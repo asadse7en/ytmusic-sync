@@ -1261,6 +1261,7 @@ class DashboardKeys:
         self.view_closed = threading.Event()
         self.view_closed.set()
         self.thread = None
+        self.old_terminal = None
 
     def start(self):
         if not sys.stdin.isatty():
@@ -1346,9 +1347,20 @@ class DashboardKeys:
 
     def _force_quit(self):
         terminate_child_processes(force=True)
+        self.restore_terminal_mode()
         with contextlib.suppress(Exception):
+            console.show_cursor(True)
+            console.set_alt_screen(False)
+            console.clear()
             console.file.flush()
         os._exit(0)
+
+    def restore_terminal_mode(self):
+        if self.old_terminal is not None and os.name != "nt":
+            with contextlib.suppress(Exception):
+                import termios
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.old_terminal)
+            self.old_terminal = None
 
     def _show_quit_screen(self):
         self.quit_screen_closed.clear()
@@ -1406,13 +1418,12 @@ class DashboardKeys:
                 self.view_closed.set()
 
     def _run(self):
-        old_terminal = None
         try:
             if os.name != "nt":
                 import termios
                 import tty
                 fd = sys.stdin.fileno()
-                old_terminal = termios.tcgetattr(fd)
+                self.old_terminal = termios.tcgetattr(fd)
                 tty.setcbreak(fd)
             while not self.done.is_set():
                 if self.quit_requested.is_set():
@@ -1430,10 +1441,7 @@ class DashboardKeys:
         except Exception:
             logging.exception("Dashboard key handling failed")
         finally:
-            if old_terminal is not None:
-                with contextlib.suppress(Exception):
-                    import termios
-                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_terminal)
+            self.restore_terminal_mode()
 
 
 def run_demo():
@@ -1767,6 +1775,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
     quit_timed_out = False
     quit_handled = False
     quit_save_failed = [False]
+    quit_started_at = [None]
     live = contextlib.nullcontext() if plain else \
         Live(get_renderable=st.render, console=console, refresh_per_second=8, transient=False, screen=True,
              vertical_overflow="crop")
@@ -1780,22 +1789,20 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
             force_event.set()
             gate.wake()
             terminate_child_processes(force=True)
+            if key_listener:
+                key_listener.restore_terminal_mode()
             with contextlib.suppress(Exception):
+                console.show_cursor(True)
+                console.set_alt_screen(False)
+                console.clear()
                 console.file.flush()
             os._exit(0)
+        quit_started_at[0] = time.monotonic()
         stop_event.set()
         gate.wake()
         if key_listener:
             key_listener.request_quit()
         raise FirstInterrupt()
-
-    if todo and threading.current_thread() is threading.main_thread():
-        try:
-            old_sigint = signal.getsignal(signal.SIGINT)
-            signal.signal(signal.SIGINT, handle_sigint)
-            signal_installed = True
-        except (ValueError, OSError):
-            signal_installed = False
 
     def write_failed_file():
         ff = DATA / "failed.txt"
@@ -1817,7 +1824,25 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
             ff.unlink(missing_ok=True)
         return failed_rows
 
+    def hard_quit_watchdog(pending, started):
+        deadline = started + 8
+        while time.monotonic() < deadline and any(not future.done() for future in pending):
+            time.sleep(0.05)
+        if not any(not future.done() for future in pending):
+            return
+        force_event.set()
+        terminate_child_processes(force=True)
+        if key_listener:
+            key_listener.quit_done.set()
+            key_listener.quit_screen_closed.wait(0.5)
+        console.show_cursor(True)
+        console.print("Forced quit")
+        with contextlib.suppress(Exception):
+            console.file.flush()
+        os._exit(0)
+
     def quit_cleanup():
+        pending = set()
         try:
             if key_listener:
                 key_listener.set_quit_status("downloads", "running")
@@ -1877,6 +1902,12 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
             quit_cleanup_done.set()
             if key_listener:
                 key_listener.quit_done.set()
+            if pending:
+                started = (key_listener.quit_started_at
+                           if key_listener and key_listener.quit_started_at is not None
+                           else quit_started_at[0] or time.monotonic())
+                threading.Thread(target=hard_quit_watchdog, args=(set(pending), started),
+                                 name="quit-timeout", daemon=True).start()
 
     def start_quit_cleanup():
         nonlocal quit_cleanup_thread
@@ -1894,7 +1925,8 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         if key_listener is None or key_listener.thread is None:
             start_quit_cleanup()
         started = (key_listener.quit_started_at
-                   if key_listener and key_listener.quit_started_at is not None else time.monotonic())
+                   if key_listener and key_listener.quit_started_at is not None
+                   else quit_started_at[0] or time.monotonic())
         deadline = started + 8
         while not quit_cleanup_done.wait(0.05):
             if not quit_cleanup_thread and time.monotonic() - started > 0.2:
@@ -1918,16 +1950,23 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         for index, e in enumerate(todo):
             work.put((index, e))
         with live:
-            executor = ThreadPoolExecutor(max_workers=worker_count)
-            key_listener = DashboardKeys(
-                st, stop_event, gate, live_obj, on_quit=start_quit_cleanup) if not plain else None
             try:
+                executor = ThreadPoolExecutor(max_workers=worker_count)
+                key_listener = DashboardKeys(
+                    st, stop_event, gate, live_obj, on_quit=start_quit_cleanup) if not plain else None
+                if key_listener:
+                    key_listener.start()
+                if threading.current_thread() is threading.main_thread():
+                    try:
+                        old_sigint = signal.getsignal(signal.SIGINT)
+                        signal.signal(signal.SIGINT, handle_sigint)
+                        signal_installed = True
+                    except (ValueError, OSError):
+                        signal_installed = False
                 for worker_id in range(worker_count):
                     futures.append(executor.submit(
                         download_worker, worker_id, work, cfg, out, lib, st, gate, stop_event,
                         failed, failed_lock, playlist_by_id, plain, force_event))
-                if key_listener:
-                    key_listener.start()
                 pending = set(futures)
                 while pending:
                     if key_listener and key_listener.quit_requested.is_set():
@@ -1998,7 +2037,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         console.print(
             f"Stopped · {downloads} done · {failures} failed · {left} left · "
             f"{'progress save failed' if quit_save_failed[0] else 'progress saved'}")
-        return stopped
+        raise SystemExit(0)
 
     finalizing[0] = True
     with lib.lock:
