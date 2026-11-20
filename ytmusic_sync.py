@@ -438,7 +438,8 @@ def canonical_id(vid, aliases):
 
 def scan(cfg, urls):
     out = Path(cfg["out"])
-    logging.basicConfig(filename=profile_dir(out) / "sync.log", level=logging.INFO, format="%(asctime)s %(message)s")
+    logging.basicConfig(filename=profile_dir(out) / "sync.log", level=logging.INFO,
+                        format="%(asctime)s %(message)s", force=True)
     lib, errs = Lib(out), []
     pls, singles, bad = resolve(urls, cfg, errs)
     entries = [x for p in pls for x in p["items"]] + singles
@@ -1294,7 +1295,6 @@ def main():
     g.add_argument("-d", "--dry-run", action="store_true", help="show what would download")
     g.add_argument("-s", "--stats", action="store_true", help="show library stats only")
     g.add_argument("-o", "--out", "--library", metavar="DIR", help="music library folder")
-    g.add_argument("--where", action="store_true", help="print the profile and music folder paths, then exit")
     g = ap.add_argument_group("output (one-off, not saved)")
     g.add_argument("-f", "--format", choices=FORMATS)
     g.add_argument("-q", "--quality", choices=QUALITIES)
