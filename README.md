@@ -51,12 +51,15 @@ Every menu has **‹ Back**. Ctrl+C goes back, or exits from the home screen.
 |---|---|
 | Home (returning) | Update library, Add Music, Settings, Stats, Quit |
 | Home (first run) | Use defaults & start, Customize, Quit |
-| Add Music | Paste links, Load from Playlists.txt, Save links to Playlists.txt, Back |
+| Add Music | Paste links, Load from Playlists.txt, Edit Playlists.txt, Back |
 | Ready | Review unique songs and playlist counts (Start, Edit settings, Back, Exit) |
 | Settings | All options below, saved automatically |
 | Stats | Songs, size, all-time downloads, runs, last sync, songs per playlist |
 
 **Update library** uses your saved settings and links and asks nothing.
+
+In **Add Music > Paste links**, playlist links can be added to `Playlists.txt`; single-song links are downloaded for that run only.
+**Edit Playlists.txt** opens the saved links in your system editor.
 
 ## Commands
 
@@ -102,7 +105,7 @@ comment above each URL.
 
 ```
 music/
-├── Song.m4a
+├── Song.mp3
 └── Gym.m3u8
 ```
 
@@ -117,7 +120,7 @@ databases at `libs/<hash>.json` for each music folder. The music folder contains
 Run `ytsync --where` to print both the data folder and music folder. Use `-o FOLDER` or Settings > Library folder
 to switch libraries.
 
-Moving to a new PC: copy the music folder, run ytsync, pick that folder. The song database rebuilds from the file tags. Use Add Music > Save links to Playlists.txt beforehand to carry your playlist links.
+Moving to a new PC: copy the music folder, run ytsync, pick that folder. The song database rebuilds from the file tags. Use Add Music > Edit Playlists.txt beforehand to carry your playlist links.
 
 ## Filenames and tags
 

@@ -5,6 +5,7 @@ dist/
 .venv/
 # local music libraries
 music/
+.ytmusic-sync/
 *.m3u8
 *.m4a
 *.mp3
