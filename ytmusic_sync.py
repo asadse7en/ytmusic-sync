@@ -1776,6 +1776,8 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
     quit_handled = False
     quit_save_failed = [False]
     quit_started_at = [None]
+    forced_quit = threading.Event()
+    forced_quit_lock = threading.Lock()
     live = contextlib.nullcontext() if plain else \
         Live(get_renderable=st.render, console=console, refresh_per_second=8, transient=False, screen=True,
              vertical_overflow="crop")
@@ -1784,19 +1786,32 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
     finalizing = [False]
     signal_stopped = False
 
+    def force_quit_now(message=None, wait_screen=False):
+        with forced_quit_lock:
+            if forced_quit.is_set():
+                os._exit(0)
+            forced_quit.set()
+        force_event.set()
+        terminate_child_processes(force=True)
+        if key_listener:
+            key_listener.quit_done.set()
+            if wait_screen:
+                key_listener.quit_screen_closed.wait(0.5)
+            key_listener.restore_terminal_mode()
+        with contextlib.suppress(Exception):
+            console.show_cursor(True)
+            console.set_alt_screen(False)
+            console.clear()
+            if message:
+                console.print(message)
+            console.file.flush()
+        os._exit(0)
+
     def handle_sigint(_signum, _frame):
         if stop_event.is_set() or finalizing[0]:
             force_event.set()
             gate.wake()
-            terminate_child_processes(force=True)
-            if key_listener:
-                key_listener.restore_terminal_mode()
-            with contextlib.suppress(Exception):
-                console.show_cursor(True)
-                console.set_alt_screen(False)
-                console.clear()
-                console.file.flush()
-            os._exit(0)
+            force_quit_now()
         quit_started_at[0] = time.monotonic()
         stop_event.set()
         gate.wake()
@@ -1830,16 +1845,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
             time.sleep(0.05)
         if not any(not future.done() for future in pending):
             return
-        force_event.set()
-        terminate_child_processes(force=True)
-        if key_listener:
-            key_listener.quit_done.set()
-            key_listener.quit_screen_closed.wait(0.5)
-        console.show_cursor(True)
-        console.print("Forced quit")
-        with contextlib.suppress(Exception):
-            console.file.flush()
-        os._exit(0)
+        force_quit_now("Forced quit", wait_screen=True)
 
     def quit_cleanup():
         pending = set()
@@ -1933,8 +1939,6 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
                 start_quit_cleanup()
             if time.monotonic() >= deadline:
                 quit_timed_out = True
-                force_event.set()
-                terminate_child_processes(force=True)
                 if key_listener:
                     key_listener.quit_done.set()
                 break
@@ -2025,11 +2029,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
             signal.signal(signal.SIGINT, old_sigint)
             signal_installed = False
         if quit_timed_out:
-            console.show_cursor(True)
-            console.print("Forced quit")
-            with contextlib.suppress(Exception):
-                console.file.flush()
-            os._exit(0)
+            force_quit_now("Forced quit")
         with st.lock:
             downloads, failures = st.done, st.fail
             left = max(st.total - st.done - st.worker_fail, 0)
