@@ -44,6 +44,20 @@ EMOJI = re.compile("[\U00010000-\U0010ffff\u2600-\u27bf\ufe0f]")
 BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 YT_ID = re.compile(r"(?:v=|youtu\.be/)([\w-]{11})")
 BLOCKED = re.compile(r"403|sign in|bot|nsig|unable to extract|HTTP Error", re.I)
+BIG_PERCENT_GLYPHS = {
+    "0": ("████", "█  █", "████"),
+    "1": ("  █ ", " ██ ", "  █ "),
+    "2": ("████", "  ██", "██  "),
+    "3": ("████", "  ██", "████"),
+    "4": ("█  █", "████", "   █"),
+    "5": ("████", "██  ", "  ██"),
+    "6": ("████", "██  ", "████"),
+    "7": ("████", "   █", "   █"),
+    "8": ("████", "████", "████"),
+    "9": ("████", "████", "   █"),
+    ".": ("    ", "    ", " ██ "),
+    "%": ("█ ▐█", " ▄█ ", "▐█ ▄"),
+}
 
 
 def ensure_ui():
@@ -928,19 +942,6 @@ class St:
         eta = dur(remaining_bytes / avg_speed) if done and avg_speed else "—"
 
         orange, green, red, grey = "#ff9f1a", "#3fb950", "#f85149", "#8b8b8b"
-        heading_row = Table.grid(expand=True, padding=0)
-        heading_row.add_column(ratio=1)
-        heading_row.add_column(no_wrap=True, justify="right")
-        heading = Text()
-        heading.append(f"{percent:.1%}", style=f"bold {orange}")
-        heading.append(f"  {finished_count} / {self.total} tracks", style=grey)
-        timing = Text()
-        timing.append("ETA ", style=grey)
-        timing.append(eta, style="bold #ffffff")
-        timing.append("  ·  Elapsed ", style=grey)
-        timing.append(dur(el), style="bold #ffffff")
-        heading_row.add_row(heading, timing)
-
         bar_width = max(width - 4, 1)
         counts = [done, failed, active, left]
         total_count = sum(counts)
@@ -955,9 +956,22 @@ class St:
                 widths[index] += 1
         else:
             widths = [0, 0, 0, bar_width]
-        segmented = Text()
-        for segment_width, color in zip(widths, (green, red, orange, "#3a3a3a")):
-            segmented.append("━" * segment_width, style=color)
+        for index, count in enumerate(counts):
+            if count > 0 and widths[index] == 0:
+                donor = max((i for i, size_ in enumerate(widths) if size_ > 1),
+                            key=lambda i: widths[i], default=None)
+                if donor is not None:
+                    widths[donor] -= 1
+                    widths[index] = 1
+
+        bar_lines = []
+        bar_height = 3 if console.size.height > 30 else 2
+        for _ in range(bar_height):
+            bar_line = Text()
+            for segment_width, color in zip(widths, (green, red, orange, "#333333")):
+                bar_line.append("█" * segment_width, style=color)
+            bar_lines.append(bar_line)
+
         legend = Text()
         for dot, label, value, color in (
                 ("●", "Done", done, green), ("●", "Failed", failed, red),
@@ -967,12 +981,56 @@ class St:
             legend.append(f"{dot} ", style=color)
             legend.append(f"{label} ", style=grey)
             legend.append(str(value), style="bold #ffffff")
-        if not narrow:
-            legend.append("   Size ", style=grey)
-            legend.append(size(byte_count), style="bold #ffffff")
-            legend.append("   Avg ", style=grey)
-            legend.append(f"{size(avg_speed)}/s", style="bold #ffffff")
-        overall_panel = Panel(Group(heading_row, segmented, legend), expand=True,
+
+        from rich.cells import cell_len
+
+        with_stats = legend.copy()
+        with_stats.append("   Size ", style=grey)
+        with_stats.append(size(byte_count), style="bold #ffffff")
+        with_stats.append("   Avg ", style=grey)
+        with_stats.append(f"{size(avg_speed)}/s", style="bold #ffffff")
+        if cell_len(with_stats.plain) <= bar_width:
+            legend = with_stats
+
+        heading_row = Table.grid(expand=True, padding=0)
+        heading_row.add_column(ratio=1)
+        heading_row.add_column(no_wrap=True, justify="right")
+        heading = Text()
+        heading.append(f"{percent:.1%}", style=f"bold {orange}")
+        heading.append(f"  {finished_count} / {self.total} tracks", style=grey)
+        timing = Text()
+        timing.append("ETA ", style=grey)
+        timing.append(eta, style="bold #ffffff")
+        timing.append("  ·  Elapsed ", style=grey)
+        timing.append(dur(el), style="bold #ffffff")
+        heading_row.add_row(heading, timing)
+
+        overall_content = []
+        if width + int(console.legacy_windows) >= 80:
+            value = f"{percent * 100:.1f}%"
+            glyph_rows = [Text(style=f"bold {orange}") for _ in range(3)]
+            for index, character in enumerate(value):
+                glyph = BIG_PERCENT_GLYPHS[character]
+                for row in range(3):
+                    if index:
+                        glyph_rows[row].append(" ")
+                    glyph_rows[row].append(glyph[row])
+
+            secondary_rows = [
+                Text(f"{finished_count} / {self.total} tracks", style=grey),
+                Text.assemble(("ETA ", grey), (eta, "bold #ffffff")),
+                Text.assemble(("Elapsed ", grey), (dur(el), "bold #ffffff")),
+            ]
+            percentage_row = Table.grid(expand=True, padding=(0, 1))
+            percentage_row.add_column(no_wrap=True)
+            percentage_row.add_column(ratio=1)
+            percentage_row.add_row(Group(*glyph_rows), Group(*secondary_rows))
+            overall_content.extend((Text(""), percentage_row))
+        else:
+            overall_content.append(heading_row)
+
+        overall_content.extend((*bar_lines, legend))
+        overall_panel = Panel(Group(*overall_content), expand=True,
                               padding=(0, 1), border_style="#5a5a5a")
         blocks = [overall_panel]
 
