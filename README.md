@@ -6,7 +6,7 @@ Run it again any time: only new songs download, and playlists update (additions,
 - Interactive menus, a live progress dashboard, and a stats summary
 - Clean filenames (`Title.m4a`) with artist, title and cover art in the tags
 - One flat folder with `.m3u8` playlists next to the songs, so VLC, Poweramp, Musicolet, foobar2000 and Jellyfin can use them
-- Settings, links and history live in a hidden `.ytmusic-sync` folder inside your music folder
+- Settings, links and history live in the ytsync data folder in your user profile
 
 ## Install
 
@@ -69,6 +69,7 @@ Every menu has **‹ Back**. Ctrl+C goes back, or exits from the home screen.
 | `ytsync -p links.txt` | Use a text file of URLs (one per line, `#` comments allowed) |
 | `ytsync -d` | Dry run: show what would download |
 | `ytsync -s` | Library stats |
+| `ytsync --where` | Print the profile data folder and music library folder |
 | `ytsync --update-ytdlp` | Upgrade yt-dlp |
 
 Options (flags apply to that run only; change defaults in Settings):
@@ -101,22 +102,20 @@ comment above each URL.
 ```
 music/
 ├── Song.m4a
-├── Gym.m3u8
-└── .ytmusic-sync/
-    ├── config.json      settings and saved links
-    ├── playlists.txt    optional links file (edit it, then run Update)
-    ├── library.json     video ID -> file map, aliases, playlists, stats
-    ├── failed.txt       songs that failed last run
-    ├── sync.log
-    └── cache.json       yt-dlp update check
+└── Gym.m3u8
 ```
 
-- Run `ytsync` inside a library (or any subfolder) to use it. Anywhere else it opens the last library you used.
-  Use `-o FOLDER` to pick another one. Each library has its own settings.
-- The only file outside the music folder is a small pointer to your last library, in your OS config folder.
-- If you copy the music folder to another PC or drive, sync keeps working.
-- If you sync the folder to a phone (Syncthing and similar), ignore `.ytmusic-sync`.
-- If `library.json` is lost, it is rebuilt from the source URL stored in each file's tags.
+The profile data folder contains `config.json`, `playlists.txt`, `library.json`, `failed.txt`, `sync.log` and
+`cache.json`. Each music folder has its own profile:
+
+- Windows: `%LOCALAPPDATA%\ytsync\libraries\<folder>-<hash>`
+- macOS: `~/Library/Application Support/ytsync/libraries/<folder>-<hash>`
+- Linux: `~/.local/share/ytsync/libraries/<folder>-<hash>`
+
+The last-used music folder pointer, `last_library.json`, is stored in the OS config folder. Run `ytsync --where`
+to print both paths. Use `-o FOLDER` or Settings > Library folder to switch libraries.
+
+Moving to a new PC: copy the music folder, run ytsync, pick that folder. The song database rebuilds from the file tags. Use Add Music > Save my links to a file beforehand to carry your playlist links.
 
 ## Filenames and tags
 
@@ -129,7 +128,7 @@ music/
 
 - **Laptop/Android:** VLC, foobar2000, MusicBee, Poweramp, Musicolet and similar read `.m3u8` files from the folder.
 - **iPhone:** Apple Music and Files cannot import `.m3u8`. Use VLC, foobar2000 mobile or Doppler, or stream through the Jellyfin app.
-- **Jellyfin:** add the folder as a Music library and enable "Prefer embedded metadata". Native `.m3u8` pickup is limited; if playlists do not appear, use a playlist-import plugin. If your scanner lists the hidden `.ytmusic-sync` folder, add it to its ignore list.
+- **Jellyfin:** add the folder as a Music library and enable "Prefer embedded metadata". Native `.m3u8` pickup is limited; if playlists do not appear, use a playlist-import plugin.
 
 ## Keeping yt-dlp current
 

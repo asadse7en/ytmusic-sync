@@ -1217,7 +1217,7 @@ def run_flow(cfg, with_review):
             pause()
             return "home"
         if a == "edit":
-            settings(cfg)
+            cfg = settings(cfg)
             continue
         return "exit" if a == "exit" else "home"
 
@@ -1309,6 +1309,7 @@ def main():
     g.add_argument("--jobs", type=int, choices=range(1, 7), help="parallel downloads (1-6, default 3)")
     g = ap.add_argument_group("other")
     g.add_argument("--compact", action="store_true", help="one line per song instead of the dashboard")
+    g.add_argument("--where", action="store_true", help="print the profile and library folder paths, then exit")
     g.add_argument("--update-ytdlp", action="store_true", help="upgrade yt-dlp and exit")
     g.add_argument("-V", "--version", action="version", version=f"%(prog)s {VERSION} (yt-dlp {YTDLP_VERSION})")
     a = ap.parse_args()
