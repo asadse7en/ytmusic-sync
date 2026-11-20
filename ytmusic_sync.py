@@ -7,44 +7,34 @@ from pathlib import Path
 import unicodedata
 from urllib.parse import urlparse
 
-try:
-    import questionary, yt_dlp
-    from platformdirs import user_config_dir, user_data_dir
-    from yt_dlp.postprocessor.common import PostProcessor
-    from yt_dlp.version import __version__ as YTDLP_VERSION
-    from rich.console import Console, Group
-    from rich.live import Live
-    from rich.panel import Panel
-    from rich.progress_bar import ProgressBar
-    from rich.table import Table
-    from rich.text import Text
-except ImportError:
-    sys.exit("Missing packages. Run: pip install -r requirements.txt")
-
 for _s in (sys.stdout, sys.stderr):
     with contextlib.suppress(Exception):
         _s.reconfigure(encoding="utf-8")
 
 VERSION = "0.1"
-DATA_BASE = Path(user_data_dir("ytsync", appauthor=False)) / "libraries"
-POINTER = Path(user_config_dir("ytsync", appauthor=False)) / "last_library.json"
-console = Console()
+DATA = Path.home() / ".ytmusic-sync"
+console = questionary = STYLE = None
+Group = Live = Panel = ProgressBar = Table = Text = None
+LIB_CACHE, LIB_CACHE_LOCK = {}, threading.RLock()
+TIMING_ENABLED = False
+TIMINGS = {}
+UPDATE_CHECKER = None
+_YT_DLP = None
+_POSTPROCESSOR_TYPES = None
 
-FORMATS = ["m4a", "mp3", "opus", "flac", "wav", "aac"]
+FORMATS = ["mp3", "m4a", "opus", "flac", "wav", "aac"]
 QUALITIES = ["best", "320", "256", "192", "128"]
 STYLES = {"title": "Title", "artist-title": "Artist - Title", "title-artist": "Title - Artist"}
 EXT = {".m4a", ".mp3", ".opus", ".flac", ".wav", ".aac", ".ogg", ".mp4"}
-DEFAULTS = dict(format="m4a", quality="best", name_style="title", cover=True, square=True, clean=True,
+DEFAULTS = dict(format="mp3", quality="best", name_style="title", cover=True, square=True, clean=True,
                 playlist_files=True, prune=False, skip_duplicate_songs=True, jobs=3, retries=5,
-                rate_limit="", cookies="", urls=[], files=[])
+                rate_limit="", cookies="")
 LABELS = [("format", "Format"), ("quality", "Quality"), ("name_style", "Filename style"),
           ("cover", "Cover art"), ("square", "Square cover"), ("clean", "Clean titles"),
           ("playlist_files", "Playlist .m3u8 files"), ("prune", "Prune removed songs"),
           ("skip_duplicate_songs", "Skip duplicate songs"), ("jobs", "Parallel downloads"),
           ("rate_limit", "Speed limit"), ("retries", "Retries"), ("cookies", "Browser cookies")]
 CHOICES = {"format": FORMATS, "quality": QUALITIES, "name_style": list(STYLES), "jobs": list(range(1, 7))}
-STYLE = questionary.Style([("pointer", "fg:#ff8c00 bold"), ("highlighted", "fg:#ff8c00 bold"),
-                           ("selected", "fg:#ff8c00"), ("question", "bold")])
 
 JUNK = re.compile(r"[\(\[\{][^\)\]\}]*\b(official|lyrics?|lyrical|audio|video|visuali[sz]er|hd|hq|4k|"
                   r"full song|music video|mv)\b[^\)\]\}]*[\)\]\}]", re.I)
@@ -52,6 +42,38 @@ EMOJI = re.compile("[\U00010000-\U0010ffff\u2600-\u27bf\ufe0f]")
 BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 YT_ID = re.compile(r"(?:v=|youtu\.be/)([\w-]{11})")
 BLOCKED = re.compile(r"403|sign in|bot|nsig|unable to extract|HTTP Error", re.I)
+
+
+def ensure_ui():
+    global console, questionary, STYLE, Group, Live, Panel, ProgressBar, Table, Text
+    if console is not None:
+        return
+    try:
+        import questionary as _questionary
+        from rich.console import Console, Group as _Group
+        from rich.live import Live as _Live
+        from rich.panel import Panel as _Panel
+        from rich.progress_bar import ProgressBar as _ProgressBar
+        from rich.table import Table as _Table
+        from rich.text import Text as _Text
+    except ImportError as e:
+        raise RuntimeError("Missing UI packages. Run: pip install -r requirements.txt") from e
+    questionary = _questionary
+    Group, Live, Panel, ProgressBar, Table, Text = _Group, _Live, _Panel, _ProgressBar, _Table, _Text
+    console = Console()
+    STYLE = questionary.Style([("pointer", "fg:#ff8c00 bold"), ("highlighted", "fg:#ff8c00 bold"),
+                               ("selected", "fg:#ff8c00"), ("question", "bold")])
+
+
+def get_ytdlp():
+    global _YT_DLP
+    if _YT_DLP is None:
+        try:
+            import yt_dlp
+        except ImportError as e:
+            raise RuntimeError("Missing yt-dlp. Run: pip install -r requirements.txt") from e
+        _YT_DLP = yt_dlp
+    return _YT_DLP
 
 
 # ---------- small helpers ----------
@@ -115,29 +137,189 @@ def read_list(p):
         return []
 
 
-# ---------- library location, config ----------
-def profile_dir(out):
+# ---------- data location, config ----------
+def ensure_data_dir():
+    DATA.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        try:
+            import ctypes
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(DATA))
+            if attrs != 0xFFFFFFFF and not attrs & 0x2:
+                if not ctypes.windll.kernel32.SetFileAttributesW(str(DATA), attrs | 0x2):
+                    raise ctypes.WinError()
+        except (AttributeError, OSError) as e:
+            logging.warning("Could not hide data folder %s: %s", DATA, e)
+    return DATA
+
+
+def music_hash(out):
     resolved = Path(out).expanduser().resolve()
-    digest = hashlib.sha1(str(resolved).lower().encode("utf-8")).hexdigest()[:8]
-    profile = DATA_BASE / f"{fsafe(resolved.name)}-{digest}"
-    profile.mkdir(parents=True, exist_ok=True)
-    return profile
+    return hashlib.sha1(str(resolved).lower().encode("utf-8")).hexdigest()
 
 
-def migration_target(profile, name):
-    target = profile / name
+def legacy_profile_name(out):
+    resolved = Path(out).expanduser().resolve()
+    return f"{fsafe(resolved.name)}-{music_hash(resolved)[:8]}"
+
+
+def library_path(out):
+    ensure_data_dir()
+    folder = DATA / "libs"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{music_hash(out)}.json"
+
+
+def copy_legacy_file(source, destination):
+    source, destination = Path(source), Path(destination)
+    if not source.is_file():
+        return None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists():
+        shutil.copy2(source, destination)
+        return destination
+    backup = DATA / "migrations" / hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:12] / source.name
+    if not backup.exists():
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, backup)
+        return backup
+    return None
+
+
+def append_urls(urls):
+    path = DATA / "playlists.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = set(read_list(path))
+    existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
+    added = []
+    for value in urls:
+        url = str(value).strip()
+        if url and url not in existing:
+            added.append(url)
+            existing.add(url)
+    if added:
+        with path.open("a", encoding="utf-8") as f:
+            if existing_text and not existing_text.endswith(("\n", "\r")):
+                f.write("\n")
+            f.writelines(f"{url}\n" for url in added)
+
+
+def append_legacy_playlist(source):
+    source = Path(source)
+    if not source.is_file():
+        return
+    target = DATA / "playlists.txt"
     if not target.exists():
-        return target
-    i = 1
-    while True:
-        candidate = profile / f"{name}.legacy-{i}"
-        if not candidate.exists():
-            return candidate
-        i += 1
+        copy_legacy_file(source, target)
+        return
+    existing_text = target.read_text(encoding="utf-8")
+    existing = set(read_list(target))
+    pairs, label = [], ""
+    for line in source.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith("#"):
+            label = line.strip()[1:].strip()
+            if label.lower() == "one link per line":
+                label = ""
+        elif line.strip():
+            pairs.append((line.strip(), label))
+            label = ""
+    added = [(url, name) for url, name in pairs if url not in existing]
+    if added:
+        with target.open("a", encoding="utf-8") as f:
+            if existing_text and not existing_text.endswith(("\n", "\r")):
+                f.write("\n")
+            for url, name in added:
+                if name:
+                    f.write(f"# {name}\n")
+                f.write(f"{url}\n")
+
+
+def legacy_config_links(config):
+    urls = config.get("urls") or []
+    files = config.get("files") or []
+    links = [urls] if isinstance(urls, str) else list(urls)
+    for path in ([files] if isinstance(files, str) else files):
+        links.extend(read_list(path))
+    return links
+
+
+def migrate_legacy_profiles():
+    ensure_data_dir()
+    marker = DATA / "migrations" / "platformdirs-v1.done"
+    if marker.exists():
+        return
+    try:
+        from platformdirs import user_config_dir, user_data_dir
+        old_base = Path(user_data_dir("ytsync", appauthor=False)) / "libraries"
+        pointer = Path(user_config_dir("ytsync", appauthor=False)) / "last_library.json"
+    except ImportError:
+        return
+
+    folders = sorted((p for p in old_base.iterdir() if p.is_dir()), key=lambda p: p.name.lower()) \
+        if old_base.is_dir() else []
+    pointed = jload(pointer, {}).get("path")
+    if pointed:
+        active = legacy_profile_name(pointed)
+        folders.sort(key=lambda p: (p.name != active, p.name.lower()))
+    links = []
+    config_path = DATA / "config.json"
+    for folder in folders:
+        source_cfg = jload(folder / "config.json", {})
+        if source_cfg:
+            links.extend(legacy_config_links(source_cfg))
+            copy_legacy_file(folder / "config.json",
+                             DATA / "migrations" / "legacy-profiles" / folder.name / "config.json")
+            if not config_path.exists():
+                migrated_cfg = {k: v for k, v in source_cfg.items() if k in DEFAULTS}
+                aw(config_path, json.dumps({**DEFAULTS, **migrated_cfg}, indent=1))
+        append_legacy_playlist(folder / "playlists.txt")
+        copy_legacy_file(folder / "library.json", DATA / "libs" / f"{folder.name}.json")
+        if pointed and folder.name == active:
+            copy_legacy_file(folder / "library.json", library_path(pointed))
+        for name in ("failed.txt", "sync.log", "cache.json"):
+            copy_legacy_file(folder / name, DATA / name)
+    if pointed:
+        config = jload(config_path, {})
+        if not config.get("out"):
+            config["out"] = str(pointed)
+            aw(config_path, json.dumps({**DEFAULTS, **config}, indent=1))
+    append_urls(links)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("done\n", encoding="utf-8")
+
+
+def migrate_music_folder(out):
+    marker = DATA / "migrations" / f"music-{music_hash(out)}.done"
+    if marker.exists():
+        return
+    legacy = Path(out) / ".ytmusic-sync"
+    if legacy.is_dir():
+        source_cfg = jload(legacy / "config.json", {})
+        if source_cfg:
+            links = legacy_config_links(source_cfg)
+            config_path = DATA / "config.json"
+            copy_legacy_file(legacy / "config.json",
+                             DATA / "migrations" / "music-folders" / music_hash(out) / "config.json")
+            if not config_path.exists():
+                migrated_cfg = {k: v for k, v in source_cfg.items() if k in DEFAULTS}
+                aw(config_path, json.dumps({**DEFAULTS, **migrated_cfg}, indent=1))
+            append_urls(links)
+        append_legacy_playlist(legacy / "playlists.txt")
+        copy_legacy_file(legacy / "library.json", library_path(out))
+        for name in ("failed.txt", "sync.log", "cache.json"):
+            copy_legacy_file(legacy / name, DATA / name)
+        for item in legacy.iterdir():
+            if item.is_file() and item.name not in {
+                    "config.json", "playlists.txt", "library.json", "failed.txt", "sync.log", "cache.json"}:
+                copy_legacy_file(item, DATA / item.name)
+    for old, new in (("library.json", library_path(out)), ("failed.txt", DATA / "failed.txt"),
+                     ("ytmusic-sync.log", DATA / "sync.log")):
+        copy_legacy_file(Path(out) / old, new)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("done\n", encoding="utf-8")
 
 
 def ensure_lib(out):
-    """Create a music folder profile, migrate legacy app files, and remember the library."""
+    """Validate a music folder and import its legacy data without modifying the source."""
     out = Path(out).expanduser().resolve()
     if not out.exists():
         if not out.parent.is_dir():
@@ -145,53 +327,47 @@ def ensure_lib(out):
         out.mkdir()
     if not out.is_dir():
         raise NotADirectoryError(f"Music folder is not a directory: {out}")
-    profile = profile_dir(out)
-    legacy = out / ".ytmusic-sync"
-    if legacy.is_dir():
-        for item in legacy.iterdir():
-            shutil.move(str(item), str(migration_target(profile, item.name)))
-        legacy.rmdir()
-    for old, new in (("library.json", "library.json"), ("failed.txt", "failed.txt"),
-                     ("ytmusic-sync.log", "sync.log")):
-        source = out / old
-        if source.is_file():
-            shutil.move(str(source), str(migration_target(profile, new)))
-    POINTER.parent.mkdir(parents=True, exist_ok=True)
-    aw(POINTER, json.dumps({"path": str(out)}))
+    ensure_data_dir()
+    migrate_legacy_profiles()
+    migrate_music_folder(out)
     return out
 
 
 def find_lib(explicit=None):
-    """--out > last used library > no selection."""
     if explicit:
         return Path(explicit).expanduser().resolve()
-    p = jload(POINTER, {}).get("path")
-    if p:
-        folder = Path(p).expanduser()
+    saved = jload(DATA / "config.json", {}).get("out")
+    if saved:
+        folder = Path(saved).expanduser()
         if folder.is_dir():
             return folder.resolve()
-        console.print(f"[yellow]Last used music folder is unavailable: {folder}. "
-                      "Reconnect the drive or choose a folder.[/]")
+        if console is not None:
+            console.print(f"[yellow]Last used music folder is unavailable: {folder}. "
+                          "Reconnect the drive or choose a folder.[/]")
     return None
 
 
-def load_cfg(out):
-    c = {**DEFAULTS, **jload(profile_dir(out) / "config.json", {})}
-    c["urls"], c["files"] = list(c["urls"]), list(c["files"])
+def load_cfg(out=None):
+    ensure_data_dir()
+    c = {**DEFAULTS, **jload(DATA / "config.json", {})}
+    c.pop("urls", None)
+    c.pop("files", None)
     c["jobs"] = int(c["jobs"])
     if not 1 <= c["jobs"] <= 6:
         raise ValueError("Parallel downloads must be between 1 and 6.")
-    c["out"] = str(out)
+    saved = out if out is not None else c.get("out")
+    c["out"] = str(Path(saved).expanduser().resolve()) if saved else ""
     return c
 
 
 def save_cfg(c):
-    aw(profile_dir(c["out"]) / "config.json", json.dumps({k: v for k, v in c.items() if k != "out"}, indent=1))
+    ensure_data_dir()
+    values = {k: v for k, v in c.items() if k in DEFAULTS or k == "out"}
+    aw(DATA / "config.json", json.dumps(values, indent=1))
 
 
-def all_urls(c):
-    urls = c["urls"] + [u for f in c["files"] for u in read_list(f)] + read_list(profile_dir(c["out"]) / "playlists.txt")
-    return list(dict.fromkeys(urls))
+def all_urls(_cfg=None):
+    return list(dict.fromkeys(read_list(DATA / "playlists.txt")))
 
 
 # ---------- ffmpeg + yt-dlp updates ----------
@@ -220,25 +396,63 @@ def vtuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", v))
 
 
-def ytdlp_latest(out):
-    cp = profile_dir(out) / "cache.json"
-    c = jload(cp, {})
-    if time.time() - c.get("t", 0) < 86400 and c.get("latest"):
-        return c["latest"]
+def installed_ytdlp_version():
     try:
-        with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=4) as r:
+        from importlib.metadata import version
+        return version("yt-dlp")
+    except Exception:
+        return "0"
+
+
+def ytdlp_latest():
+    cp = DATA / "cache.json"
+    cached = jload(cp, {})
+    if "latest" in cached and time.time() - cached.get("t", 0) < 86400:
+        return cached["latest"] or None
+    latest = None
+    try:
+        with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=2) as r:
             latest = json.load(r)["info"]["version"]
-        aw(cp, json.dumps({"t": time.time(), "latest": latest}))
-        return latest
-    except Exception:  # offline: retry in about an hour
-        with contextlib.suppress(OSError):
-            aw(cp, json.dumps({"t": time.time() - 86400 + 3600, "latest": c.get("latest")}))
-        return c.get("latest")
+    except Exception:
+        pass
+    with contextlib.suppress(OSError):
+        aw(cp, json.dumps({"t": time.time(), "latest": latest or ""}))
+    return latest
 
 
-def outdated(out):
-    new = ytdlp_latest(out)
-    return (YTDLP_VERSION, new) if new and vtuple(new) > vtuple(YTDLP_VERSION) else None
+def outdated(_out=None):
+    current = installed_ytdlp_version()
+    latest = ytdlp_latest()
+    return (current, latest) if latest and vtuple(latest) > vtuple(current) else None
+
+
+class UpdateChecker:
+    def __init__(self):
+        self.started = time.monotonic()
+        self.finished = None
+        self.result = None
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="yt-dlp-update-check", daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            self.result = outdated()
+        except Exception:
+            logging.exception("yt-dlp update check failed")
+        finally:
+            self.finished = time.monotonic()
+            self.done.set()
+
+    @property
+    def elapsed(self):
+        return self.finished - self.started if self.finished else None
+
+
+def start_update_check():
+    global UPDATE_CHECKER
+    UPDATE_CHECKER = UpdateChecker()
+    return UPDATE_CHECKER
 
 
 def upgrade_ytdlp():
@@ -293,36 +507,44 @@ def pick_name(lib, vid, artist, title, style):
         return candidate
 
 
-class Clean(PostProcessor):
-    """Runs before filename + tagging: sets clean artist/title and the final filename."""
-    def __init__(self, lib, cfg, st):
-        super().__init__()
-        self.lib, self.cfg, self.st = lib, cfg, st
+def postprocessor_types():
+    global _POSTPROCESSOR_TYPES
+    if _POSTPROCESSOR_TYPES is not None:
+        return _POSTPROCESSOR_TYPES
+    get_ytdlp()
+    from yt_dlp.postprocessor.common import PostProcessor
 
-    def run(self, info):
-        a, t = clean_tags(info, self.cfg["clean"])
-        info.update(artist=a, track=t, title=t, album_artist=a.split(",")[0].strip())
-        info["fname"] = pick_name(self.lib, info["id"], a, t, self.cfg["name_style"])
-        self.st.set_track(t, a)
-        return [], info
+    class Clean(PostProcessor):
+        def __init__(self, lib, cfg, st):
+            super().__init__()
+            self.lib, self.cfg, self.st = lib, cfg, st
 
+        def run(self, info):
+            a, t = clean_tags(info, self.cfg["clean"])
+            info.update(artist=a, track=t, title=t, album_artist=a.split(",")[0].strip())
+            info["fname"] = pick_name(self.lib, info["id"], a, t, self.cfg["name_style"])
+            self.st.set_track(t, a)
+            return [], info
 
-class SquareCover(PostProcessor):
-    """Center-crop the downloaded cover to a square, in place (runs after the JPEG conversion)."""
-    def run(self, info):
-        exe = FFMPEG or shutil.which("ffmpeg")
-        for t in info.get("thumbnails") or []:
-            src = t.get("filepath")
-            if not exe or not src or not os.path.exists(src):
-                continue
-            tmp = src + ".sq.jpg"
-            r = subprocess.run([exe, "-y", "-loglevel", "error", "-i", src, "-vf", "crop='min(iw,ih)':'min(iw,ih)'",
-                                "-c:v", "mjpeg", "-q:v", "2", tmp], capture_output=True)
-            if r.returncode == 0 and os.path.exists(tmp):
-                os.replace(tmp, src)
-            else:
-                logging.warning("cover crop failed: %s", r.stderr.decode(errors="ignore")[-200:])
-        return [], info
+    class SquareCover(PostProcessor):
+        def run(self, info):
+            exe = FFMPEG or shutil.which("ffmpeg")
+            for thumbnail in info.get("thumbnails") or []:
+                src = thumbnail.get("filepath")
+                if not exe or not src or not os.path.exists(src):
+                    continue
+                tmp = src + ".sq.jpg"
+                r = subprocess.run([exe, "-y", "-loglevel", "error", "-i", src,
+                                    "-vf", "crop='min(iw,ih)':'min(iw,ih)'", "-c:v", "mjpeg", "-q:v", "2", tmp],
+                                   capture_output=True)
+                if r.returncode == 0 and os.path.exists(tmp):
+                    os.replace(tmp, src)
+                else:
+                    logging.warning("cover crop failed: %s", r.stderr.decode(errors="ignore")[-200:])
+            return [], info
+
+    _POSTPROCESSOR_TYPES = Clean, SquareCover
+    return _POSTPROCESSOR_TYPES
 
 
 # ---------- library database ----------
@@ -336,26 +558,39 @@ def tag_has_url(k, v):
 
 class Lib:
     def __init__(self, out):
-        self.out, self.f = Path(out), profile_dir(out) / "library.json"
+        ensure_ui()
+        self.out, self.f = Path(out).expanduser().resolve(), library_path(out)
         self.lock, self.name_lock, self.reserved_names = threading.RLock(), threading.Lock(), set()
         self.reserved_by_id = {}
         self.d = {"songs": {}, "playlists": {}, "stats": {}, "aliases": {}}
-        self.d.update(jload(self.f, {}))
+        old_db = DATA / "libs" / f"{legacy_profile_name(out)}.json"
+        if not self.f.exists() and old_db.is_file():
+            shutil.copy2(old_db, self.f)
+        database_exists = self.f.is_file()
+        loaded = jload(self.f, {}) if database_exists else {}
+        if isinstance(loaded, dict):
+            self.d.update(loaded)
+        self.d["songs"] = self.d.get("songs") if isinstance(self.d.get("songs"), dict) else {}
+        self.d["playlists"] = self.d.get("playlists") if isinstance(self.d.get("playlists"), dict) else {}
+        self.d["stats"] = self.d.get("stats") if isinstance(self.d.get("stats"), dict) else {}
+        self.d["aliases"] = self.d.get("aliases") if isinstance(self.d.get("aliases"), dict) else {}
         self.d.setdefault("aliases", {})
         self.d["stats"] = {"runs": 0, "downloads": 0, "bytes": 0, "last_run": "never", **self.d["stats"]}
-        if not self.d["songs"]:
-            self.rebuild()
-        self.d["songs"] = {k: v for k, v in self.d["songs"].items() if (self.out / v["file"]).exists()}
+        if not database_exists:
+            with console.status("[cyan]Reading existing files..."):
+                self.rebuild()
+        self.d["songs"] = {k: v for k, v in self.d["songs"].items()
+                           if isinstance(v, dict) and v.get("file") and (self.out / v["file"]).exists()}
         self.d["aliases"] = {k: v for k, v in self.d["aliases"].items() if v in self.d["songs"]}
+        if not database_exists:
+            self.save()
 
     def rebuild(self):
         """Best effort: recover video IDs from the source URL stored in each file's tags."""
-        try:
-            import mutagen
-        except ImportError:
-            return
+        import mutagen
+        known_files = {Path(v["file"]).name for v in self.d["songs"].values() if v.get("file")}
         for p in self.out.iterdir():
-            if p.suffix.lower() not in EXT or not p.is_file():
+            if p.name in known_files or p.suffix.lower() not in EXT or not p.is_file():
                 continue
             try:
                 f = mutagen.File(p)
@@ -369,11 +604,13 @@ class Lib:
                 get = lambda k: ((e.tags.get(k) or [""])[0] if e and e.tags else "")
                 self.d["songs"][vid] = {"file": p.name, "artist": get("artist"),
                                         "title": get("title") or p.stem, "dur": int(f.info.length)}
+                known_files.add(p.name)
             except Exception:
-                continue
+                logging.exception("Could not read tags from %s", p)
 
     def save(self):
         with self.lock:
+            self.f.parent.mkdir(parents=True, exist_ok=True)
             aw(self.f, json.dumps(self.d, indent=1, ensure_ascii=False))
 
     def total_size(self):
@@ -382,8 +619,17 @@ class Lib:
                        if (self.out / v["file"]).exists())
 
 
+def get_lib(out):
+    key = str(Path(out).expanduser().resolve()).casefold()
+    with LIB_CACHE_LOCK:
+        if key not in LIB_CACHE:
+            LIB_CACHE[key] = Lib(out)
+        return LIB_CACHE[key]
+
+
 # ---------- scan ----------
 def resolve(urls, cfg, errs, details=None):
+    yt_dlp = get_ytdlp()
     o = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "skip_download": True, "logger": Quiet()}
     if cfg["cookies"]:
         o["cookiesfrombrowser"] = (cfg["cookies"],)
@@ -438,9 +684,7 @@ def canonical_id(vid, aliases):
 
 def scan(cfg, urls):
     out = Path(cfg["out"])
-    logging.basicConfig(filename=profile_dir(out) / "sync.log", level=logging.INFO,
-                        format="%(asctime)s %(message)s", force=True)
-    lib, errs = Lib(out), []
+    lib, errs = get_lib(out), []
     pls, singles, bad = resolve(urls, cfg, errs)
     entries = [x for p in pls for x in p["items"]] + singles
     want = {}
@@ -669,6 +913,7 @@ class St:
 
 
 def dl_opts(cfg, out, st, worker_id, stop_event):
+    yt_dlp = get_ytdlp()
     f = cfg["format"]
 
     def hook(d):
@@ -751,6 +996,8 @@ class WorkerGate:
 
 def download_worker(worker_id, work, cfg, out, lib, st, gate, stop_event, failed, failed_lock,
                     playlist_by_id, compact):
+    yt_dlp = get_ytdlp()
+    Clean, SquareCover = postprocessor_types()
     status = WorkerStatus(st, worker_id)
     with yt_dlp.YoutubeDL(dl_opts(cfg, out, st, worker_id, stop_event)) as y:
         y.add_post_processor(Clean(lib, cfg, status), when="pre_process")
@@ -905,7 +1152,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         s["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         playlist_count = len(lib.d["playlists"])
     lib.save()
-    ff = profile_dir(out) / "failed.txt"
+    ff = DATA / "failed.txt"
     if failed:
         ff.write_text("\n".join(f"{a}\t{b}" for a, b in failed), encoding="utf-8")
     else:
@@ -949,11 +1196,11 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
 
 
 def show_stats(cfg):
-    lib = Lib(cfg["out"])
+    lib = get_lib(cfg["out"])
     s = lib.d["stats"]
     t = Table(title="Library stats", show_header=False, border_style="cyan")
     t.add_row("Folder", cfg["out"])
-    t.add_row("Data folder", str(profile_dir(cfg["out"])))
+    t.add_row("Data folder", short_data_dir())
     t.add_row("Songs", str(len(lib.d["songs"])))
     t.add_row("Size", size(lib.total_size()))
     t.add_row("All-time downloads", str(s["downloads"]))
@@ -968,12 +1215,57 @@ def show_stats(cfg):
 
 # ---------- interactive menus (every menu has "‹ Back"; Ctrl+C = back/exit) ----------
 def ask(msg, choices):
-    return questionary.select(msg, choices=[questionary.Choice(t, v) for t, v in choices],
-                              style=STYLE, instruction=" ").ask()
+    try:
+        return questionary.select(msg, choices=[questionary.Choice(t, v) for t, v in choices],
+                                  style=STYLE, instruction=" ").ask()
+    except KeyboardInterrupt:
+        return None
 
 
 def pause():
-    questionary.press_any_key_to_continue("Press any key to continue...").ask()
+    try:
+        console.input("[dim]Press Enter to continue...[/]")
+    except KeyboardInterrupt:
+        return
+
+
+def short_data_dir():
+    try:
+        return str(Path("~") / DATA.relative_to(Path.home()))
+    except ValueError:
+        return str(DATA)
+
+
+def setup_logging():
+    ensure_data_dir()
+    logging.basicConfig(filename=DATA / "sync.log", level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s", force=True)
+
+
+def menu_error(error):
+    logging.exception("Menu action failed")
+    console.print(f"[red]Error: {short(error)}[/]")
+
+
+def print_timings():
+    if not TIMING_ENABLED:
+        return
+    for name in ("imports", "config", "library load"):
+        if name in TIMINGS:
+            console.print(f"[dim]Timing · {name}: {TIMINGS[name]:.3f}s[/]")
+    if UPDATE_CHECKER and "update check reported" not in TIMINGS:
+        elapsed = UPDATE_CHECKER.elapsed
+        if elapsed is None:
+            console.print("[dim]Timing · update check: running in background (2s timeout)[/]")
+        else:
+            console.print(f"[dim]Timing · update check: {elapsed:.3f}s[/]")
+
+
+def report_update_timing():
+    if TIMING_ENABLED and UPDATE_CHECKER and UPDATE_CHECKER.done.is_set() \
+            and "update check reported" not in TIMINGS:
+        console.print(f"[dim]Timing · update check: {UPDATE_CHECKER.elapsed:.3f}s[/]")
+        TIMINGS["update check reported"] = 1
 
 
 def val(c, k):
@@ -983,8 +1275,8 @@ def val(c, k):
     return STYLES[v] if k == "name_style" else (str(v) or "-")
 
 
-def save_named_links(path, links):
-    path = Path(path).expanduser()
+def save_named_links(links):
+    path = DATA / "playlists.txt"
     existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
     existing = set(read_list(path))
     new_links = []
@@ -1006,161 +1298,199 @@ def save_named_links(path, links):
     return len(new_links)
 
 
-def save_my_links(cfg):
-    urls = all_urls(cfg)
-    if not urls:
-        console.print("[dim]No saved links to write.[/]")
+def open_path(path, purpose):
+    path = Path(path)
+    try:
+        if os.name == "nt":
+            os.startfile(str(path))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as e:
+        console.print(f"[yellow]Could not open {purpose}: {e}\nPath: {path}[/]")
+
+
+def open_playlists():
+    ensure_data_dir()
+    path = DATA / "playlists.txt"
+    if not path.exists():
+        path.write_text("# One link per line\n", encoding="utf-8")
+    console.print(f"[dim]{path}[/]")
+    open_path(path, "Playlists.txt")
+
+
+def offer_open_playlists():
+    try:
+        if questionary.confirm("Open Playlists.txt?", default=False).ask():
+            open_playlists()
+    except KeyboardInterrupt:
         return
-    path = questionary.path("Save links to:", default=str(profile_dir(cfg["out"]) / "playlists.txt")).ask()
-    if not path:
-        return
-    existing = set(read_list(path))
-    urls = [url for url in urls if url not in existing]
-    if not urls:
-        console.print("[dim]All saved links are already in that file.[/]")
-        return
-    details, errs = {}, []
-    resolve(urls, cfg, errs, details)
-    for url, reason in errs:
-        console.print(f"[red]Could not read {url}: {reason}[/]")
-    save_named_links(path, [(url, details.get(url, (url, 0, None))[0]) for url in urls])
+
+
+def collect_links(cfg):
+    known, added, number = set(all_urls()), [], 1
+    while True:
+        try:
+            raw = questionary.text(f"Link #{number} (Enter on empty line = Done)").ask()
+        except KeyboardInterrupt:
+            return None
+        if raw is None:
+            return None
+        link = raw.strip()
+        if not link:
+            return added
+        number += 1
+        parsed = urlparse(link)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            console.print("[red]Enter a valid http(s) URL.[/]")
+            continue
+        if link in known:
+            console.print("[dim]Already in Playlists.txt; skipping duplicate link.[/]")
+            continue
+        details, errs = {}, []
+        resolve([link], cfg, errs, details)
+        detail = details.get(link)
+        if errs or not detail or detail[2]:
+            reason = errs[0][1] if errs else (detail[2] if detail else "No playlist or song information found")
+            console.print(f"[red]Could not add link: {reason}[/]")
+            continue
+        name, count, _ = detail
+        added.append((link, name))
+        known.add(link)
+        console.print(f"[green]✔ {name} · {count} songs[/]")
 
 
 def add_links(cfg):
-    c = ask("Add Music", [("Paste links", "paste"), ("Load from a file", "file"),
-                          ("Save my links to a file", "save"), ("‹ Back", "back")])
-    found = False
-    if c == "paste":
-        known, added, number = set(all_urls(cfg)), [], 1
-        while True:
-            raw = questionary.text(f"Link #{number} (Enter on empty line = Done)").ask()
-            if raw is None:
-                save_cfg(cfg)
-                return False
-            link = raw.strip()
-            if not link:
-                break
-            number += 1
-            parsed = urlparse(link)
-            if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
-                console.print("[red]Enter a valid http(s) URL.[/]")
+    options = [("Paste links", "paste"), ("Load from Playlists.txt", "load"),
+               ("Save links to Playlists.txt", "save"), ("‹ Back", "back")]
+    while True:
+        console.clear()
+        try:
+            choice = ask("Add Music", options)
+        except Exception as e:
+            menu_error(e)
+            continue
+        if choice in (None, "back"):
+            return None
+        try:
+            if choice == "paste":
+                added = collect_links(cfg)
+                if added is None or not added:
+                    return None
+                try:
+                    save = questionary.confirm("Also save these to Playlists.txt? [Y/n]", default=True).ask()
+                except KeyboardInterrupt:
+                    return None
+                if save is None:
+                    return None
+                if save:
+                    save_named_links(added)
+                return [url for url, _ in added]
+            if choice == "load":
+                ensure_data_dir()
+                path = DATA / "playlists.txt"
+                links = read_list(path)
+                if not links:
+                    if not path.exists():
+                        path.write_text("# One link per line\n", encoding="utf-8")
+                    elif "# One link per line" not in path.read_text(encoding="utf-8"):
+                        with path.open("a", encoding="utf-8") as f:
+                            f.write("\n# One link per line\n")
+                    console.print(f"[yellow]No links found. Add one link per line in {path}.[/]")
+                    offer_open_playlists()
+                    continue
+                return links
+            added = collect_links(cfg)
+            if added is not None:
+                save_named_links(added)
+                console.print(f"[dim]Playlists.txt: {DATA / 'playlists.txt'}[/]")
+                offer_open_playlists()
+        except Exception as e:
+            menu_error(e)
+            continue
+
+
+def open_data_folder():
+    ensure_data_dir()
+    open_path(DATA, "data folder")
+
+
+def library_folder_menu(cfg):
+    while True:
+        console.clear()
+        console.print(f"[bold]Library folder[/]\n[dim]{cfg['out']}[/]\n")
+        try:
+            choice = ask("", [("Change folder", "change"), ("Open in file explorer", "open"),
+                              ("‹ Back", "back")])
+        except Exception as e:
+            menu_error(e)
+            continue
+        if choice in (None, "back"):
+            return cfg
+        try:
+            if choice == "open":
+                open_path(cfg["out"], "library folder")
                 continue
-            if link in known:
-                console.print("[dim]Already saved; skipping duplicate link.[/]")
-                continue
-            details, errs = {}, []
-            resolve([link], cfg, errs, details)
-            if errs or details.get(link, (None, 0, "No playlist or song information found"))[2]:
-                reason = errs[0][1] if errs else details[link][2]
-                console.print(f"[red]Could not add link: {reason}[/]")
-                continue
-            name, count, _ = details[link]
-            cfg["urls"].append(link)
-            known.add(link)
-            added.append((link, name))
-            found = True
-            console.print(f"[green]✔ {name} · {count} songs[/]")
-        save_cfg(cfg)
-        save_to_file = questionary.confirm("Save these links to a file too? [y/N]", default=False).ask() \
-            if added else False
-        if added and save_to_file is None:
-            return False
-        if save_to_file:
-            path = questionary.path("Save links to:", default=str(profile_dir(cfg["out"]) / "playlists.txt")).ask()
-            if not path:
-                return False
-            save_named_links(path, added)
-    elif c == "file":
-        p = questionary.path("File:", default="playlists.txt").ask()
-        if p and Path(p).is_file():
-            f = str(Path(p).resolve())
-            if f not in cfg["files"]:
-                cfg["files"].append(f)
-            found = True
-        elif p:
-            console.print("[red]File not found.[/]")
-            pause()
-    elif c == "save":
-        save_my_links(cfg)
-    save_cfg(cfg)
-    return found
-
-
-def manage_links(cfg):
-    items = cfg["urls"] + cfg["files"]
-    if not items:
-        console.print("[dim]No saved links.[/]")
-        pause()
-        return
-    r = questionary.checkbox("Space = select · Enter = remove selected", choices=items, style=STYLE).ask()
-    if r:
-        cfg["urls"] = [u for u in cfg["urls"] if u not in r]
-        cfg["files"] = [f for f in cfg["files"] if f not in r]
-
-
-def open_playlists(cfg):
-    p = profile_dir(cfg["out"]) / "playlists.txt"
-    if not p.exists():
-        p.write_text("# One YouTube playlist or song URL per line\n", encoding="utf-8")
-    console.print(f"[dim]{p}[/]")
-    try:
-        if os.name == "nt":
-            os.startfile(str(p))
-        else:
-            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(p)])
-    except Exception:
-        console.print("[yellow]Could not open an editor. Edit the file above by hand.[/]")
-    pause()
-
-
-def open_data_folder(cfg):
-    p = profile_dir(cfg["out"])
-    try:
-        if os.name == "nt":
-            os.startfile(str(p))
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(p)])
-        else:
-            subprocess.Popen(["xdg-open", str(p)])
-    except OSError as e:
-        console.print(f"[yellow]Could not open the data folder: {e}\nData folder: {p}[/]")
+            try:
+                value = questionary.text("Music folder:", default=cfg["out"]).ask()
+            except KeyboardInterrupt:
+                return cfg
+            if value is None or not value.strip():
+                return cfg
+            new_path = Path(value.strip()).expanduser().resolve()
+            if new_path == Path(cfg["out"]).expanduser().resolve():
+                return cfg
+            with console.status("[cyan]Loading library..."):
+                new_path = ensure_lib(new_path)
+                updated = load_cfg(new_path)
+                get_lib(new_path)
+                save_cfg(updated)
+            return updated
+        except Exception as e:
+            menu_error(e)
 
 
 def settings(cfg):
     while True:
         console.clear()
-        console.print(f"[bold orange1]Settings[/]\n[dim]Data folder: {profile_dir(cfg['out'])}[/]\n")
-        n = len(cfg["urls"]) + len(cfg["files"])
-        k = ask("", [(f"{l:<22}{val(cfg, key)}", key) for key, l in LABELS] +
-                [("Library folder", "library"), ("Open data folder", "open_data"),
-                 ("Edit playlists.txt", "edit"), (f"Saved links ({n})", "links"),
-                 ("Reset to defaults", "reset"), ("‹ Back", "back")])
-        if k in (None, "back"):
+        console.print(f"[bold orange1]Settings[/]\n[dim]Data: {short_data_dir()}[/]\n")
+        items = [(f"{label:<22}{val(cfg, key)}", key) for key, label in LABELS]
+        items.extend([("Library folder", "library"), ("Open data folder", "open_data"),
+                      ("Edit Playlists.txt", "edit"), ("Reset to defaults", "reset"), ("‹ Back", "back")])
+        try:
+            choice = ask("", items)
+        except Exception as e:
+            menu_error(e)
+            continue
+        if choice in (None, "back"):
             return cfg
-        if k == "library":
-            p = questionary.path("Music folder:", default=cfg["out"], only_directories=True).ask()
-            if p:
-                cfg = load_cfg(ensure_lib(p))
-                return cfg
-        elif k == "open_data":
-            open_data_folder(cfg)
-        elif k == "reset":
-            cfg.update({**DEFAULTS, "urls": cfg["urls"], "files": cfg["files"]})
-        elif k == "edit":
-            open_playlists(cfg)
-        elif k == "links":
-            manage_links(cfg)
-        elif isinstance(cfg[k], bool):
-            cfg[k] = not cfg[k]
-        elif k in CHOICES:
-            v = ask(dict(LABELS)[k], [(str(STYLES.get(c, c)), c) for c in CHOICES[k]] + [("‹ Back", "back")])
-            if v and v != "back":
-                cfg[k] = v
-        else:
-            v = questionary.text(dict(LABELS)[k] + ":", default=str(cfg[k])).ask()
-            if v is not None:
-                cfg[k] = (int(v) if v.isdigit() else cfg[k]) if k == "retries" else v.strip()
-        save_cfg(cfg)
+        try:
+            if choice == "library":
+                cfg = library_folder_menu(cfg)
+            elif choice == "open_data":
+                open_data_folder()
+            elif choice == "edit":
+                open_playlists()
+            elif choice == "reset":
+                out = cfg["out"]
+                cfg.update(DEFAULTS)
+                cfg["out"] = out
+            elif isinstance(cfg[choice], bool):
+                cfg[choice] = not cfg[choice]
+            elif choice in CHOICES:
+                value = ask(dict(LABELS)[choice],
+                            [(str(STYLES.get(item, item)), item) for item in CHOICES[choice]] + [("‹ Back", "back")])
+                if value and value != "back":
+                    cfg[choice] = value
+            else:
+                value = questionary.text(dict(LABELS)[choice] + ":", default=str(cfg[choice])).ask()
+                if value is not None:
+                    cfg[choice] = (int(value) if value.isdigit() else cfg[choice]) \
+                        if choice == "retries" else value.strip()
+            save_cfg(cfg)
+        except Exception as e:
+            menu_error(e)
 
 
 def review(cfg, plan):
@@ -1201,34 +1531,41 @@ def review(cfg, plan):
     return ask("", [("Start", "start"), ("Edit settings", "edit"), ("‹ Back", "back"), ("✕ Exit", "exit")])
 
 
-def run_flow(cfg, with_review):
+def run_flow(cfg, with_review, extra_urls=None):
+    extra_urls = list(extra_urls or [])
     while True:
-        urls = all_urls(cfg)
+        urls = list(dict.fromkeys(all_urls(cfg) + extra_urls))
         if not urls:
-            console.print("[yellow]No links yet. Use 'Add Music'.[/]")
+            console.print(f"[yellow]No links yet. Add them to {DATA / 'playlists.txt'} with Add Music.[/]")
             pause()
             return "home"
-        plan = scan(cfg, urls)
-        a = review(cfg, plan) if with_review else "start"
-        if not with_review:
-            console.print(f"[bold]{len(plan['todo'])} new[/] · "
-                          f"{len(plan['unique']) - len(plan['todo'])} in library\n")
-        if a == "start":
-            execute(cfg, plan, interactive=True, prune_ok=True)
-            pause()
+        if not need_ffmpeg():
             return "home"
-        if a == "edit":
-            cfg = settings(cfg)
-            continue
-        return "exit" if a == "exit" else "home"
+        try:
+            plan = scan(cfg, urls)
+            choice = review(cfg, plan) if with_review else "start"
+            if not with_review:
+                console.print(f"[bold]{len(plan['todo'])} new[/] · "
+                              f"{len(plan['unique']) - len(plan['todo'])} in library\n")
+            if choice == "start":
+                execute(cfg, plan, interactive=True, prune_ok=True)
+                pause()
+                return "home"
+            if choice == "edit":
+                cfg = settings(cfg)
+                continue
+            return "exit" if choice == "exit" else "home"
+        except Exception as e:
+            menu_error(e)
+            return "home"
 
 
 def header(cfg, upd):
-    lib = Lib(cfg["out"])
+    lib = get_lib(cfg["out"])
     console.print(Panel(f"[bold orange1]♪  ytmusic-sync[/]  v{VERSION}\n[dim]YouTube music + Local, always in sync[/]",
                         border_style="orange1", expand=False))
     console.print(f" {cfg['out']} · {len(lib.d['songs'])} songs · {size(lib.total_size())}\n"
-                  f" Last sync: {ago(lib.d['stats']['last_run'])}")
+                  f" Last sync: {ago(lib.d['stats']['last_run'])} · Data: {short_data_dir()}")
     if upd:
         console.print(f" [yellow]⚠ yt-dlp update available ({upd[0]} → {upd[1]})[/]")
     console.print()
@@ -1236,22 +1573,21 @@ def header(cfg, upd):
 
 def pick_library():
     console.print(Panel("[bold orange1]Welcome![/]\nWhere should your music library live?\n"
-                        "[dim]Songs and .m3u8 playlists go here; app data is stored in your user profile.[/]",
+                        "[dim]Songs and .m3u8 playlists go here; app data is stored in ~/.ytmusic-sync.[/]",
                         border_style="orange1", expand=False))
     p = questionary.path("Music folder:", default=str(Path.home() / "music"), only_directories=True).ask()
     return Path(p).expanduser() if p else None
 
 
-def interactive(out):
-    if out is None:
-        out = pick_library()
-        if out is None:
-            return
-    cfg = load_cfg(ensure_lib(out))
-    upd = outdated(cfg["out"])
+def interactive(cfg):
     while True:
         console.clear()
+        upd = UPDATE_CHECKER.result if UPDATE_CHECKER and UPDATE_CHECKER.done.is_set() else None
         header(cfg, upd)
+        report_update_timing()
+        if TIMING_ENABLED and "startup timing printed" not in TIMINGS:
+            print_timings()
+            TIMINGS["startup timing printed"] = 1
         first = not all_urls(cfg)
         menu = [("Use defaults & start", "go"), ("Customize", "set"), ("Quit", "q")] if first else \
                [("Update library", "upd"), ("Add Music", "add"), ("Settings", "set"), ("Stats", "stats")]
@@ -1259,28 +1595,59 @@ def interactive(out):
             menu.append((f"Update yt-dlp ({upd[0]} → {upd[1]})", "ytdlp"))
         if not first:
             menu.append(("Quit", "q"))
-        k = ask("", menu)
+        try:
+            k = ask("", menu)
+        except Exception as e:
+            menu_error(e)
+            continue
         if k in (None, "q"):
             return
-        if k == "set":
-            cfg = settings(cfg)
-            upd = outdated(cfg["out"])
-        elif k == "stats":
-            show_stats(cfg)
-            pause()
-        elif k == "ytdlp":
-            upgrade_ytdlp()
-            pause()
-            return
-        elif k in ("go", "add"):
-            if add_links(cfg) and run_flow(cfg, True) == "exit":
+        try:
+            if k == "set":
+                cfg = settings(cfg)
+            elif k == "stats":
+                show_stats(cfg)
+                pause()
+            elif k == "ytdlp":
+                upgrade_ytdlp()
+                pause()
+            elif k == "go":
+                links = all_urls(cfg)
+                if not links:
+                    links = add_links(cfg) or []
+                if links and run_flow(cfg, True, links) == "exit":
+                    return
+            elif k == "add":
+                links = add_links(cfg)
+                if links and run_flow(cfg, True, links) == "exit":
+                    return
+            elif k == "upd" and run_flow(cfg, False) == "exit":
                 return
-        elif k == "upd" and run_flow(cfg, False) == "exit":
-            return
+        except Exception as e:
+            menu_error(e)
 
 
 # ---------- command line ----------
+class VersionAction(argparse.Action):
+    def __init__(self, option_strings, dest, nargs=0, **kwargs):
+        super().__init__(option_strings, dest, nargs=nargs, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.exit(message=f"{parser.prog} {VERSION} (yt-dlp {installed_ytdlp_version()})\n")
+
+
+def save_cli_links(cfg, urls):
+    if not urls:
+        return
+    details, errors = {}, []
+    resolve(urls, cfg, errors, details)
+    for url, reason in errors:
+        console.print(f"[yellow]Could not get a name for {url}: {reason}[/]")
+    save_named_links([(url, details.get(url, (url, 0, None))[0]) for url in urls])
+
+
 def main():
+    global TIMING_ENABLED, UPDATE_CHECKER
     ap = argparse.ArgumentParser(prog="ytsync", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Download YouTube songs/playlists with clean tags and keep .m3u8 playlists in sync.\n"
                     "Run with no arguments for interactive mode.",
@@ -1309,33 +1676,70 @@ def main():
     g.add_argument("--jobs", type=int, choices=range(1, 7), help="parallel downloads (1-6, default 3)")
     g = ap.add_argument_group("other")
     g.add_argument("--compact", action="store_true", help="one line per song instead of the dashboard")
-    g.add_argument("--where", action="store_true", help="print the profile and library folder paths, then exit")
+    g.add_argument("--where", action="store_true", help="print the data folder and music library folder, then exit")
+    g.add_argument("--timing", action="store_true", help="print startup step timings")
     g.add_argument("--update-ytdlp", action="store_true", help="upgrade yt-dlp and exit")
-    g.add_argument("-V", "--version", action="version", version=f"%(prog)s {VERSION} (yt-dlp {YTDLP_VERSION})")
+    g.add_argument("-V", "--version", action=VersionAction, help="show program and yt-dlp versions, then exit")
     a = ap.parse_args()
 
+    direct = bool(a.urls or a.playlists or a.update or a.stats or a.dry_run or a.where or a.update_ytdlp)
+    if not direct and not sys.stdin.isatty():
+        return ap.print_help()
+    TIMING_ENABLED = a.timing
+    import_started = time.perf_counter()
     try:
+        ensure_ui()
+        TIMINGS["imports"] = time.perf_counter() - import_started
+        config_started = time.perf_counter()
+        ensure_data_dir()
+        migrate_legacy_profiles()
+        cfg = load_cfg()
+        TIMINGS["config"] = time.perf_counter() - config_started
+
         if a.update_ytdlp:
+            if a.timing:
+                print_timings()
             return upgrade_ytdlp()
-        out = find_lib(a.out)
-        direct = bool(a.urls or a.playlists or a.update or a.stats or a.dry_run or a.where)
-        if not direct:
-            if not sys.stdin.isatty():
-                return ap.print_help()
-            if need_ffmpeg():
-                interactive(out)
-            return
+
+        out = Path(a.out).expanduser().resolve() if a.out else \
+            (Path(cfg["out"]).expanduser().resolve() if cfg["out"] else None)
+        if out is not None and not a.out and not out.is_dir():
+            console.print(f"[yellow]Last used music folder is unavailable: {out}. "
+                          "Reconnect the drive or choose a folder.[/]")
+            out = None
         if out is None:
+            if a.where and not sys.stdin.isatty():
+                console.print(f"Data folder: {DATA}\nLibrary folder: (not selected)")
+                if a.timing:
+                    print_timings()
+                return 0
             if sys.stdin.isatty():
                 out = pick_library()
             if out is None:
                 console.print("[yellow]No library folder selected. Run [bold]ytsync[/bold] to pick one, or pass -o FOLDER.[/]")
                 return 1
+
+        config_reload_started = time.perf_counter()
         out = ensure_lib(out)
-        if a.where:
-            console.print(f"Profile folder: {profile_dir(out)}\nLibrary folder: {out}")
-            return 0
+        setup_logging()
         cfg = load_cfg(out)
+        save_cfg(cfg)
+        TIMINGS["config"] += time.perf_counter() - config_reload_started
+        if a.where:
+            console.print(f"Data folder: {DATA}\nLibrary folder: {out}")
+            if a.timing:
+                print_timings()
+            return 0
+
+        UPDATE_CHECKER = start_update_check()
+        library_started = time.perf_counter()
+        if not (a.urls or a.playlists or a.update or a.stats or a.dry_run):
+            with console.status("[cyan]Loading library..."):
+                get_lib(out)
+        else:
+            get_lib(out)
+        TIMINGS["library load"] = time.perf_counter() - library_started
+
         for k in ("format", "quality", "name_style", "cookies", "rate_limit", "retries", "jobs"):
             if getattr(a, k) is not None:
                 cfg[k] = getattr(a, k)
@@ -1346,32 +1750,61 @@ def main():
         if a.prune:
             cfg["prune"] = True
         if a.stats:
-            return show_stats(cfg)
-        upd = outdated(cfg["out"])
-        if upd:
-            console.print(f"[yellow]⚠ yt-dlp {upd[0]} → {upd[1]} available. Run: ytsync --update-ytdlp[/]")
+            show_stats(cfg)
+            if a.timing:
+                print_timings()
+            return 0
+
+        if not direct:
+            interactive(cfg)
+            report_update_timing()
+            if a.timing and "startup timing printed" not in TIMINGS:
+                print_timings()
+            return 0
+
         urls = a.urls + (read_list(a.playlists) if a.playlists else [])
         if a.save and a.urls:
-            cfg["urls"] += [u for u in a.urls if u not in cfg["urls"]]
-            save_cfg(cfg)
+            save_cli_links(cfg, list(dict.fromkeys(a.urls)))
         if a.update:
             urls += all_urls(cfg)
         urls = list(dict.fromkeys(urls))
         if not urls:
-            return console.print("[yellow]No links saved yet. Run ytsync, or: ytsync <url> --save[/]")
+            console.print(f"[yellow]No links saved yet. Add links to {DATA / 'playlists.txt'} or pass a URL.[/]")
+            if a.timing:
+                print_timings()
+            return 0
         if not a.dry_run and not need_ffmpeg():
-            return
+            return 1
         plan = scan(cfg, urls)
         if a.dry_run:
             for e in plan["todo"]:
                 console.print(f"  [green]+[/] {e['title']}")
-            return console.print(f"\n[yellow]Dry run: {len(plan['todo'])} new, nothing downloaded.[/]")
-        execute(cfg, plan, compact=a.compact, prune_ok=a.update)
+            console.print(f"\n[yellow]Dry run: {len(plan['todo'])} new, nothing downloaded.[/]")
+        else:
+            execute(cfg, plan, compact=a.compact, prune_ok=a.update)
+        report_update_timing()
+        if a.timing:
+            print_timings()
+        return 0
     except KeyboardInterrupt:
-        console.print("\n[yellow]Cancelled.[/]")
+        if console is not None:
+            console.print("\n[yellow]Cancelled.[/]")
+            report_update_timing()
+            if a.timing:
+                print_timings()
+        else:
+            print("Cancelled.", file=sys.stderr)
+        return 130
     except OSError as e:
         console.print(f"[red]Could not access the music or data folder: {e}[/]")
         console.print("[dim]Check that the music folder is connected and writable.[/]")
+        return 1
+    except Exception as e:
+        logging.exception("Startup or command failed")
+        if console is not None:
+            console.print(f"[red]Error: {short(e)}[/]")
+        else:
+            print(f"Error: {short(e)}", file=sys.stderr)
         return 1
 
 

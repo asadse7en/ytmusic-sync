@@ -4,9 +4,9 @@ Download your YouTube playlists as clean, tagged music files, and keep matching 
 Run it again any time: only new songs download, and playlists update (additions, removals, order).
 
 - Interactive menus, a live progress dashboard, and a stats summary
-- Clean filenames (`Title.m4a`) with artist, title and cover art in the tags
+- Clean filenames (`Title.mp3` by default) with artist, title and cover art in the tags
 - One flat folder with `.m3u8` playlists next to the songs, so VLC, Poweramp, Musicolet, foobar2000 and Jellyfin can use them
-- Settings, links and history live in the ytsync data folder in your user profile
+- Settings, links and history live in the hidden `~/.ytmusic-sync` data folder
 
 ## Install
 
@@ -51,7 +51,7 @@ Every menu has **‹ Back**. Ctrl+C goes back, or exits from the home screen.
 |---|---|
 | Home (returning) | Update library, Add Music, Settings, Stats, Quit |
 | Home (first run) | Use defaults & start, Customize, Quit |
-| Add Music | Paste links one at a time, load a file, or save your links to a named links file |
+| Add Music | Paste links, Load from Playlists.txt, Save links to Playlists.txt, Back |
 | Ready | Review unique songs and playlist counts (Start, Edit settings, Back, Exit) |
 | Settings | All options below, saved automatically |
 | Stats | Songs, size, all-time downloads, runs, last sync, songs per playlist |
@@ -69,7 +69,8 @@ Every menu has **‹ Back**. Ctrl+C goes back, or exits from the home screen.
 | `ytsync -p links.txt` | Use a text file of URLs (one per line, `#` comments allowed) |
 | `ytsync -d` | Dry run: show what would download |
 | `ytsync -s` | Library stats |
-| `ytsync --where` | Print the profile data folder and music library folder |
+| `ytsync --where` | Print the data folder and music library folder |
+| `ytsync --timing` | Print startup step timings |
 | `ytsync --update-ytdlp` | Upgrade yt-dlp |
 
 Options (flags apply to that run only; change defaults in Settings):
@@ -77,7 +78,7 @@ Options (flags apply to that run only; change defaults in Settings):
 | Flag | Meaning |
 |---|---|
 | `-o, --out DIR` | Music library folder |
-| `-f, --format` | `m4a` (default), `mp3`, `opus`, `flac`, `wav`, `aac` |
+| `-f, --format` | `mp3` (default), `m4a`, `opus`, `flac`, `wav`, `aac` |
 | `-q, --quality` | `best` (default), `320`, `256`, `192`, `128` (kbps, lossy formats) |
 | `-n, --name-style` | `title` (default), `artist-title`, `title-artist` |
 | `--no-cover` | Skip cover art |
@@ -92,8 +93,8 @@ Options (flags apply to that run only; change defaults in Settings):
 ## Settings
 
 Format, Quality, Filename style, Cover art, Square cover, Clean titles, Playlist .m3u8 files, Prune removed songs,
-Skip duplicate songs, Parallel downloads, Speed limit, Retries, Browser cookies, Edit playlists.txt, Saved links,
-Reset to defaults. Duplicate video IDs are downloaded once; matching titles with durations within three seconds
+Skip duplicate songs, Parallel downloads, Speed limit, Retries, Browser cookies, Library folder, Open data folder,
+Edit Playlists.txt, Reset to defaults. Duplicate video IDs are downloaded once; matching titles with durations within three seconds
 are recorded as aliases and their playlist entries use the kept song file. Links saved to a file include a name
 comment above each URL.
 
@@ -105,21 +106,22 @@ music/
 └── Gym.m3u8
 ```
 
-The profile data folder contains `config.json`, `playlists.txt`, `library.json`, `failed.txt`, `sync.log` and
-`cache.json`. Each music folder has its own profile:
+All app data is in one hidden folder in your home directory:
 
-- Windows: `%LOCALAPPDATA%\ytsync\libraries\<folder>-<hash>`
-- macOS: `~/Library/Application Support/ytsync/libraries/<folder>-<hash>`
-- Linux: `~/.local/share/ytsync/libraries/<folder>-<hash>`
+- Windows: `C:\Users\<you>\.ytmusic-sync`
+- macOS: `~/.ytmusic-sync`
+- Linux: `~/.ytmusic-sync`
 
-The last-used music folder pointer, `last_library.json`, is stored in the OS config folder. Run `ytsync --where`
-to print both paths. Use `-o FOLDER` or Settings > Library folder to switch libraries.
+It contains `config.json`, `playlists.txt`, `failed.txt`, `sync.log`, `cache.json`, and separate JSON library
+databases at `libs/<hash>.json` for each music folder. The music folder contains only songs and `.m3u8` files.
+Run `ytsync --where` to print both the data folder and music folder. Use `-o FOLDER` or Settings > Library folder
+to switch libraries.
 
-Moving to a new PC: copy the music folder, run ytsync, pick that folder. The song database rebuilds from the file tags. Use Add Music > Save my links to a file beforehand to carry your playlist links.
+Moving to a new PC: copy the music folder, run ytsync, pick that folder. The song database rebuilds from the file tags. Use Add Music > Save links to Playlists.txt beforehand to carry your playlist links.
 
 ## Filenames and tags
 
-- Filenames default to `Title.m4a`. If two songs share a title, the second becomes `Title - Artist.m4a`.
+- Filenames default to `Title.mp3`. If two songs share a title, the second becomes `Title - Artist.mp3`.
 - Titles are cleaned: "(Official Video)", "[HD]", "(Lyrics)", emoji, and "- Topic" on channel names are removed.
 - Artist, title and album come from YouTube Music metadata when available; otherwise `Artist - Title` is parsed from the video title, then the channel name.
 - Cover art is cropped square and embedded. Tags are a best guess, so a few odd titles may need manual fixing.

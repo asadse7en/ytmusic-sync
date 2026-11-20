@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """ytmusic-sync: YouTube playlists -> clean, tagged music library + .m3u8 playlists."""
-import argparse, contextlib, json, logging, os, queue, re, shutil, subprocess, sys, threading, time, urllib.request
+import argparse, contextlib, hashlib, json, logging, os, queue, re, shutil, subprocess, sys, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+import unicodedata
 from urllib.parse import urlparse
 
 try:
     import questionary, yt_dlp
-    from platformdirs import user_config_dir
+    from platformdirs import user_config_dir, user_data_dir
     from yt_dlp.postprocessor.common import PostProcessor
     from yt_dlp.version import __version__ as YTDLP_VERSION
     from rich.console import Console, Group
@@ -24,9 +25,9 @@ for _s in (sys.stdout, sys.stderr):
     with contextlib.suppress(Exception):
         _s.reconfigure(encoding="utf-8")
 
-VERSION = "2.0.0"
-APP, HID = "ytmusic-sync", ".ytmusic-sync"
-POINTER = Path(user_config_dir(APP, appauthor=False)) / "last_library.json"
+VERSION = "0.1"
+DATA_BASE = Path(user_data_dir("ytsync", appauthor=False)) / "libraries"
+POINTER = Path(user_config_dir("ytsync", appauthor=False)) / "last_library.json"
 console = Console()
 
 FORMATS = ["m4a", "mp3", "opus", "flac", "wav", "aac"]
@@ -115,42 +116,67 @@ def read_list(p):
 
 
 # ---------- library location, config ----------
-def hid(out):
-    return Path(out) / HID
+def profile_dir(out):
+    resolved = Path(out).expanduser().resolve()
+    digest = hashlib.sha1(str(resolved).lower().encode("utf-8")).hexdigest()[:8]
+    profile = DATA_BASE / f"{fsafe(resolved.name)}-{digest}"
+    profile.mkdir(parents=True, exist_ok=True)
+    return profile
+
+
+def migration_target(profile, name):
+    target = profile / name
+    if not target.exists():
+        return target
+    i = 1
+    while True:
+        candidate = profile / f"{name}.legacy-{i}"
+        if not candidate.exists():
+            return candidate
+        i += 1
 
 
 def ensure_lib(out):
-    """Create the hidden folder, migrate old root-level files, remember this library."""
+    """Create a music folder profile, migrate legacy app files, and remember the library."""
     out = Path(out).expanduser().resolve()
-    h = hid(out)
-    h.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt":
-        with contextlib.suppress(Exception):
-            import ctypes
-            ctypes.windll.kernel32.SetFileAttributesW(str(h), 2)
-    for old, new in (("library.json", "library.json"), ("failed.txt", "failed.txt"), ("ytmusic-sync.log", "sync.log")):
-        if (out / old).is_file() and not (h / new).exists():
-            shutil.move(str(out / old), str(h / new))
-    with contextlib.suppress(OSError):
-        POINTER.parent.mkdir(parents=True, exist_ok=True)
-        aw(POINTER, json.dumps({"path": str(out)}))
+    if not out.exists():
+        if not out.parent.is_dir():
+            raise FileNotFoundError(f"Music folder is unavailable: {out}")
+        out.mkdir()
+    if not out.is_dir():
+        raise NotADirectoryError(f"Music folder is not a directory: {out}")
+    profile = profile_dir(out)
+    legacy = out / ".ytmusic-sync"
+    if legacy.is_dir():
+        for item in legacy.iterdir():
+            shutil.move(str(item), str(migration_target(profile, item.name)))
+        legacy.rmdir()
+    for old, new in (("library.json", "library.json"), ("failed.txt", "failed.txt"),
+                     ("ytmusic-sync.log", "sync.log")):
+        source = out / old
+        if source.is_file():
+            shutil.move(str(source), str(migration_target(profile, new)))
+    POINTER.parent.mkdir(parents=True, exist_ok=True)
+    aw(POINTER, json.dumps({"path": str(out)}))
     return out
 
 
 def find_lib(explicit=None):
-    """--out > current folder (or a parent) with .ytmusic-sync > last used library."""
+    """--out > last used library > no selection."""
     if explicit:
         return Path(explicit).expanduser().resolve()
-    cwd = Path.cwd()
-    for p in [cwd, *cwd.parents]:
-        if (p / HID).is_dir():
-            return p
     p = jload(POINTER, {}).get("path")
-    return Path(p) if p and (Path(p) / HID).is_dir() else None
+    if p:
+        folder = Path(p).expanduser()
+        if folder.is_dir():
+            return folder.resolve()
+        console.print(f"[yellow]Last used music folder is unavailable: {folder}. "
+                      "Reconnect the drive or choose a folder.[/]")
+    return None
 
 
 def load_cfg(out):
-    c = {**DEFAULTS, **jload(hid(out) / "config.json", {})}
+    c = {**DEFAULTS, **jload(profile_dir(out) / "config.json", {})}
     c["urls"], c["files"] = list(c["urls"]), list(c["files"])
     c["jobs"] = int(c["jobs"])
     if not 1 <= c["jobs"] <= 6:
@@ -160,11 +186,11 @@ def load_cfg(out):
 
 
 def save_cfg(c):
-    aw(hid(c["out"]) / "config.json", json.dumps({k: v for k, v in c.items() if k != "out"}, indent=1))
+    aw(profile_dir(c["out"]) / "config.json", json.dumps({k: v for k, v in c.items() if k != "out"}, indent=1))
 
 
 def all_urls(c):
-    urls = c["urls"] + [u for f in c["files"] for u in read_list(f)] + read_list(hid(c["out"]) / "playlists.txt")
+    urls = c["urls"] + [u for f in c["files"] for u in read_list(f)] + read_list(profile_dir(c["out"]) / "playlists.txt")
     return list(dict.fromkeys(urls))
 
 
@@ -195,7 +221,7 @@ def vtuple(v):
 
 
 def ytdlp_latest(out):
-    cp = hid(out) / "cache.json"
+    cp = profile_dir(out) / "cache.json"
     c = jload(cp, {})
     if time.time() - c.get("t", 0) < 86400 and c.get("latest"):
         return c["latest"]
@@ -310,7 +336,7 @@ def tag_has_url(k, v):
 
 class Lib:
     def __init__(self, out):
-        self.out, self.f = Path(out), hid(out) / "library.json"
+        self.out, self.f = Path(out), profile_dir(out) / "library.json"
         self.lock, self.name_lock, self.reserved_names = threading.RLock(), threading.Lock(), set()
         self.reserved_by_id = {}
         self.d = {"songs": {}, "playlists": {}, "stats": {}, "aliases": {}}
@@ -398,7 +424,7 @@ def resolve(urls, cfg, errs, details=None):
 
 
 def song_key(title):
-    normalized = re.sub(r"[^\w\s]", "", tidy(title).lower())
+    normalized = "".join(c for c in tidy(title).lower() if not unicodedata.category(c).startswith("P"))
     return re.sub(r"\s+", " ", normalized).strip()
 
 
@@ -412,7 +438,8 @@ def canonical_id(vid, aliases):
 
 def scan(cfg, urls):
     out = Path(cfg["out"])
-    logging.basicConfig(filename=hid(out) / "sync.log", level=logging.INFO, format="%(asctime)s %(message)s")
+    logging.basicConfig(filename=profile_dir(out) / "sync.log", level=logging.INFO,
+                        format="%(asctime)s %(message)s", force=True)
     lib, errs = Lib(out), []
     pls, singles, bad = resolve(urls, cfg, errs)
     entries = [x for p in pls for x in p["items"]] + singles
@@ -513,9 +540,9 @@ class St:
             elif d["postprocessor"] in ("Metadata", "EmbedThumbnail"):
                 self.workers[worker_id]["stage"] = 3
 
-    def set_retry(self, worker_id, delay):
+    def set_retry(self, worker_id, delay=None):
         with self.lock:
-            self.workers[worker_id]["retry"] = f"Retrying in {delay}s"
+            self.workers[worker_id]["retry"] = f"Retrying in {delay}s" if delay else ""
 
     def finish_worker(self, worker_id):
         with self.lock:
@@ -678,7 +705,8 @@ def dl_opts(cfg, out, st, worker_id, stop_event):
     return o
 
 
-def m3u(out, name, ids, songs, aliases):
+def m3u(out, name, ids, songs, aliases=None):
+    aliases = aliases or {}
     L = ["#EXTM3U"]
     for i in ids:
         s = songs.get(canonical_id(i, aliases))
@@ -778,6 +806,7 @@ def download_worker(worker_id, work, cfg, out, lib, st, gate, stop_event, failed
                             cancelled = True
                             break
                         held = True
+                        st.set_retry(worker_id)
                         continue
                     break
             finally:
@@ -817,10 +846,11 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
             work.put((index, e))
         with live:
             executor = ThreadPoolExecutor(max_workers=worker_count)
-            futures = [executor.submit(download_worker, worker_id, work, cfg, out, lib, st, gate, stop_event,
-                                       failed, failed_lock, playlist_by_id, plain)
-                       for worker_id in range(worker_count)]
+            futures = []
             try:
+                futures = [executor.submit(download_worker, worker_id, work, cfg, out, lib, st, gate, stop_event,
+                                           failed, failed_lock, playlist_by_id, plain)
+                           for worker_id in range(worker_count)]
                 for future in as_completed(futures):
                     future.result()
             except KeyboardInterrupt:
@@ -842,6 +872,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
 
     with lib.lock:
         songs, aliases = dict(lib.d["songs"]), dict(plan["aliases"])
+        lib.d["aliases"] = aliases
         old_playlists = dict(lib.d["playlists"])
     rows = []
     for p in plan["pls"]:
@@ -874,7 +905,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         s["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         playlist_count = len(lib.d["playlists"])
     lib.save()
-    ff = hid(out) / "failed.txt"
+    ff = profile_dir(out) / "failed.txt"
     if failed:
         ff.write_text("\n".join(f"{a}\t{b}" for a, b in failed), encoding="utf-8")
     else:
@@ -897,7 +928,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
     if plan["bad"]:
         console.print(f"[dim]{plan['bad']} private/deleted videos skipped[/]")
     if failed:
-        t = Table(title=f"Needs attention ({len(failed)}), saved to {HID}/failed.txt",
+        t = Table(title=f"Needs attention ({len(failed)}), saved to {ff}",
                   border_style="#ef4444", header_style="bold #ef4444")
         t.add_column("Item", no_wrap=True)
         t.add_column("Reason")
@@ -922,6 +953,7 @@ def show_stats(cfg):
     s = lib.d["stats"]
     t = Table(title="Library stats", show_header=False, border_style="cyan")
     t.add_row("Folder", cfg["out"])
+    t.add_row("Data folder", str(profile_dir(cfg["out"])))
     t.add_row("Songs", str(len(lib.d["songs"])))
     t.add_row("Size", size(lib.total_size()))
     t.add_row("All-time downloads", str(s["downloads"]))
@@ -979,7 +1011,7 @@ def save_my_links(cfg):
     if not urls:
         console.print("[dim]No saved links to write.[/]")
         return
-    path = questionary.path("Save links to:", default=str(hid(cfg["out"]) / "playlists.txt")).ask()
+    path = questionary.path("Save links to:", default=str(profile_dir(cfg["out"]) / "playlists.txt")).ask()
     if not path:
         return
     existing = set(read_list(path))
@@ -1029,10 +1061,15 @@ def add_links(cfg):
             found = True
             console.print(f"[green]✔ {name} · {count} songs[/]")
         save_cfg(cfg)
-        if added and questionary.confirm("Save these links to a file too? [y/N]", default=False).ask():
-            path = questionary.path("Save links to:", default=str(hid(cfg["out"]) / "playlists.txt")).ask()
-            if path:
-                save_named_links(path, added)
+        save_to_file = questionary.confirm("Save these links to a file too? [y/N]", default=False).ask() \
+            if added else False
+        if added and save_to_file is None:
+            return False
+        if save_to_file:
+            path = questionary.path("Save links to:", default=str(profile_dir(cfg["out"]) / "playlists.txt")).ask()
+            if not path:
+                return False
+            save_named_links(path, added)
     elif c == "file":
         p = questionary.path("File:", default="playlists.txt").ask()
         if p and Path(p).is_file():
@@ -1062,7 +1099,7 @@ def manage_links(cfg):
 
 
 def open_playlists(cfg):
-    p = hid(cfg["out"]) / "playlists.txt"
+    p = profile_dir(cfg["out"]) / "playlists.txt"
     if not p.exists():
         p.write_text("# One YouTube playlist or song URL per line\n", encoding="utf-8")
     console.print(f"[dim]{p}[/]")
@@ -1076,17 +1113,38 @@ def open_playlists(cfg):
     pause()
 
 
+def open_data_folder(cfg):
+    p = profile_dir(cfg["out"])
+    try:
+        if os.name == "nt":
+            os.startfile(str(p))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+    except OSError as e:
+        console.print(f"[yellow]Could not open the data folder: {e}\nData folder: {p}[/]")
+
+
 def settings(cfg):
     while True:
         console.clear()
-        console.print("[bold orange1]Settings[/]\n")
+        console.print(f"[bold orange1]Settings[/]\n[dim]Data folder: {profile_dir(cfg['out'])}[/]\n")
         n = len(cfg["urls"]) + len(cfg["files"])
         k = ask("", [(f"{l:<22}{val(cfg, key)}", key) for key, l in LABELS] +
-                [("Edit playlists.txt", "edit"), (f"Saved links ({n})", "links"),
+                [("Library folder", "library"), ("Open data folder", "open_data"),
+                 ("Edit playlists.txt", "edit"), (f"Saved links ({n})", "links"),
                  ("Reset to defaults", "reset"), ("‹ Back", "back")])
         if k in (None, "back"):
-            return
-        if k == "reset":
+            return cfg
+        if k == "library":
+            p = questionary.path("Music folder:", default=cfg["out"], only_directories=True).ask()
+            if p:
+                cfg = load_cfg(ensure_lib(p))
+                return cfg
+        elif k == "open_data":
+            open_data_folder(cfg)
+        elif k == "reset":
             cfg.update({**DEFAULTS, "urls": cfg["urls"], "files": cfg["files"]})
         elif k == "edit":
             open_playlists(cfg)
@@ -1160,14 +1218,14 @@ def run_flow(cfg, with_review):
             pause()
             return "home"
         if a == "edit":
-            settings(cfg)
+            cfg = settings(cfg)
             continue
         return "exit" if a == "exit" else "home"
 
 
 def header(cfg, upd):
     lib = Lib(cfg["out"])
-    console.print(Panel(f"[bold orange1]♪  ytmusic-sync[/]  v{VERSION}\n[dim]YouTube music + playlists, always in sync[/]",
+    console.print(Panel(f"[bold orange1]♪  ytmusic-sync[/]  v{VERSION}\n[dim]YouTube music + Local, always in sync[/]",
                         border_style="orange1", expand=False))
     console.print(f" {cfg['out']} · {len(lib.d['songs'])} songs · {size(lib.total_size())}\n"
                   f" Last sync: {ago(lib.d['stats']['last_run'])}")
@@ -1178,7 +1236,7 @@ def header(cfg, upd):
 
 def pick_library():
     console.print(Panel("[bold orange1]Welcome![/]\nWhere should your music library live?\n"
-                        "[dim]Songs, playlists and settings (in a hidden .ytmusic-sync folder) go here.[/]",
+                        "[dim]Songs and .m3u8 playlists go here; app data is stored in your user profile.[/]",
                         border_style="orange1", expand=False))
     p = questionary.path("Music folder:", default=str(Path.home() / "music"), only_directories=True).ask()
     return Path(p).expanduser() if p else None
@@ -1205,7 +1263,8 @@ def interactive(out):
         if k in (None, "q"):
             return
         if k == "set":
-            settings(cfg)
+            cfg = settings(cfg)
+            upd = outdated(cfg["out"])
         elif k == "stats":
             show_stats(cfg)
             pause()
@@ -1250,6 +1309,7 @@ def main():
     g.add_argument("--jobs", type=int, choices=range(1, 7), help="parallel downloads (1-6, default 3)")
     g = ap.add_argument_group("other")
     g.add_argument("--compact", action="store_true", help="one line per song instead of the dashboard")
+    g.add_argument("--where", action="store_true", help="print the profile and library folder paths, then exit")
     g.add_argument("--update-ytdlp", action="store_true", help="upgrade yt-dlp and exit")
     g.add_argument("-V", "--version", action="version", version=f"%(prog)s {VERSION} (yt-dlp {YTDLP_VERSION})")
     a = ap.parse_args()
@@ -1258,7 +1318,7 @@ def main():
         if a.update_ytdlp:
             return upgrade_ytdlp()
         out = find_lib(a.out)
-        direct = bool(a.urls or a.playlists or a.update or a.stats or a.dry_run)
+        direct = bool(a.urls or a.playlists or a.update or a.stats or a.dry_run or a.where)
         if not direct:
             if not sys.stdin.isatty():
                 return ap.print_help()
@@ -1266,8 +1326,16 @@ def main():
                 interactive(out)
             return
         if out is None:
-            return console.print("[yellow]No library found. Run [bold]ytsync[/bold] once to set one up, or pass -o FOLDER.[/]")
-        cfg = load_cfg(ensure_lib(out))
+            if sys.stdin.isatty():
+                out = pick_library()
+            if out is None:
+                console.print("[yellow]No library folder selected. Run [bold]ytsync[/bold] to pick one, or pass -o FOLDER.[/]")
+                return 1
+        out = ensure_lib(out)
+        if a.where:
+            console.print(f"Profile folder: {profile_dir(out)}\nLibrary folder: {out}")
+            return 0
+        cfg = load_cfg(out)
         for k in ("format", "quality", "name_style", "cookies", "rate_limit", "retries", "jobs"):
             if getattr(a, k) is not None:
                 cfg[k] = getattr(a, k)
@@ -1301,6 +1369,10 @@ def main():
         execute(cfg, plan, compact=a.compact, prune_ok=a.update)
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled.[/]")
+    except OSError as e:
+        console.print(f"[red]Could not access the music or data folder: {e}[/]")
+        console.print("[dim]Check that the music folder is connected and writable.[/]")
+        return 1
 
 
 if __name__ == "__main__":
