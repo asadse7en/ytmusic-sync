@@ -97,8 +97,9 @@ Options (flags apply to that run only; change defaults in Settings):
 ## Settings
 
 Format, Quality, Filename style, Cover art, Square cover, Clean titles, Playlist .m3u8 files, Prune removed songs,
-Skip duplicate songs, Parallel downloads, Speed limit, Retries, Browser cookies, Library folder, Open data folder,
-Edit Playlists.txt, Reset to defaults. Duplicate video IDs are downloaded once; matching titles with durations within three seconds
+Skip duplicate songs, Parallel downloads, Speed limit, Retries, Browser cookies, Library folder, Data folder,
+Edit Playlists.txt, Reset to defaults. Data folder opens a submenu listing the data files and their sizes; select a file
+to open it in its default application, or choose Open in file explorer to open the data folder. Duplicate video IDs are downloaded once; matching titles with durations within three seconds
 are recorded as aliases and their playlist entries use the kept song file. Links saved to a file include a name
 comment above each URL.
 

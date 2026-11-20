@@ -44,20 +44,6 @@ EMOJI = re.compile("[\U00010000-\U0010ffff\u2600-\u27bf\ufe0f]")
 BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 YT_ID = re.compile(r"(?:v=|youtu\.be/)([\w-]{11})")
 BLOCKED = re.compile(r"403|sign in|bot|nsig|unable to extract|HTTP Error", re.I)
-BIG_PERCENT_GLYPHS = {
-    "0": ("████", "█  █", "████"),
-    "1": ("  █ ", " ██ ", "  █ "),
-    "2": ("████", "  ██", "██  "),
-    "3": ("████", "  ██", "████"),
-    "4": ("█  █", "████", "   █"),
-    "5": ("████", "██  ", "  ██"),
-    "6": ("████", "██  ", "████"),
-    "7": ("████", "   █", "   █"),
-    "8": ("████", "████", "████"),
-    "9": ("████", "████", "   █"),
-    ".": ("    ", "    ", " ██ "),
-    "%": ("█ ▐█", " ▄█ ", "▐█ ▄"),
-}
 
 
 def ensure_ui():
@@ -814,6 +800,196 @@ class WorkerStatus:
         self.state.set_track(self.worker_id, title, artist)
 
 
+def build_overall_panel(state, width):
+    from rich import box
+    from rich.cells import cell_len
+
+    with state.lock:
+        elapsed = max(time.time() - state.t0, 0)
+        speed_data_seconds = (time.monotonic() - state.speed_started
+                              if state.speed_started is not None else 0)
+        done, failed, total = state.done, state.fail, state.total
+        completed_bytes = state.bytes
+        workers = [dict(worker) for worker in state.workers.values()]
+
+    active_workers = [worker for worker in workers if worker.get("active")]
+    active = len(active_workers)
+    left = max(total - done - failed - active, 0)
+    finished = done + failed
+    percent = min(finished / total, 1) if total else 0
+    panel_width = max(width - int(getattr(console, "legacy_windows", False)), 1)
+    inner_width = max(panel_width - 4, 0)
+    percent_text = Text(f"{percent:.1%}", style="bold #ff9f1a")
+    count_text = Text(f"{finished} / {total}", style="#8b8b8b")
+    bar_width = max(inner_width - cell_len(percent_text.plain) - cell_len(count_text.plain) - 2, 0)
+
+    counts = [done, failed, active, left]
+    denominator = sum(counts)
+    if denominator:
+        widths, remainders = [], []
+        for count in counts:
+            quotient, remainder = divmod(max(count, 0) * bar_width, denominator)
+            widths.append(quotient)
+            remainders.append(remainder)
+        for index in sorted(range(len(widths)), key=lambda i: remainders[i], reverse=True)[
+                :bar_width - sum(widths)]:
+            widths[index] += 1
+    else:
+        widths = [0, 0, 0, bar_width]
+    for index, count in enumerate(counts):
+        if count > 0 and widths[index] == 0:
+            donor = max((i for i, segment_width in enumerate(widths) if segment_width > 1),
+                        key=lambda i: widths[i], default=None)
+            if donor is not None:
+                widths[donor] -= 1
+                widths[index] = 1
+
+    bar = Text()
+    for segment_width, color in zip(widths, ("#3fb950", "#f85149", "#ff9f1a", "#333333")):
+        bar.append("━" * segment_width, style=color)
+    row = Text()
+    row.append(percent_text)
+    row.append(" ")
+    row.append(bar)
+    row.append(" ")
+    row.append(count_text)
+
+    bytes_so_far = completed_bytes + sum(max(worker.get("dl", 0), 0) for worker in active_workers)
+    speed = sum(max(worker.get("speed", 0), 0) for worker in active_workers)
+    total_size = (f"{bytes_so_far / (1024 ** 3):.1f} GB"
+                  if bytes_so_far >= 1024 ** 3 else size(bytes_so_far))
+    completed_song_size = completed_bytes / done if done else 0
+    if not completed_song_size:
+        known_sizes = [worker.get("total", 0) for worker in active_workers if worker.get("total", 0) > 0]
+        completed_song_size = sum(known_sizes) / len(known_sizes) if known_sizes else 0
+    remaining_bytes = completed_song_size * left
+    for worker in active_workers:
+        if worker.get("total", 0) > 0:
+            remaining_bytes += max(worker["total"] - worker.get("dl", 0), 0)
+        else:
+            remaining_bytes += completed_song_size
+
+    eta = "—"
+    if speed_data_seconds >= 5:
+        if finished >= total:
+            eta = dur(0)
+        elif speed > 0 and remaining_bytes > 0:
+            eta = dur(remaining_bytes / speed)
+    if speed >= 1024 * 1024:
+        speed_text = f"{speed / (1024 * 1024):.1f} MB/s"
+    else:
+        speed_text = f"{speed / 1024:.0f} KB/s"
+
+    items = {
+        "done": ("dot", done, "done", "#3fb950"),
+        "failed": ("dot", failed, "failed", "#f85149"),
+        "active": ("dot", active, "active", "#ff9f1a"),
+        "size": ("value", total_size, None, None),
+        "speed": ("value", speed_text, None, None),
+        "eta": ("label", "ETA", eta, None),
+        "elapsed": ("label", "Elapsed", dur(elapsed), None),
+    }
+    included = list(items)
+
+    def make_stats(spacing):
+        line = Text()
+        for name in included:
+            if line.plain:
+                line.append(" " * spacing)
+            kind, value, label, color = items[name]
+            if kind == "dot":
+                line.append("● ", style=color)
+                line.append(str(value), style="#e6e6e6")
+                line.append(f" {label}", style="#8b8b8b")
+            elif kind == "label":
+                line.append(f"{value} ", style="#8b8b8b")
+                line.append(str(label), style="#e6e6e6")
+            else:
+                line.append(str(value), style="#e6e6e6")
+        return line
+
+    stats = make_stats(3)
+    for name in ("elapsed", "eta", "speed", "size"):
+        if cell_len(stats.plain) <= inner_width:
+            break
+        included.remove(name)
+        stats = make_stats(3)
+    for spacing in (2, 1):
+        if cell_len(stats.plain) <= inner_width:
+            break
+        stats = make_stats(spacing)
+    if cell_len(stats.plain) > inner_width:
+        stats.truncate(inner_width, overflow="crop")
+
+    return Panel(Group(Text(""), row, stats), expand=True, padding=(0, 1),
+                 border_style="#5a5a5a", box=box.ROUNDED)
+
+
+def short_failure_reason(reason):
+    value = str(reason or "Unknown error").strip()
+    prefix = re.compile(r"^(?:ERROR:\s*)?(?:\[youtube\]\s*[\w-]+:\s*|Postprocessing:\s*)", re.I)
+    while prefix.match(value):
+        value = prefix.sub("", value, count=1).strip()
+    value = re.sub(r"^ERROR:\s*", "", value, flags=re.I).strip()
+    message = re.sub(r"\s+", " ", value).strip()
+    lowered = message.lower()
+    for pattern, label in (
+            (r"\bprivate video\b", "Private video"),
+            (r"\bage restricted\b|\bage-restricted\b|\bconfirm your age\b", "Age restricted"),
+            (r"\bnot available in your country\b|\bgeo(?:graphical)? restriction\b|"
+             r"\bgeo-restricted\b", "Region blocked"),
+            (r"\bcopyright\b", "Copyright claim"),
+            (r"\bvideo (?:is )?unavailable\b", "Video unavailable")):
+        if re.search(pattern, lowered):
+            return label
+    return message[:60]
+
+
+def build_failures_view(state, width, height):
+    from rich import box
+
+    with state.lock:
+        failures = list(state.failures)
+    display_rows = []
+    for failure in failures:
+        title, artist, reason = failure[:3]
+        video_id = failure[3] if len(failure) > 3 else ""
+        if not video_id:
+            match = re.search(r"\[youtube\]\s*([A-Za-z0-9_-]{11})\s*:", str(reason), re.I)
+            video_id = match.group(1) if match else "—"
+        if not artist or str(artist).strip().casefold() == "unknown":
+            artist = "—"
+        display_rows.append((str(title), str(artist), short_failure_reason(reason), str(video_id)))
+
+    def make_view(visible_count):
+        table = Table(title=f"Failures ({len(failures)})", expand=True,
+                      border_style="#5a5a5a", box=box.SQUARE)
+        table.add_column("Title", style="bold #ffffff", ratio=4, no_wrap=False)
+        table.add_column("Artist", style="#8b8b8b", ratio=2)
+        table.add_column("Reason", style="#f85149", ratio=3, no_wrap=True, overflow="ellipsis")
+        if width >= 90:
+            table.add_column("ID", style="#8b8b8b", width=11, no_wrap=True, overflow="ellipsis")
+        if not display_rows:
+            table.add_row("No failures", "", "", *([""] if width >= 90 else []))
+        else:
+            for row in display_rows[-visible_count:]:
+                table.add_row(*row[:3], *([row[3]] if width >= 90 else []))
+        omitted = max(len(display_rows) - visible_count, 0)
+        parts = [table]
+        if omitted:
+            parts.append(Text(f"+{omitted} more", style="#8b8b8b"))
+        parts.append(Text("Press any key to return", style="#8b8b8b"))
+        return Group(*parts)
+
+    visible_count = max(1, min(len(display_rows), max(height - 8, 1)))
+    while True:
+        view = make_view(visible_count)
+        lines = console.render_lines(view, options=console.options.update(height=None), pad=False)
+        if len(lines) < max(height, 1) or visible_count <= 1:
+            return view
+        visible_count -= 1
+
+
 class St:
     def __init__(self, total, todo, jobs, initial_failures=0):
         self.total, self.n, self.done = total, 0, 0
@@ -821,9 +997,10 @@ class St:
         self.interrupted = 0
         self.jobs, self.todo = jobs, todo
         self.t0 = time.time()
+        self.speed_started = None
         self.lock, self.print_lock = threading.RLock(), threading.Lock()
         self.workers = {i: {"active": False} for i in range(jobs)}
-        self.failures, self.failures_view = [], False
+        self.failures = []
 
     def start(self, worker_id, index, e, playlist):
         with self.lock:
@@ -838,6 +1015,8 @@ class St:
         with self.lock:
             state = self.workers[worker_id]
             if d["status"] == "downloading":
+                if self.speed_started is None:
+                    self.speed_started = time.monotonic()
                 speed = d.get("speed") or 0
                 old_speed = state.get("speed") or 0
                 state.update(stage=1, dl=d.get("downloaded_bytes") or 0,
@@ -880,26 +1059,23 @@ class St:
             state["active"] = False
             return self.n, title
 
-    def show_failures(self, value):
-        with self.lock:
-            self.failures_view = value
-
-    def failure_record(self, worker_id, fallback_title, reason):
+    def failure_record(self, worker_id, fallback_title, reason, video_id=None):
         with self.lock:
             state = self.workers[worker_id]
             title = first_text(state.get("title"), fallback_title)
             artist = first_text(state.get("artist"), "Unknown")
-            failure = title, artist, reason or "Unknown error"
-            self.failures.append(failure)
-            return failure
+            raw_reason = reason or "Unknown error"
+            if not video_id:
+                match = re.search(r"\[youtube\]\s*([A-Za-z0-9_-]{11})\s*:", str(raw_reason), re.I)
+                video_id = match.group(1) if match else ""
+            self.failures.append((title, artist, raw_reason, video_id))
+            return title, artist, raw_reason
 
     def render(self):
         width = max(console.size.width, 1)
         narrow = width < 100
         with self.lock:
-            el = time.time() - self.t0
-            done, failed, byte_count = self.done, self.fail, self.bytes
-            failures, failures_view = list(self.failures), self.failures_view
+            failed = self.fail
             workers = []
             for worker_id in range(self.jobs):
                 state = dict(self.workers.get(worker_id, {}))
@@ -912,128 +1088,9 @@ class St:
                 state.setdefault("stage", 0)
                 workers.append((worker_id, state))
 
-        if failures_view:
-            table = Table(title=f"Failures ({len(failures)})", expand=True, border_style="#5a5a5a")
-            table.add_column("Title", style="bold #ffffff")
-            table.add_column("Artist", style="#8b8b8b")
-            table.add_column("Reason", style="#f85149")
-            if failures:
-                for title, artist, reason in failures:
-                    table.add_row(Text(title), Text(artist), Text(reason))
-            else:
-                table.add_row("No failures", "", "")
-            return Panel(Group(table, Text("Press any key to return", style="#8b8b8b")),
-                         expand=True, border_style="#5a5a5a")
-
-        active = sum(1 for _, state in workers if state["active"])
-        left = max(self.total - done - failed - active, 0)
-        finished_count = done + failed + active
-        percent = finished_count / self.total if self.total else 0
-        avg_speed = byte_count / el if el > 0 else 0
-        avg_song_size = byte_count / done if done else 0
-        remaining_bytes = avg_song_size * left
-        for _, state in workers:
-            if not state["active"]:
-                continue
-            if state["stage"] > 0 and state["total"]:
-                remaining_bytes += max(state["total"] - state["dl"], 0)
-            else:
-                remaining_bytes += avg_song_size
-        eta = dur(remaining_bytes / avg_speed) if done and avg_speed else "—"
+        blocks = [build_overall_panel(self, width)]
 
         orange, green, red, grey = "#ff9f1a", "#3fb950", "#f85149", "#8b8b8b"
-        bar_width = max(width - 4, 1)
-        counts = [done, failed, active, left]
-        total_count = sum(counts)
-        if total_count != self.total:
-            counts[-1] = max(self.total - sum(counts[:-1]), 0)
-            total_count = sum(counts)
-        if total_count:
-            exact = [count * bar_width / total_count for count in counts]
-            widths = [int(value) for value in exact]
-            for index in sorted(range(len(widths)), key=lambda i: exact[i] - widths[i], reverse=True)[
-                    :bar_width - sum(widths)]:
-                widths[index] += 1
-        else:
-            widths = [0, 0, 0, bar_width]
-        for index, count in enumerate(counts):
-            if count > 0 and widths[index] == 0:
-                donor = max((i for i, size_ in enumerate(widths) if size_ > 1),
-                            key=lambda i: widths[i], default=None)
-                if donor is not None:
-                    widths[donor] -= 1
-                    widths[index] = 1
-
-        bar_lines = []
-        bar_height = 3 if console.size.height > 30 else 2
-        for _ in range(bar_height):
-            bar_line = Text()
-            for segment_width, color in zip(widths, (green, red, orange, "#333333")):
-                bar_line.append("█" * segment_width, style=color)
-            bar_lines.append(bar_line)
-
-        legend = Text()
-        for dot, label, value, color in (
-                ("●", "Done", done, green), ("●", "Failed", failed, red),
-                ("●", "Active", active, orange), ("●", "Left", left, grey)):
-            if legend.plain:
-                legend.append("   ")
-            legend.append(f"{dot} ", style=color)
-            legend.append(f"{label} ", style=grey)
-            legend.append(str(value), style="bold #ffffff")
-
-        from rich.cells import cell_len
-
-        with_stats = legend.copy()
-        with_stats.append("   Size ", style=grey)
-        with_stats.append(size(byte_count), style="bold #ffffff")
-        with_stats.append("   Avg ", style=grey)
-        with_stats.append(f"{size(avg_speed)}/s", style="bold #ffffff")
-        if cell_len(with_stats.plain) <= bar_width:
-            legend = with_stats
-
-        heading_row = Table.grid(expand=True, padding=0)
-        heading_row.add_column(ratio=1)
-        heading_row.add_column(no_wrap=True, justify="right")
-        heading = Text()
-        heading.append(f"{percent:.1%}", style=f"bold {orange}")
-        heading.append(f"  {finished_count} / {self.total} tracks", style=grey)
-        timing = Text()
-        timing.append("ETA ", style=grey)
-        timing.append(eta, style="bold #ffffff")
-        timing.append("  ·  Elapsed ", style=grey)
-        timing.append(dur(el), style="bold #ffffff")
-        heading_row.add_row(heading, timing)
-
-        overall_content = []
-        if width + int(console.legacy_windows) >= 80:
-            value = f"{percent * 100:.1f}%"
-            glyph_rows = [Text(style=f"bold {orange}") for _ in range(3)]
-            for index, character in enumerate(value):
-                glyph = BIG_PERCENT_GLYPHS[character]
-                for row in range(3):
-                    if index:
-                        glyph_rows[row].append(" ")
-                    glyph_rows[row].append(glyph[row])
-
-            secondary_rows = [
-                Text(f"{finished_count} / {self.total} tracks", style=grey),
-                Text.assemble(("ETA ", grey), (eta, "bold #ffffff")),
-                Text.assemble(("Elapsed ", grey), (dur(el), "bold #ffffff")),
-            ]
-            percentage_row = Table.grid(expand=True, padding=(0, 1))
-            percentage_row.add_column(no_wrap=True)
-            percentage_row.add_column(ratio=1)
-            percentage_row.add_row(Group(*glyph_rows), Group(*secondary_rows))
-            overall_content.extend((Text(""), percentage_row))
-        else:
-            overall_content.append(heading_row)
-
-        overall_content.extend((*bar_lines, legend))
-        overall_panel = Panel(Group(*overall_content), expand=True,
-                              padding=(0, 1), border_style="#5a5a5a")
-        blocks = [overall_panel]
-
         stage_names = ("Fetch", "Download", "Convert", "Tag")
         for worker_id, state in workers:
             title_line = Text()
@@ -1083,10 +1140,14 @@ class St:
 
 
 class DashboardKeys:
-    def __init__(self, state, stop_event, gate):
+    def __init__(self, state, stop_event, gate, live=None):
         self.state, self.stop_event, self.gate = state, stop_event, gate
+        self.live = live
         self.quit_requested = threading.Event()
         self.done = threading.Event()
+        self.view_open = threading.Event()
+        self.view_closed = threading.Event()
+        self.view_closed.set()
         self.thread = None
 
     def start(self):
@@ -1097,6 +1158,8 @@ class DashboardKeys:
         return True
 
     def stop(self):
+        if self.view_open.is_set() and not self.stop_event.is_set():
+            self.view_closed.wait()
         self.done.set()
         if self.thread:
             self.thread.join(timeout=1)
@@ -1118,6 +1181,44 @@ class DashboardKeys:
         ready, _, _ = select.select([fd], [], [], 0.1)
         return os.read(fd, 1).decode("utf-8", "ignore") if ready else None
 
+    def _flush_input(self):
+        if os.name == "nt":
+            with contextlib.suppress(Exception):
+                import msvcrt
+                while msvcrt.kbhit():
+                    key = msvcrt.getwch()
+                    if key in ("\x00", "\xe0") and msvcrt.kbhit():
+                        msvcrt.getwch()
+            return
+        with contextlib.suppress(Exception):
+            import termios
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+
+    def _show_failures(self):
+        if self.live is None or not self.live.is_started:
+            return
+        self._flush_input()
+        self.view_closed.clear()
+        self.view_open.set()
+        try:
+            self.live.stop()
+            with console.screen():
+                console.clear()
+                console.print(build_failures_view(
+                    self.state, console.size.width, console.size.height))
+                while not self.done.is_set() and not self.stop_event.is_set():
+                    if self._read_key() is not None:
+                        break
+        finally:
+            try:
+                self._flush_input()
+                console.clear()
+                if not self.done.is_set() and not self.stop_event.is_set():
+                    self.live.start(refresh=True)
+            finally:
+                self.view_open.clear()
+                self.view_closed.set()
+
     def _run(self):
         old_terminal = None
         try:
@@ -1131,17 +1232,8 @@ class DashboardKeys:
                 key = self._read_key()
                 if key is None:
                     continue
-                with self.state.lock:
-                    showing_failures = self.state.failures_view
-                if showing_failures:
-                    self.state.show_failures(False)
-                    continue
                 if key.lower() == "f":
-                    self.state.show_failures(True)
-                    while not self.done.is_set():
-                        if self._read_key() is not None:
-                            self.state.show_failures(False)
-                            break
+                    self._show_failures()
                 elif key.lower() == "q":
                     self.quit_requested.set()
                     self.stop_event.set()
@@ -1162,7 +1254,7 @@ def run_demo():
         import random
     except ImportError:
         random = __import__("random")
-    todo = [{"id": f"demo{i:04}", "title": f"Demo Track {i + 1}", "dur": 180}
+    todo = [{"id": f"demo{i:07}", "title": f"Demo Track {i + 1}", "dur": 180}
             for i in range(64)]
     state = St(64, todo, 3)
     stop_event, gate = threading.Event(), WorkerGate(3)
@@ -1192,23 +1284,26 @@ def run_demo():
             failed = random.random() < 0.08
             if failed:
                 reason = "Video unavailable"
-                state.failure_record(worker_id, item["title"], reason)
+                state.failure_record(worker_id, item["title"], reason, video_id=item["id"])
                 state.record(worker_id, False, item["title"], 0, 1.2, reason)
             else:
                 state.record(worker_id, True, item["title"], total, 1.2, "")
             state.finish_worker(worker_id)
 
     console.clear()
-    listeners = DashboardKeys(state, stop_event, gate)
-    listeners.start()
-    with Live(get_renderable=state.render, console=console, refresh_per_second=8,
-              transient=False, screen=True, vertical_overflow="crop"):
-        executor = ThreadPoolExecutor(max_workers=3)
-        futures = [executor.submit(demo_worker, worker_id) for worker_id in range(3)]
-        for future in as_completed(futures):
-            future.result()
-        executor.shutdown(wait=True)
-    listeners.stop()
+    live = Live(get_renderable=state.render, console=console, refresh_per_second=8,
+                transient=False, screen=True, vertical_overflow="crop")
+    listeners = DashboardKeys(state, stop_event, gate, live)
+    with live:
+        listeners.start()
+        try:
+            executor = ThreadPoolExecutor(max_workers=3)
+            futures = [executor.submit(demo_worker, worker_id) for worker_id in range(3)]
+            for future in as_completed(futures):
+                future.result()
+            executor.shutdown(wait=True)
+        finally:
+            listeners.stop()
     console.print(f"[bold #3fb950]Done[/] · {state.done} done · {state.fail} failed · "
                   f"{size(state.bytes)} · {dur(time.time() - state.t0)}")
 
@@ -1346,7 +1441,8 @@ def download_worker(worker_id, work, cfg, out, lib, st, gate, stop_event, failed
                             note = clean_reason(short(ex) or "Interrupted")
                             with failed_lock:
                                 failed.append(st.failure_record(
-                                    worker_id, first_text(e.get("title"), e["id"]), str(ex) or note))
+                                    worker_id, first_text(e.get("title"), e["id"]), str(ex) or note,
+                                    video_id=e["id"]))
                             logging.exception("Download failed for video %s", e["id"])
                     except Exception as ex:
                         if stop_event.is_set() or force_event.is_set():
@@ -1367,7 +1463,8 @@ def download_worker(worker_id, work, cfg, out, lib, st, gate, stop_event, failed
                             note = clean_reason(short(ex))
                             with failed_lock:
                                 failed.append(st.failure_record(
-                                    worker_id, first_text(e.get("title"), e["id"]), str(ex) or note))
+                                    worker_id, first_text(e.get("title"), e["id"]), str(ex) or note,
+                                    video_id=e["id"]))
                             logging.exception("Download failed for video %s", e["id"])
                     gate.release()
                     held = False
@@ -1530,7 +1627,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
             work.put((index, e))
         with live:
             executor = ThreadPoolExecutor(max_workers=worker_count)
-            key_listener = DashboardKeys(st, stop_event, gate) if not plain else None
+            key_listener = DashboardKeys(st, stop_event, gate, live_obj) if not plain else None
             try:
                 if key_listener:
                     key_listener.start()
@@ -1780,7 +1877,7 @@ def save_named_links(links):
     return len(new_links)
 
 
-def open_path(path, purpose):
+def open_path(path):
     path = Path(path)
     try:
         if os.name == "nt":
@@ -1790,7 +1887,13 @@ def open_path(path, purpose):
         else:
             subprocess.Popen(["xdg-open", str(path)])
     except Exception as e:
-        console.print(f"[yellow]Could not open {purpose}: {e}\nPath: {path}[/]")
+        if os.name == "nt" and path.suffix.lower() in (".json", ".log"):
+            try:
+                subprocess.Popen(["notepad", str(path)])
+                return
+            except Exception as fallback_error:
+                e = fallback_error
+        console.print(f"[yellow]Could not open: {e}\nPath: {path}[/]")
 
 
 def open_playlists():
@@ -1799,24 +1902,11 @@ def open_playlists():
     if not path.exists():
         path.write_text("# One link per line\n", encoding="utf-8")
     console.print(f"[dim]{path}[/]")
-    open_path(path, "Playlists.txt")
+    open_path(path)
 
 
 def edit_playlists():
-    ensure_data_dir()
-    path = DATA / "playlists.txt"
-    if not path.exists():
-        path.write_text("# One link per line\n", encoding="utf-8")
-    console.print(f"[dim]{path}[/]")
-    try:
-        if os.name == "nt":
-            subprocess.Popen(["notepad", str(path)])
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", "-t", str(path)])
-        else:
-            subprocess.Popen(["xdg-open", str(path)])
-    except Exception as e:
-        console.print(f"[yellow]Could not open Playlists.txt: {e}\nPath: {path}[/]")
+    open_playlists()
 
 
 def offer_open_playlists():
@@ -1847,6 +1937,10 @@ def is_playlist_url(url):
 
 def terminal_columns():
     return max(1, shutil.get_terminal_size((80, 24)).columns)
+
+
+def data_file_size(byte_count):
+    return f"{byte_count / 1024:.1f} KB" if byte_count < 1024 * 1024 else size(byte_count)
 
 
 def truncate_display(value, width):
@@ -2009,12 +2103,43 @@ def add_links(cfg):
             continue
 
 
-def open_data_folder():
-    try:
-        ensure_data_dir()
-        open_path(DATA, "data folder")
-    except Exception as e:
-        console.print(f"[yellow]Could not open the data folder: {e}\nPath: {DATA}[/]")
+def data_folder_menu():
+    ensure_data_dir()
+    while True:
+        console.clear()
+        console.print(f"[bold]Data folder[/]\n[dim]{DATA}[/]\n")
+        try:
+            files = []
+            for entry in DATA.iterdir():
+                if entry.is_file():
+                    if not entry.name.lower().endswith(".tmp"):
+                        files.append((entry.name, entry))
+                elif entry.is_dir():
+                    for child in entry.iterdir():
+                        if child.is_file() and not child.name.lower().endswith(".tmp"):
+                            files.append((f"{entry.name}/{child.name}", child))
+            files.sort(key=lambda item: item[0].casefold())
+            name_width = max(1, terminal_columns() - 20)
+            choices = [("Open in file explorer", "open")]
+            choices.extend((f"{truncate_display(name, name_width).plain:<{name_width}} "
+                            f"{data_file_size(path.stat().st_size):>10}", str(path))
+                           for name, path in files)
+            choices.append(("‹ Back", "back"))
+            choice = ask("", choices)
+        except KeyboardInterrupt:
+            return
+        except Exception as e:
+            menu_error(e)
+            continue
+        if choice in (None, "back"):
+            return
+        try:
+            if choice == "open":
+                open_path(DATA)
+            else:
+                open_path(Path(choice))
+        except Exception as e:
+            menu_error(e)
 
 
 def library_folder_menu(cfg):
@@ -2031,7 +2156,7 @@ def library_folder_menu(cfg):
             return cfg
         try:
             if choice == "open":
-                open_path(cfg["out"], "library folder")
+                open_path(cfg["out"])
                 continue
             try:
                 value = questionary.text("Music folder:", default=cfg["out"]).ask()
@@ -2057,7 +2182,7 @@ def settings(cfg):
         console.clear()
         console.print(f"[bold orange1]Settings[/]\n[dim]Data: {short_data_dir()}[/]\n")
         items = [(f"{label:<22}{val(cfg, key)}", key) for key, label in LABELS]
-        items.extend([("Library folder", "library"), ("Open data folder", "open_data"),
+        items.extend([("Library folder", "library"), ("Data folder", "data"),
                       ("Edit Playlists.txt", "edit"), ("Reset to defaults", "reset"), ("‹ Back", "back")])
         try:
             choice = ask("", items)
@@ -2071,8 +2196,8 @@ def settings(cfg):
             if choice == "library":
                 cfg = library_folder_menu(cfg)
                 save = False
-            elif choice == "open_data":
-                open_data_folder()
+            elif choice == "data":
+                data_folder_menu()
                 save = False
             elif choice == "edit":
                 open_playlists()
