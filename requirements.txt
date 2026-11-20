@@ -1,0 +1,6 @@
+yt-dlp
+rich
+questionary
+mutagen
+platformdirs
+imageio-ffmpeg

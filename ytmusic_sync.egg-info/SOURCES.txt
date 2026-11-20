@@ -1,0 +1,10 @@
+LICENSE
+README.md
+pyproject.toml
+ytmusic_sync.py
+ytmusic_sync.egg-info/PKG-INFO
+ytmusic_sync.egg-info/SOURCES.txt
+ytmusic_sync.egg-info/dependency_links.txt
+ytmusic_sync.egg-info/entry_points.txt
+ytmusic_sync.egg-info/requires.txt
+ytmusic_sync.egg-info/top_level.txt
