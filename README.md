@@ -75,6 +75,7 @@ In **Add Music > Paste links**, playlist links can be added to `Playlists.txt`; 
 | `ytsync --where` | Print the data folder and music library folder |
 | `ytsync --timing` | Print startup step timings |
 | `ytsync --update-ytdlp` | Upgrade yt-dlp |
+| `ytsync --demo` | Preview the 64-track progress dashboard with simulated downloads |
 
 Options (flags apply to that run only; change defaults in Settings):
 

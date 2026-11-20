@@ -1,50 +1,41 @@
 #!/usr/bin/env python3
 """ytmusic-sync: YouTube playlists -> clean, tagged music library + .m3u8 playlists."""
 import argparse, contextlib, hashlib, json, logging, os, queue, re, shutil, subprocess, sys, threading, time, urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from pathlib import Path
 import unicodedata
-from urllib.parse import urlparse
-
-try:
-    import questionary, yt_dlp
-    from platformdirs import user_config_dir, user_data_dir
-    from yt_dlp.postprocessor.common import PostProcessor
-    from yt_dlp.version import __version__ as YTDLP_VERSION
-    from rich.console import Console, Group
-    from rich.live import Live
-    from rich.panel import Panel
-    from rich.progress_bar import ProgressBar
-    from rich.table import Table
-    from rich.text import Text
-except ImportError:
-    sys.exit("Missing packages. Run: pip install -r requirements.txt")
+import signal
+from urllib.parse import parse_qs, urlparse
 
 for _s in (sys.stdout, sys.stderr):
     with contextlib.suppress(Exception):
         _s.reconfigure(encoding="utf-8")
 
 VERSION = "0.1"
-DATA_BASE = Path(user_data_dir("ytsync", appauthor=False)) / "libraries"
-POINTER = Path(user_config_dir("ytsync", appauthor=False)) / "last_library.json"
-console = Console()
+DATA = Path.home() / ".ytmusic-sync"
+console = questionary = STYLE = None
+Group = Live = Panel = Table = Text = None
+LIB_CACHE, LIB_CACHE_LOCK = {}, threading.RLock()
+TIMING_ENABLED = False
+TIMINGS = {}
+UPDATE_CHECKER = None
+_YT_DLP = None
+_POSTPROCESSOR_TYPES = None
 
-FORMATS = ["m4a", "mp3", "opus", "flac", "wav", "aac"]
+FORMATS = ["mp3", "m4a", "opus", "flac", "wav", "aac"]
 QUALITIES = ["best", "320", "256", "192", "128"]
 STYLES = {"title": "Title", "artist-title": "Artist - Title", "title-artist": "Title - Artist"}
 EXT = {".m4a", ".mp3", ".opus", ".flac", ".wav", ".aac", ".ogg", ".mp4"}
-DEFAULTS = dict(format="m4a", quality="best", name_style="title", cover=True, square=True, clean=True,
+DEFAULTS = dict(format="mp3", quality="best", name_style="title", cover=True, square=True, clean=True,
                 playlist_files=True, prune=False, skip_duplicate_songs=True, jobs=3, retries=5,
-                rate_limit="", cookies="", urls=[], files=[])
+                rate_limit="", cookies="")
 LABELS = [("format", "Format"), ("quality", "Quality"), ("name_style", "Filename style"),
           ("cover", "Cover art"), ("square", "Square cover"), ("clean", "Clean titles"),
           ("playlist_files", "Playlist .m3u8 files"), ("prune", "Prune removed songs"),
           ("skip_duplicate_songs", "Skip duplicate songs"), ("jobs", "Parallel downloads"),
           ("rate_limit", "Speed limit"), ("retries", "Retries"), ("cookies", "Browser cookies")]
 CHOICES = {"format": FORMATS, "quality": QUALITIES, "name_style": list(STYLES), "jobs": list(range(1, 7))}
-STYLE = questionary.Style([("pointer", "fg:#ff8c00 bold"), ("highlighted", "fg:#ff8c00 bold"),
-                           ("selected", "fg:#ff8c00"), ("question", "bold")])
 
 JUNK = re.compile(r"[\(\[\{][^\)\]\}]*\b(official|lyrics?|lyrical|audio|video|visuali[sz]er|hd|hq|4k|"
                   r"full song|music video|mv)\b[^\)\]\}]*[\)\]\}]", re.I)
@@ -52,6 +43,37 @@ EMOJI = re.compile("[\U00010000-\U0010ffff\u2600-\u27bf\ufe0f]")
 BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 YT_ID = re.compile(r"(?:v=|youtu\.be/)([\w-]{11})")
 BLOCKED = re.compile(r"403|sign in|bot|nsig|unable to extract|HTTP Error", re.I)
+
+
+def ensure_ui():
+    global console, questionary, STYLE, Group, Live, Panel, Table, Text
+    if console is not None:
+        return
+    try:
+        import questionary as _questionary
+        from rich.console import Console, Group as _Group
+        from rich.live import Live as _Live
+        from rich.panel import Panel as _Panel
+        from rich.table import Table as _Table
+        from rich.text import Text as _Text
+    except ImportError as e:
+        raise RuntimeError("Missing UI packages. Run: pip install -r requirements.txt") from e
+    questionary = _questionary
+    Group, Live, Panel, Table, Text = _Group, _Live, _Panel, _Table, _Text
+    console = Console()
+    STYLE = questionary.Style([("pointer", "fg:#ff8c00 bold"), ("highlighted", "fg:#ff8c00 bold"),
+                               ("selected", "fg:#ff8c00"), ("question", "bold")])
+
+
+def get_ytdlp():
+    global _YT_DLP
+    if _YT_DLP is None:
+        try:
+            import yt_dlp
+        except ImportError as e:
+            raise RuntimeError("Missing yt-dlp. Run: pip install -r requirements.txt") from e
+        _YT_DLP = yt_dlp
+    return _YT_DLP
 
 
 # ---------- small helpers ----------
@@ -103,6 +125,23 @@ def short(e):
     return re.sub(r"\x1b\[[0-9;]*m", "", str(e)).replace("ERROR: ", "").strip().split("\n")[-1][:80]
 
 
+def clean_reason(reason):
+    value = str(reason or "").strip()
+    prefix = re.compile(r"^(?:\[youtube\]\s*[\w-]+:\s*|ERROR:\s*|Postprocessing:\s*)", re.I)
+    while prefix.match(value):
+        value = prefix.sub("", value, count=1).strip()
+    return value[:80]
+
+
+def status_glyph(ok):
+    stream = getattr(console, "file", sys.stdout) if console is not None else sys.stdout
+    encoding = (getattr(stream, "encoding", None) or getattr(sys.stdout, "encoding", "") or "")
+    encoding = encoding.lower().replace("_", "-")
+    if encoding in ("utf-8", "utf8"):
+        return "✓" if ok else "✗"
+    return "OK" if ok else "ERR"
+
+
 def fsafe(s, n=120):
     return BAD.sub("", s).strip(" .")[:n].strip() or "track"
 
@@ -115,29 +154,190 @@ def read_list(p):
         return []
 
 
-# ---------- library location, config ----------
-def profile_dir(out):
+# ---------- data location, config ----------
+def ensure_data_dir():
+    DATA.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        try:
+            import ctypes
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(DATA))
+            if attrs != 0xFFFFFFFF and not attrs & 0x2:
+                if not ctypes.windll.kernel32.SetFileAttributesW(str(DATA), attrs | 0x2):
+                    raise ctypes.WinError()
+        except (AttributeError, OSError) as e:
+            logging.warning("Could not hide data folder %s: %s", DATA, e)
+    return DATA
+
+
+def music_hash(out):
+    resolved = Path(out).expanduser().resolve()
+    return hashlib.sha1(os.path.normcase(str(resolved)).encode("utf-8")).hexdigest()
+
+
+def legacy_profile_name(out):
     resolved = Path(out).expanduser().resolve()
     digest = hashlib.sha1(str(resolved).lower().encode("utf-8")).hexdigest()[:8]
-    profile = DATA_BASE / f"{fsafe(resolved.name)}-{digest}"
-    profile.mkdir(parents=True, exist_ok=True)
-    return profile
+    return f"{fsafe(resolved.name)}-{digest}"
 
 
-def migration_target(profile, name):
-    target = profile / name
+def library_path(out):
+    ensure_data_dir()
+    folder = DATA / "libs"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{music_hash(out)}.json"
+
+
+def copy_legacy_file(source, destination):
+    source, destination = Path(source), Path(destination)
+    if not source.is_file():
+        return None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists():
+        shutil.copy2(source, destination)
+        return destination
+    backup = DATA / "migrations" / hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:12] / source.name
+    if not backup.exists():
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, backup)
+        return backup
+    return None
+
+
+def append_urls(urls):
+    path = DATA / "playlists.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = set(read_list(path))
+    existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
+    added = []
+    for value in urls:
+        url = str(value).strip()
+        if url and url not in existing:
+            added.append(url)
+            existing.add(url)
+    if added:
+        with path.open("a", encoding="utf-8") as f:
+            if existing_text and not existing_text.endswith(("\n", "\r")):
+                f.write("\n")
+            f.writelines(f"{url}\n" for url in added)
+
+
+def append_legacy_playlist(source):
+    source = Path(source)
+    if not source.is_file():
+        return
+    target = DATA / "playlists.txt"
     if not target.exists():
-        return target
-    i = 1
-    while True:
-        candidate = profile / f"{name}.legacy-{i}"
-        if not candidate.exists():
-            return candidate
-        i += 1
+        copy_legacy_file(source, target)
+        return
+    existing_text = target.read_text(encoding="utf-8")
+    existing = set(read_list(target))
+    pairs, label = [], ""
+    for line in source.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith("#"):
+            label = line.strip()[1:].strip()
+            if label.lower() == "one link per line":
+                label = ""
+        elif line.strip():
+            pairs.append((line.strip(), label))
+            label = ""
+    added = [(url, name) for url, name in pairs if url not in existing]
+    if added:
+        with target.open("a", encoding="utf-8") as f:
+            if existing_text and not existing_text.endswith(("\n", "\r")):
+                f.write("\n")
+            for url, name in added:
+                if name:
+                    f.write(f"# {name}\n")
+                f.write(f"{url}\n")
+
+
+def legacy_config_links(config):
+    urls = config.get("urls") or []
+    files = config.get("files") or []
+    links = [urls] if isinstance(urls, str) else list(urls)
+    for path in ([files] if isinstance(files, str) else files):
+        links.extend(read_list(path))
+    return links
+
+
+def migrate_legacy_profiles():
+    ensure_data_dir()
+    marker = DATA / "migrations" / "platformdirs-v1.done"
+    if marker.exists():
+        return
+    try:
+        from platformdirs import user_config_dir, user_data_dir
+        old_base = Path(user_data_dir("ytsync", appauthor=False)) / "libraries"
+        pointer = Path(user_config_dir("ytsync", appauthor=False)) / "last_library.json"
+    except ImportError:
+        return
+
+    folders = sorted((p for p in old_base.iterdir() if p.is_dir()), key=lambda p: p.name.lower()) \
+        if old_base.is_dir() else []
+    pointed = jload(pointer, {}).get("path")
+    if pointed:
+        active = legacy_profile_name(pointed)
+        folders.sort(key=lambda p: (p.name != active, p.name.lower()))
+    links = []
+    config_path = DATA / "config.json"
+    for folder in folders:
+        source_cfg = jload(folder / "config.json", {})
+        if source_cfg:
+            links.extend(legacy_config_links(source_cfg))
+            copy_legacy_file(folder / "config.json",
+                             DATA / "migrations" / "legacy-profiles" / folder.name / "config.json")
+            if not config_path.exists():
+                migrated_cfg = {k: v for k, v in source_cfg.items() if k in DEFAULTS}
+                aw(config_path, json.dumps({**DEFAULTS, **migrated_cfg}, indent=1))
+        append_legacy_playlist(folder / "playlists.txt")
+        copy_legacy_file(folder / "library.json", DATA / "libs" / f"{folder.name}.json")
+        if pointed and folder.name == active:
+            copy_legacy_file(folder / "library.json", library_path(pointed))
+        for name in ("failed.txt", "sync.log", "cache.json"):
+            copy_legacy_file(folder / name, DATA / name)
+    if pointed:
+        config = jload(config_path, {})
+        if not config.get("out"):
+            config["out"] = str(pointed)
+            aw(config_path, json.dumps({**DEFAULTS, **config}, indent=1))
+    append_urls(links)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("done\n", encoding="utf-8")
+
+
+def migrate_music_folder(out):
+    marker = DATA / "migrations" / f"music-{music_hash(out)}.done"
+    if marker.exists():
+        return
+    legacy = Path(out) / ".ytmusic-sync"
+    if legacy.is_dir():
+        source_cfg = jload(legacy / "config.json", {})
+        if source_cfg:
+            links = legacy_config_links(source_cfg)
+            config_path = DATA / "config.json"
+            copy_legacy_file(legacy / "config.json",
+                             DATA / "migrations" / "music-folders" / music_hash(out) / "config.json")
+            if not config_path.exists():
+                migrated_cfg = {k: v for k, v in source_cfg.items() if k in DEFAULTS}
+                aw(config_path, json.dumps({**DEFAULTS, **migrated_cfg}, indent=1))
+            append_urls(links)
+        append_legacy_playlist(legacy / "playlists.txt")
+        copy_legacy_file(legacy / "library.json", library_path(out))
+        for name in ("failed.txt", "sync.log", "cache.json"):
+            copy_legacy_file(legacy / name, DATA / name)
+        for item in legacy.iterdir():
+            if item.is_file() and item.name not in {
+                    "config.json", "playlists.txt", "library.json", "failed.txt", "sync.log", "cache.json"}:
+                copy_legacy_file(item, DATA / item.name)
+    for old, new in (("library.json", library_path(out)), ("failed.txt", DATA / "failed.txt"),
+                     ("ytmusic-sync.log", DATA / "sync.log")):
+        copy_legacy_file(Path(out) / old, new)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("done\n", encoding="utf-8")
 
 
 def ensure_lib(out):
-    """Create a music folder profile, migrate legacy app files, and remember the library."""
+    """Validate a music folder and import its legacy data without modifying the source."""
     out = Path(out).expanduser().resolve()
     if not out.exists():
         if not out.parent.is_dir():
@@ -145,53 +345,47 @@ def ensure_lib(out):
         out.mkdir()
     if not out.is_dir():
         raise NotADirectoryError(f"Music folder is not a directory: {out}")
-    profile = profile_dir(out)
-    legacy = out / ".ytmusic-sync"
-    if legacy.is_dir():
-        for item in legacy.iterdir():
-            shutil.move(str(item), str(migration_target(profile, item.name)))
-        legacy.rmdir()
-    for old, new in (("library.json", "library.json"), ("failed.txt", "failed.txt"),
-                     ("ytmusic-sync.log", "sync.log")):
-        source = out / old
-        if source.is_file():
-            shutil.move(str(source), str(migration_target(profile, new)))
-    POINTER.parent.mkdir(parents=True, exist_ok=True)
-    aw(POINTER, json.dumps({"path": str(out)}))
+    ensure_data_dir()
+    migrate_legacy_profiles()
+    migrate_music_folder(out)
     return out
 
 
 def find_lib(explicit=None):
-    """--out > last used library > no selection."""
     if explicit:
         return Path(explicit).expanduser().resolve()
-    p = jload(POINTER, {}).get("path")
-    if p:
-        folder = Path(p).expanduser()
+    saved = jload(DATA / "config.json", {}).get("out")
+    if saved:
+        folder = Path(saved).expanduser()
         if folder.is_dir():
             return folder.resolve()
-        console.print(f"[yellow]Last used music folder is unavailable: {folder}. "
-                      "Reconnect the drive or choose a folder.[/]")
+        if console is not None:
+            console.print(f"[yellow]Last used music folder is unavailable: {folder}. "
+                          "Reconnect the drive or choose a folder.[/]")
     return None
 
 
-def load_cfg(out):
-    c = {**DEFAULTS, **jload(profile_dir(out) / "config.json", {})}
-    c["urls"], c["files"] = list(c["urls"]), list(c["files"])
+def load_cfg(out=None):
+    ensure_data_dir()
+    c = {**DEFAULTS, **jload(DATA / "config.json", {})}
+    c.pop("urls", None)
+    c.pop("files", None)
     c["jobs"] = int(c["jobs"])
     if not 1 <= c["jobs"] <= 6:
         raise ValueError("Parallel downloads must be between 1 and 6.")
-    c["out"] = str(out)
+    saved = out if out is not None else c.get("out")
+    c["out"] = str(Path(saved).expanduser().resolve()) if saved else ""
     return c
 
 
 def save_cfg(c):
-    aw(profile_dir(c["out"]) / "config.json", json.dumps({k: v for k, v in c.items() if k != "out"}, indent=1))
+    ensure_data_dir()
+    values = {k: v for k, v in c.items() if k in DEFAULTS or k == "out"}
+    aw(DATA / "config.json", json.dumps(values, indent=1))
 
 
-def all_urls(c):
-    urls = c["urls"] + [u for f in c["files"] for u in read_list(f)] + read_list(profile_dir(c["out"]) / "playlists.txt")
-    return list(dict.fromkeys(urls))
+def all_urls(_cfg=None):
+    return list(dict.fromkeys(read_list(DATA / "playlists.txt")))
 
 
 # ---------- ffmpeg + yt-dlp updates ----------
@@ -220,25 +414,64 @@ def vtuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", v))
 
 
-def ytdlp_latest(out):
-    cp = profile_dir(out) / "cache.json"
-    c = jload(cp, {})
-    if time.time() - c.get("t", 0) < 86400 and c.get("latest"):
-        return c["latest"]
+def installed_ytdlp_version():
     try:
-        with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=4) as r:
+        from importlib.metadata import version
+        return version("yt-dlp")
+    except Exception:
+        return "0"
+
+
+def ytdlp_latest():
+    cp = DATA / "cache.json"
+    cached = jload(cp, {})
+    if "latest" in cached and time.time() - cached.get("t", 0) < 86400:
+        return cached["latest"] or None
+    latest = None
+    try:
+        with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=2) as r:
             latest = json.load(r)["info"]["version"]
-        aw(cp, json.dumps({"t": time.time(), "latest": latest}))
-        return latest
-    except Exception:  # offline: retry in about an hour
-        with contextlib.suppress(OSError):
-            aw(cp, json.dumps({"t": time.time() - 86400 + 3600, "latest": c.get("latest")}))
-        return c.get("latest")
+    except Exception:
+        pass
+    with contextlib.suppress(OSError):
+        aw(cp, json.dumps({"t": time.time(), "latest": latest or ""}))
+    return latest
 
 
-def outdated(out):
-    new = ytdlp_latest(out)
-    return (YTDLP_VERSION, new) if new and vtuple(new) > vtuple(YTDLP_VERSION) else None
+def outdated(_out=None):
+    current = installed_ytdlp_version()
+    latest = ytdlp_latest()
+    return (current, latest) if latest and vtuple(latest) > vtuple(current) else None
+
+
+class UpdateChecker:
+    def __init__(self):
+        self.started = time.monotonic()
+        self.finished = None
+        self.result = None
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="yt-dlp-update-check", daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            self.result = outdated()
+        except Exception:
+            logging.exception("yt-dlp update check failed")
+        finally:
+            self.finished = time.monotonic()
+            self.done.set()
+
+    @property
+    def elapsed(self):
+        end = self.finished if self.finished else time.monotonic()
+        return end - self.started
+
+
+def start_update_check():
+    global UPDATE_CHECKER
+    UPDATE_CHECKER = UpdateChecker()
+    return UPDATE_CHECKER
 
 
 def upgrade_ytdlp():
@@ -250,22 +483,38 @@ def upgrade_ytdlp():
 
 # ---------- tag + filename cleaning ----------
 def tidy(s):
-    s = JUNK.sub("", EMOJI.sub("", s or ""))
+    s = JUNK.sub("", EMOJI.sub("", str(s or "")))
     s = re.sub(r"\s*[|｜].*$", "", s)
     return re.sub(r"\s+", " ", s).strip(" -–—_")
 
 
+def first_text(value, default=""):
+    if isinstance(value, str):
+        return value.strip() or default
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+        return default
+    return str(value).strip() if value is not None else default
+
+
 def clean_tags(i, clean):
-    title = i.get("track") or i.get("title") or i["id"]
-    artist = i.get("artist") or i.get("creator") or ""
+    if not isinstance(i, dict):
+        return "Unknown", "Unknown"
+    fallback = first_text(i.get("id"), "Unknown")
+    title = first_text(i.get("track"), first_text(i.get("title"), fallback))
+    artist = first_text(i.get("artist"), first_text(i.get("creator")))
     if clean:
         title = tidy(title) or title
     if not artist:
         m = re.match(r"^(.+?)\s+[-–—]\s+(.+)$", title)
         if m:
-            artist, title = tidy(m[1]), tidy(m[2])
+            artist_part, title_part = m.groups()
+            artist, title = tidy(artist_part), tidy(title_part)
         else:
-            artist = re.sub(r"\s*(-\s*Topic|VEVO)$", "", i.get("channel") or i.get("uploader") or "Unknown", flags=re.I)
+            channel = first_text(i.get("channel"), first_text(i.get("uploader"), "Unknown"))
+            artist = re.sub(r"\s*(-\s*Topic|VEVO)$", "", channel, flags=re.I)
     return (tidy(artist) if clean else artist).strip() or "Unknown", title
 
 
@@ -293,36 +542,44 @@ def pick_name(lib, vid, artist, title, style):
         return candidate
 
 
-class Clean(PostProcessor):
-    """Runs before filename + tagging: sets clean artist/title and the final filename."""
-    def __init__(self, lib, cfg, st):
-        super().__init__()
-        self.lib, self.cfg, self.st = lib, cfg, st
+def postprocessor_types():
+    global _POSTPROCESSOR_TYPES
+    if _POSTPROCESSOR_TYPES is not None:
+        return _POSTPROCESSOR_TYPES
+    get_ytdlp()
+    from yt_dlp.postprocessor.common import PostProcessor
 
-    def run(self, info):
-        a, t = clean_tags(info, self.cfg["clean"])
-        info.update(artist=a, track=t, title=t, album_artist=a.split(",")[0].strip())
-        info["fname"] = pick_name(self.lib, info["id"], a, t, self.cfg["name_style"])
-        self.st.set_track(t, a)
-        return [], info
+    class Clean(PostProcessor):
+        def __init__(self, lib, cfg, st):
+            super().__init__()
+            self.lib, self.cfg, self.st = lib, cfg, st
 
+        def run(self, info):
+            a, t = clean_tags(info, self.cfg["clean"])
+            info.update(artist=a, track=t, title=t, album_artist=a.partition(",")[0].strip())
+            info["fname"] = pick_name(self.lib, info["id"], a, t, self.cfg["name_style"])
+            self.st.set_track(t, a)
+            return [], info
 
-class SquareCover(PostProcessor):
-    """Center-crop the downloaded cover to a square, in place (runs after the JPEG conversion)."""
-    def run(self, info):
-        exe = FFMPEG or shutil.which("ffmpeg")
-        for t in info.get("thumbnails") or []:
-            src = t.get("filepath")
-            if not exe or not src or not os.path.exists(src):
-                continue
-            tmp = src + ".sq.jpg"
-            r = subprocess.run([exe, "-y", "-loglevel", "error", "-i", src, "-vf", "crop='min(iw,ih)':'min(iw,ih)'",
-                                "-c:v", "mjpeg", "-q:v", "2", tmp], capture_output=True)
-            if r.returncode == 0 and os.path.exists(tmp):
-                os.replace(tmp, src)
-            else:
-                logging.warning("cover crop failed: %s", r.stderr.decode(errors="ignore")[-200:])
-        return [], info
+    class SquareCover(PostProcessor):
+        def run(self, info):
+            exe = FFMPEG or shutil.which("ffmpeg")
+            for thumbnail in info.get("thumbnails") or []:
+                src = thumbnail.get("filepath")
+                if not exe or not src or not os.path.exists(src):
+                    continue
+                tmp = src + ".sq.jpg"
+                r = subprocess.run([exe, "-y", "-loglevel", "error", "-i", src,
+                                    "-vf", "crop='min(iw,ih)':'min(iw,ih)'", "-c:v", "mjpeg", "-q:v", "2", tmp],
+                                   capture_output=True)
+                if r.returncode == 0 and os.path.exists(tmp):
+                    os.replace(tmp, src)
+                else:
+                    logging.warning("cover crop failed: %s", r.stderr.decode(errors="ignore")[-200:])
+            return [], info
+
+    _POSTPROCESSOR_TYPES = Clean, SquareCover
+    return _POSTPROCESSOR_TYPES
 
 
 # ---------- library database ----------
@@ -336,26 +593,39 @@ def tag_has_url(k, v):
 
 class Lib:
     def __init__(self, out):
-        self.out, self.f = Path(out), profile_dir(out) / "library.json"
+        ensure_ui()
+        self.out, self.f = Path(out).expanduser().resolve(), library_path(out)
         self.lock, self.name_lock, self.reserved_names = threading.RLock(), threading.Lock(), set()
         self.reserved_by_id = {}
         self.d = {"songs": {}, "playlists": {}, "stats": {}, "aliases": {}}
-        self.d.update(jload(self.f, {}))
+        old_db = DATA / "libs" / f"{legacy_profile_name(out)}.json"
+        if not self.f.exists() and old_db.is_file():
+            shutil.copy2(old_db, self.f)
+        database_exists = self.f.is_file()
+        loaded = jload(self.f, {}) if database_exists else {}
+        if isinstance(loaded, dict):
+            self.d.update(loaded)
+        self.d["songs"] = self.d.get("songs") if isinstance(self.d.get("songs"), dict) else {}
+        self.d["playlists"] = self.d.get("playlists") if isinstance(self.d.get("playlists"), dict) else {}
+        self.d["stats"] = self.d.get("stats") if isinstance(self.d.get("stats"), dict) else {}
+        self.d["aliases"] = self.d.get("aliases") if isinstance(self.d.get("aliases"), dict) else {}
         self.d.setdefault("aliases", {})
         self.d["stats"] = {"runs": 0, "downloads": 0, "bytes": 0, "last_run": "never", **self.d["stats"]}
-        if not self.d["songs"]:
-            self.rebuild()
-        self.d["songs"] = {k: v for k, v in self.d["songs"].items() if (self.out / v["file"]).exists()}
+        if not database_exists:
+            with console.status("[cyan]Reading existing files..."):
+                self.rebuild()
+        self.d["songs"] = {k: v for k, v in self.d["songs"].items()
+                           if isinstance(v, dict) and v.get("file") and (self.out / v["file"]).exists()}
         self.d["aliases"] = {k: v for k, v in self.d["aliases"].items() if v in self.d["songs"]}
+        if not database_exists:
+            self.save()
 
     def rebuild(self):
         """Best effort: recover video IDs from the source URL stored in each file's tags."""
-        try:
-            import mutagen
-        except ImportError:
-            return
+        import mutagen
+        known_files = {Path(v["file"]).name for v in self.d["songs"].values() if v.get("file")}
         for p in self.out.iterdir():
-            if p.suffix.lower() not in EXT or not p.is_file():
+            if p.name in known_files or p.suffix.lower() not in EXT or not p.is_file():
                 continue
             try:
                 f = mutagen.File(p)
@@ -369,11 +639,13 @@ class Lib:
                 get = lambda k: ((e.tags.get(k) or [""])[0] if e and e.tags else "")
                 self.d["songs"][vid] = {"file": p.name, "artist": get("artist"),
                                         "title": get("title") or p.stem, "dur": int(f.info.length)}
+                known_files.add(p.name)
             except Exception:
-                continue
+                logging.exception("Could not read tags from %s", p)
 
     def save(self):
         with self.lock:
+            self.f.parent.mkdir(parents=True, exist_ok=True)
             aw(self.f, json.dumps(self.d, indent=1, ensure_ascii=False))
 
     def total_size(self):
@@ -382,8 +654,17 @@ class Lib:
                        if (self.out / v["file"]).exists())
 
 
+def get_lib(out):
+    key = os.path.normcase(str(Path(out).expanduser().resolve()))
+    with LIB_CACHE_LOCK:
+        if key not in LIB_CACHE:
+            LIB_CACHE[key] = Lib(out)
+        return LIB_CACHE[key]
+
+
 # ---------- scan ----------
 def resolve(urls, cfg, errs, details=None):
+    yt_dlp = get_ytdlp()
     o = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "skip_download": True, "logger": Quiet()}
     if cfg["cookies"]:
         o["cookiesfrombrowser"] = (cfg["cookies"],)
@@ -438,9 +719,7 @@ def canonical_id(vid, aliases):
 
 def scan(cfg, urls):
     out = Path(cfg["out"])
-    logging.basicConfig(filename=profile_dir(out) / "sync.log", level=logging.INFO,
-                        format="%(asctime)s %(message)s", force=True)
-    lib, errs = Lib(out), []
+    lib, errs = get_lib(out), []
     pls, singles, bad = resolve(urls, cfg, errs)
     entries = [x for p in pls for x in p["items"]] + singles
     want = {}
@@ -494,6 +773,14 @@ class StopRequested(Exception):
     pass
 
 
+class FirstInterrupt(Exception):
+    pass
+
+
+class ForceInterrupt(Exception):
+    pass
+
+
 class WorkerStatus:
     def __init__(self, state, worker_id):
         self.state, self.worker_id = state, worker_id
@@ -503,17 +790,18 @@ class WorkerStatus:
 
 
 class St:
-    def __init__(self, total, todo, jobs):
-        self.total, self.n, self.done, self.fail, self.bytes = total, 0, 0, 0, 0
+    def __init__(self, total, todo, jobs, initial_failures=0):
+        self.total, self.n, self.done = total, 0, 0
+        self.fail, self.worker_fail, self.bytes = initial_failures, 0, 0
+        self.interrupted = 0
         self.jobs, self.todo = jobs, todo
-        self.t0, self.feed, self.song_times = time.time(), [], []
+        self.t0 = time.time()
         self.lock, self.print_lock = threading.RLock(), threading.Lock()
-        self.pending = set(range(total))
         self.workers = {i: {"active": False} for i in range(jobs)}
+        self.failures, self.failures_view = [], False
 
     def start(self, worker_id, index, e, playlist):
         with self.lock:
-            self.pending.discard(index)
             self.workers[worker_id] = dict(active=True, index=index, title=e["title"], artist="",
                                            playlist=playlist, dl=0, total=0, speed=0, stage=0, retry="")
 
@@ -525,9 +813,11 @@ class St:
         with self.lock:
             state = self.workers[worker_id]
             if d["status"] == "downloading":
+                speed = d.get("speed") or 0
+                old_speed = state.get("speed") or 0
                 state.update(stage=1, dl=d.get("downloaded_bytes") or 0,
                              total=d.get("total_bytes") or d.get("total_bytes_estimate") or 0,
-                             speed=d.get("speed") or 0)
+                             speed=0.3 * speed + 0.7 * old_speed if old_speed else speed)
             elif d["status"] == "finished":
                 state["stage"] = 2
 
@@ -548,7 +838,7 @@ class St:
         with self.lock:
             self.workers[worker_id] = {"active": False}
 
-    def record(self, worker_id, ok, fallback_title, song_size, elapsed, reason):
+    def record(self, worker_id, ok, fallback_title, song_size, elapsed, reason, interrupted=False):
         with self.lock:
             state = self.workers[worker_id]
             title = state.get("title") or fallback_title
@@ -556,128 +846,315 @@ class St:
             if ok:
                 self.done += 1
                 self.bytes += song_size
+            elif interrupted:
+                self.interrupted += 1
             else:
                 self.fail += 1
+                self.worker_fail += 1
             self.n += 1
-            self.feed.append((ok, title, artist, size(song_size) if ok else "-",
-                              f"{elapsed:.1f}s", "" if ok else reason))
-            self.song_times.append(elapsed)
-            self.song_times = self.song_times[-10:]
+            state["active"] = False
             return self.n, title
 
+    def show_failures(self, value):
+        with self.lock:
+            self.failures_view = value
+
+    def failure_record(self, worker_id, fallback_title, reason):
+        with self.lock:
+            state = self.workers[worker_id]
+            title = first_text(state.get("title"), fallback_title)
+            artist = first_text(state.get("artist"), "Unknown")
+            failure = title, artist, reason or "Unknown error"
+            self.failures.append(failure)
+            return failure
+
     def render(self):
-        narrow = console.size.width < 80
+        width = max(console.size.width, 1)
+        narrow = width < 100
         with self.lock:
             el = time.time() - self.t0
-            n, done, fail, byte_count = self.n, self.done, self.fail, self.bytes
-            average = sum(self.song_times[-10:]) / len(self.song_times[-10:]) if self.song_times else 0
-            feed = list(self.feed)
-            workers = [(i, dict(state)) for i, state in self.workers.items() if state["active"]]
-            next_up = [self.todo[i]["title"] for i in sorted(self.pending)[:3]]
-            pending_count = len(self.pending)
-        remaining = max(self.total - n, 0)
-        active_eta = [max((s["total"] - s["dl"]) / s["speed"], 0)
-                      if s["total"] and s["speed"] else average for _, s in workers]
-        worker_count = max(1, min(self.jobs, len(workers) or self.jobs))
-        eta = max(active_eta, default=0) + average * ((pending_count + worker_count - 1) // worker_count)
-        avg_speed = byte_count / el if el else 0
-        stats = [
-            ("Done", str(done), "#22c55e"),
-            ("Failed", str(fail), "#ef4444"),
-            ("Remaining", str(remaining), "bold"),
-            ("Size", size(byte_count), "bold"),
-            ("Avg speed", f"{size(avg_speed)}/s", "bold"),
-            ("Elapsed", dur(el), "bold"),
-            ("ETA", dur(eta), "bold"),
-        ]
-        strip = Table.grid(expand=True, padding=(0, 1))
-        if narrow:
-            for row in (stats[:4], stats[4:]):
-                strip.add_row(*(Text.assemble((f"{label} ", "#8b8b8b"), (value, style)) for label, value, style in row))
+            done, failed, byte_count = self.done, self.fail, self.bytes
+            failures, failures_view = list(self.failures), self.failures_view
+            workers = []
+            for worker_id in range(self.jobs):
+                state = dict(self.workers.get(worker_id, {}))
+                state.setdefault("active", False)
+                state.setdefault("title", "")
+                state.setdefault("artist", "")
+                state.setdefault("dl", 0)
+                state.setdefault("total", 0)
+                state.setdefault("speed", 0)
+                state.setdefault("stage", 0)
+                workers.append((worker_id, state))
+
+        if failures_view:
+            table = Table(title=f"Failures ({len(failures)})", expand=True, border_style="#5a5a5a")
+            table.add_column("Title", style="bold #ffffff")
+            table.add_column("Artist", style="#8b8b8b")
+            table.add_column("Reason", style="#f85149")
+            if failures:
+                for title, artist, reason in failures:
+                    table.add_row(Text(title), Text(artist), Text(reason))
+            else:
+                table.add_row("No failures", "", "")
+            return Panel(Group(table, Text("Press any key to return", style="#8b8b8b")),
+                         expand=True, border_style="#5a5a5a")
+
+        active = sum(1 for _, state in workers if state["active"])
+        left = max(self.total - done - failed - active, 0)
+        finished_count = done + failed + active
+        percent = finished_count / self.total if self.total else 0
+        avg_speed = byte_count / el if el > 0 else 0
+        avg_song_size = byte_count / done if done else 0
+        remaining_bytes = avg_song_size * left
+        for _, state in workers:
+            if not state["active"]:
+                continue
+            if state["stage"] > 0 and state["total"]:
+                remaining_bytes += max(state["total"] - state["dl"], 0)
+            else:
+                remaining_bytes += avg_song_size
+        eta = dur(remaining_bytes / avg_speed) if done and avg_speed else "—"
+
+        orange, green, red, grey = "#ff9f1a", "#3fb950", "#f85149", "#8b8b8b"
+        heading_row = Table.grid(expand=True, padding=0)
+        heading_row.add_column(ratio=1)
+        heading_row.add_column(no_wrap=True, justify="right")
+        heading = Text()
+        heading.append(f"{percent:.1%}", style=f"bold {orange}")
+        heading.append(f"  {finished_count} / {self.total} tracks", style=grey)
+        timing = Text()
+        timing.append("ETA ", style=grey)
+        timing.append(eta, style="bold #ffffff")
+        timing.append("  ·  Elapsed ", style=grey)
+        timing.append(dur(el), style="bold #ffffff")
+        heading_row.add_row(heading, timing)
+
+        bar_width = max(width - 4, 1)
+        counts = [done, failed, active, left]
+        total_count = sum(counts)
+        if total_count != self.total:
+            counts[-1] = max(self.total - sum(counts[:-1]), 0)
+            total_count = sum(counts)
+        if total_count:
+            exact = [count * bar_width / total_count for count in counts]
+            widths = [int(value) for value in exact]
+            for index in sorted(range(len(widths)), key=lambda i: exact[i] - widths[i], reverse=True)[
+                    :bar_width - sum(widths)]:
+                widths[index] += 1
         else:
-            strip.add_row(*(Text.assemble((f"{label} ", "#8b8b8b"), (value, style)) for label, value, style in stats))
-
-        now_panels = []
-        bar_width = max(console.size.width - (60 if narrow else 54), 8)
-        for worker_id, state in workers[:3]:
-            title = Text(f"Now · {state['index'] + 1}/{self.total} · Worker {worker_id + 1}",
-                         style="bold #ff8c00")
-            current_title = Text(state["title"], style="bold", no_wrap=True, overflow="ellipsis")
-            pct = state["dl"] / state["total"] if state["total"] else 0
-            current_eta = max((state["total"] - state["dl"]) / state["speed"], 0) \
-                if state["total"] and state["speed"] else 0
-            bar_row = Table.grid(expand=True, padding=(0, 1))
-            bar_row.add_column(width=6)
-            bar_row.add_column(width=bar_width)
-            bar_row.add_column(justify="right")
-            detail = (f"{size(state['dl'])} / {size(state['total'])} · {size(state['speed'])}/s · ETA {dur(current_eta)}"
-                      if state["total"] else f"{size(state['dl'])} · {size(state['speed'])}/s · ETA …")
-            if state["retry"]:
-                detail += f" · {state['retry']}"
-            bar_row.add_row(Text(f"{pct:.1%}", style="bold #ff8c00"),
-                            ProgressBar(total=state["total"] or None, completed=state["dl"], width=bar_width,
-                                        pulse=not state["total"], style="#3a3a3a", complete_style="#ff8c00",
-                                        finished_style="#22c55e", animation_time=time.time()),
-                            Text(detail, style="bold"))
-            steps = Text()
-            for i, name in enumerate(("Fetch", "Download", "Convert", "Tag")):
-                if i:
-                    steps.append("  ")
-                marker, color = ("✔", "#22c55e") if i < state["stage"] else \
-                                ("●", "#ff8c00") if i == state["stage"] else ("○", "#8b8b8b")
-                steps.append(f"{marker} {name}", style=color)
-            row_items = [title, current_title]
-            if not narrow:
-                row_items += [Text(state["artist"], style="#8b8b8b", no_wrap=True, overflow="ellipsis"),
-                              Text(state["playlist"], style="#8b8b8b", no_wrap=True, overflow="ellipsis")]
-            row_items += [bar_row, steps]
-            now_panels.append(Panel(Group(*row_items), border_style="#ff8c00", padding=(0, 1), expand=True))
-
-        overall_done = min(n + len(workers), self.total)
-        done_pct = overall_done / self.total if self.total else 0
-        overall_width = max(console.size.width - 22, 8)
-        overall = Table.grid(expand=True, padding=(0, 1))
-        overall.add_column(width=overall_width)
-        overall.add_column(justify="right")
-        overall.add_row(ProgressBar(total=self.total or None, completed=overall_done, width=overall_width,
-                                    style="#3a3a3a", complete_style="#ff8c00",
-                                    finished_style="#22c55e", animation_time=time.time()),
-                        Text(f"{done_pct:.1%} · {overall_done}/{self.total}", style="bold"))
-
-        recent = Table(title="Recent", expand=True, border_style="#3a3a3a", header_style="bold")
-        recent.add_column("Status", width=7)
-        recent.add_column("Title", ratio=3, no_wrap=True, overflow="ellipsis")
+            widths = [0, 0, 0, bar_width]
+        segmented = Text()
+        for segment_width, color in zip(widths, (green, red, orange, "#3a3a3a")):
+            segmented.append("━" * segment_width, style=color)
+        legend = Text()
+        for dot, label, value, color in (
+                ("●", "Done", done, green), ("●", "Failed", failed, red),
+                ("●", "Active", active, orange), ("●", "Left", left, grey)):
+            if legend.plain:
+                legend.append("   ")
+            legend.append(f"{dot} ", style=color)
+            legend.append(f"{label} ", style=grey)
+            legend.append(str(value), style="bold #ffffff")
         if not narrow:
-            recent.add_column("Artist", ratio=2, no_wrap=True, overflow="ellipsis")
-            recent.add_column("Size", justify="right", no_wrap=True)
-        recent.add_column("Time", justify="right", no_wrap=True)
-        for ok, song, song_artist, song_size, elapsed, reason in feed[-6:]:
-            color = "#22c55e" if ok else "#ef4444"
-            name = song if ok or not reason else f"{song} · {reason}"
-            cells = [Text("✔" if ok else "✖", style=color), Text(name, style=color)]
-            if not narrow:
-                cells.extend([Text(song_artist, style="#8b8b8b"), Text(song_size, justify="right")])
-            cells.append(Text(elapsed, justify="right"))
-            recent.add_row(*cells)
+            legend.append("   Size ", style=grey)
+            legend.append(size(byte_count), style="bold #ffffff")
+            legend.append("   Avg ", style=grey)
+            legend.append(f"{size(avg_speed)}/s", style="bold #ffffff")
+        overall_panel = Panel(Group(heading_row, segmented, legend), expand=True,
+                              padding=(0, 1), border_style="#5a5a5a")
+        blocks = [overall_panel]
 
-        items = [strip, *now_panels, overall, recent]
-        if not narrow:
-            items.append(Text("Up next", style="bold"))
-            items.extend(Text(f"  {song}", style="#8b8b8b", no_wrap=True, overflow="ellipsis") for song in next_up)
-        items.append(Text("Ctrl+C to stop safely", style="#8b8b8b"))
-        return Group(*items)
+        stage_names = ("Fetch", "Download", "Convert", "Tag")
+        for worker_id, state in workers:
+            title_line = Text()
+            title_line.append(f"W{worker_id + 1}  ", style=orange)
+            title_line.append(state["title"] or "Waiting for data…", style="bold #ffffff")
+            if not narrow and state["artist"]:
+                title_line.append(f" · {state['artist']}", style=grey)
+            if state["dl"] > 0:
+                right_text = f"{size(state['dl'])} / {size(state['total'])} · {size(state['speed'])}/s"
+            else:
+                right_text = "waiting for data…"
+            title_line.truncate(max(width - len(right_text) - 8, 1), overflow="ellipsis")
+            line1 = Table.grid(expand=True, padding=0)
+            line1.add_column(ratio=1)
+            line1.add_column(no_wrap=True, justify="right")
+            line1.add_row(title_line, Text(right_text, style=grey))
+
+            stage = min(max(state["stage"], 0), len(stage_names) - 1)
+            progress = min(state["dl"] / state["total"], 1) if state["total"] else 0
+            percent_style = green if progress >= 1 else orange if progress > 0 else grey
+            percent_text = Text(f"{progress:.0%}", style=percent_style)
+            chips = Text()
+            for index, name in enumerate(stage_names):
+                if index:
+                    chips.append("  ")
+                if index < stage:
+                    chips.append(f"✓ {name}", style=green)
+                elif index == stage:
+                    chips.append(f"● {name}", style=orange)
+                else:
+                    chips.append(f"○ {name}", style=grey)
+            inner_width = max(width - 4, 1)
+            bar_cells = max(inner_width - 6 - len(chips.plain), 1)
+            filled = min(int(bar_cells * progress), bar_cells)
+            progress_bar = Text("━" * filled, style=green if progress >= 1 else orange)
+            progress_bar.append("━" * (bar_cells - filled), style="#3a3a3a")
+            line2 = Table.grid(expand=True, padding=0)
+            line2.add_column(width=5, no_wrap=True)
+            line2.add_column(ratio=1, no_wrap=True)
+            line2.add_column(no_wrap=True, justify="right")
+            line2.add_row(percent_text, progress_bar, chips)
+            blocks.append(Panel(Group(line1, line2), expand=True, padding=(0, 1),
+                                border_style="#6b4a12"))
+
+        blocks.append(Text(f"Failed: {failed} · press f to view failures, q to quit", style=grey))
+        return Group(*blocks)
 
 
-def dl_opts(cfg, out, st, worker_id, stop_event):
+class DashboardKeys:
+    def __init__(self, state, stop_event, gate):
+        self.state, self.stop_event, self.gate = state, stop_event, gate
+        self.quit_requested = threading.Event()
+        self.done = threading.Event()
+        self.thread = None
+
+    def start(self):
+        if not sys.stdin.isatty():
+            return False
+        self.thread = threading.Thread(target=self._run, name="dashboard-keys", daemon=True)
+        self.thread.start()
+        return True
+
+    def stop(self):
+        self.done.set()
+        if self.thread:
+            self.thread.join(timeout=1)
+
+    def _read_key(self):
+        if os.name == "nt":
+            import msvcrt
+            if not msvcrt.kbhit():
+                time.sleep(0.05)
+                return None
+            key = msvcrt.getwch()
+            if key in ("\x00", "\xe0"):
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                return None
+            return key
+        import select
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], 0.1)
+        return os.read(fd, 1).decode("utf-8", "ignore") if ready else None
+
+    def _run(self):
+        old_terminal = None
+        try:
+            if os.name != "nt":
+                import termios
+                import tty
+                fd = sys.stdin.fileno()
+                old_terminal = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+            while not self.done.is_set():
+                key = self._read_key()
+                if key is None:
+                    continue
+                with self.state.lock:
+                    showing_failures = self.state.failures_view
+                if showing_failures:
+                    self.state.show_failures(False)
+                    continue
+                if key.lower() == "f":
+                    self.state.show_failures(True)
+                    while not self.done.is_set():
+                        if self._read_key() is not None:
+                            self.state.show_failures(False)
+                            break
+                elif key.lower() == "q":
+                    self.quit_requested.set()
+                    self.stop_event.set()
+                    self.gate.wake()
+                    return
+        except Exception:
+            logging.exception("Dashboard key handling failed")
+        finally:
+            if old_terminal is not None:
+                with contextlib.suppress(Exception):
+                    import termios
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_terminal)
+
+
+def run_demo():
+    ensure_ui()
+    try:
+        import random
+    except ImportError:
+        random = __import__("random")
+    todo = [{"id": f"demo{i:04}", "title": f"Demo Track {i + 1}", "dur": 180}
+            for i in range(64)]
+    state = St(64, todo, 3)
+    stop_event, gate = threading.Event(), WorkerGate(3)
+    work = queue.Queue()
+    for index, item in enumerate(todo):
+        work.put((index, item))
+
+    def demo_worker(worker_id):
+        while not stop_event.is_set():
+            try:
+                index, item = work.get_nowait()
+            except queue.Empty:
+                return
+            state.start(worker_id, index, item, "Demo")
+            state.set_track(worker_id, item["title"], "Demo Artist")
+            total = random.randint(2_000_000, 5_000_000)
+            downloaded = 0
+            for step in range(random.randint(8, 16)):
+                if stop_event.is_set():
+                    return
+                downloaded = min(total, downloaded + random.randint(total // 12, total // 6))
+                state.progress(worker_id, {"status": "downloading",
+                                           "downloaded_bytes": downloaded,
+                                           "total_bytes": total,
+                                           "speed": random.randint(300_000, 900_000)})
+                time.sleep(random.uniform(0.08, 0.16))
+            failed = random.random() < 0.08
+            if failed:
+                reason = "Video unavailable"
+                state.failure_record(worker_id, item["title"], reason)
+                state.record(worker_id, False, item["title"], 0, 1.2, reason)
+            else:
+                state.record(worker_id, True, item["title"], total, 1.2, "")
+            state.finish_worker(worker_id)
+
+    console.clear()
+    listeners = DashboardKeys(state, stop_event, gate)
+    listeners.start()
+    with Live(get_renderable=state.render, console=console, refresh_per_second=8,
+              transient=False, screen=True, vertical_overflow="crop"):
+        executor = ThreadPoolExecutor(max_workers=3)
+        futures = [executor.submit(demo_worker, worker_id) for worker_id in range(3)]
+        for future in as_completed(futures):
+            future.result()
+        executor.shutdown(wait=True)
+    listeners.stop()
+    console.print(f"[bold #3fb950]Done[/] · {state.done} done · {state.fail} failed · "
+                  f"{size(state.bytes)} · {dur(time.time() - state.t0)}")
+
+
+def dl_opts(cfg, out, st, worker_id, force_event=None):
+    yt_dlp = get_ytdlp()
     f = cfg["format"]
 
     def hook(d):
-        if stop_event.is_set():
+        if force_event and force_event.is_set():
             raise StopRequested()
         st.progress(worker_id, d)
 
     def pphook(d):
-        if stop_event.is_set():
+        if force_event and force_event.is_set():
             raise StopRequested()
         st.postprocess(worker_id, d)
 
@@ -750,9 +1227,11 @@ class WorkerGate:
 
 
 def download_worker(worker_id, work, cfg, out, lib, st, gate, stop_event, failed, failed_lock,
-                    playlist_by_id, compact):
+                    playlist_by_id, compact, force_event):
+    yt_dlp = get_ytdlp()
+    Clean, SquareCover = postprocessor_types()
     status = WorkerStatus(st, worker_id)
-    with yt_dlp.YoutubeDL(dl_opts(cfg, out, st, worker_id, stop_event)) as y:
+    with yt_dlp.YoutubeDL(dl_opts(cfg, out, st, worker_id, force_event)) as y:
         y.add_post_processor(Clean(lib, cfg, status), when="pre_process")
         if cfg["cover"] and cfg["square"] and cfg["format"] != "wav":
             y.add_post_processor(SquareCover(), when="before_dl")
@@ -765,6 +1244,7 @@ def download_worker(worker_id, work, cfg, out, lib, st, gate, stop_event, failed
                 return
             st.start(worker_id, index, e, playlist_by_id.get(e["id"], "Single track"))
             t1, ok, song_size, note, cancelled, retries = time.time(), False, 0, "", False, 0
+            index_retry = False
             held = True
             try:
                 while True:
@@ -773,36 +1253,57 @@ def download_worker(worker_id, work, cfg, out, lib, st, gate, stop_event, failed
                         if stop_event.is_set():
                             raise StopRequested()
                         info = y.extract_info(watch_url(e["id"]), download=True)
-                        rd = (info.get("requested_downloads") or [{}])[0]
-                        fp = Path(rd.get("filepath") or out / f"{info['fname']}.{cfg['format']}")
-                        record = {"file": fp.name, "artist": info.get("artist") or "",
-                                  "title": info.get("title") or e["title"],
-                                  "dur": int(info.get("duration") or e["dur"])}
+                        downloads = info.get("requested_downloads") if isinstance(info, dict) else None
+                        rd = next((item for item in downloads or [] if isinstance(item, dict)), {})
+                        with lib.name_lock:
+                            reserved_name = lib.reserved_by_id.get(e["id"])
+                        filename = first_text(info.get("fname") if isinstance(info, dict) else None,
+                                              reserved_name or fsafe(e.get("title")))
+                        fp = Path(first_text(rd.get("filepath"), str(out / f"{filename}.{cfg['format']}")))
+                        artist = first_text(info.get("artist") if isinstance(info, dict) else None, "Unknown")
+                        title = first_text(info.get("title") if isinstance(info, dict) else None,
+                                           first_text(e.get("title"), "Unknown"))
+                        record = {"file": fp.name, "artist": artist, "title": title,
+                                  "dur": int((info.get("duration") if isinstance(info, dict) else None)
+                                             or e.get("dur") or 0)}
                         song_size = fp.stat().st_size
                         with lib.lock:
                             lib.d["songs"][e["id"]] = record
                         ok, note = True, f"{size(song_size)}  {time.time() - t1:.1f}s"
-                    except StopRequested:
-                        cancelled = True
-                    except Exception as ex:
-                        if stop_event.is_set():
+                    except (StopRequested, KeyboardInterrupt) as ex:
+                        if stop_event.is_set() or force_event.is_set():
                             cancelled = True
+                        else:
+                            note = clean_reason(short(ex) or "Interrupted")
+                            with failed_lock:
+                                failed.append(st.failure_record(
+                                    worker_id, first_text(e.get("title"), e["id"]), str(ex) or note))
+                            logging.exception("Download failed for video %s", e["id"])
+                    except Exception as ex:
+                        if stop_event.is_set() or force_event.is_set():
+                            cancelled = True
+                        elif isinstance(ex, IndexError) and not index_retry:
+                            index_retry = True
+                            retry_delay = 1
+                            st.set_retry(worker_id, retry_delay)
+                            logging.exception("Retrying index error for video %s once", e["id"])
                         elif re.search(r"429|sign\s+in", str(ex), re.I) and retries < max(1, int(cfg["retries"])):
                             retries += 1
                             gate.reduce()
                             retry_delay = min(2 ** (retries - 1), 30)
                             st.set_retry(worker_id, retry_delay)
-                            logging.warning("%s: transient download failure, retry %s in %ss: %s",
-                                            e["id"], retries, retry_delay, short(ex))
+                            logging.exception("Transient download failure for video %s; retry %s in %ss",
+                                              e["id"], retries, retry_delay)
                         else:
-                            note = short(ex)
+                            note = clean_reason(short(ex))
                             with failed_lock:
-                                failed.append((e["title"], note))
-                            logging.error("%s: %s", e["id"], ex)
+                                failed.append(st.failure_record(
+                                    worker_id, first_text(e.get("title"), e["id"]), str(ex) or note))
+                            logging.exception("Download failed for video %s", e["id"])
                     gate.release()
                     held = False
                     if retry_delay is not None:
-                        if stop_event.wait(retry_delay) or not gate.acquire(stop_event):
+                        if stop_event.wait(retry_delay) or force_event.is_set() or not gate.acquire(stop_event):
                             cancelled = True
                             break
                         held = True
@@ -814,62 +1315,200 @@ def download_worker(worker_id, work, cfg, out, lib, st, gate, stop_event, failed
                     gate.release()
             elapsed = time.time() - t1
             if cancelled:
+                st.record(worker_id, False, first_text(e.get("title"), e["id"]), 0, elapsed,
+                          "Interrupted", interrupted=True)
                 st.finish_worker(worker_id)
+                lib.save()
                 return
             count, title = st.record(worker_id, ok, e["title"], song_size, elapsed, note)
             st.finish_worker(worker_id)
             lib.save()
             if compact:
                 with st.print_lock:
-                    console.print(f"{'✔' if ok else '✖'} {count}/{st.total} {title[:50]}  {note}")
+                    console.print(f"{status_glyph(ok)} {count}/{st.total} {title[:50]}  {note}")
+
+
+def cleanup_partial_files(out, lib):
+    with lib.lock:
+        known = {Path(song["file"]).name for song in lib.d["songs"].values()
+                 if isinstance(song, dict) and song.get("file")}
+    with lib.name_lock:
+        reserved = {name.casefold() for name in lib.reserved_by_id.values()}
+    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+    audio_exts = EXT | {".webm"}
+    for path in Path(out).iterdir():
+        if not path.is_file() or path.name in known:
+            continue
+        name = path.name
+        suffix = path.suffix.lower()
+        base_name = name[:-len(suffix)] if suffix in (".part", ".ytdl", ".temp") else name
+        stem = Path(base_name).stem
+        if stem.lower().endswith(".sq"):
+            stem = stem[:-3]
+        if stem.casefold() in reserved and (suffix in (".part", ".ytdl", ".temp")
+                                            or suffix in audio_exts | image_exts):
+            path.unlink(missing_ok=True)
 
 
 def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
     out, lib, todo = plan["out"], plan["lib"], plan["todo"]
     jobs = max(1, min(6, int(cfg.get("jobs", 3))))
     worker_count = min(jobs, max(1, len(todo)))
-    st = St(len(todo), todo, worker_count)
+    st = St(len(todo), todo, worker_count, initial_failures=len(plan["errs"]))
     failed, stopped = list(plan["errs"]), False
+    with st.lock:
+        st.failures.extend((title, "Unknown", reason) for title, reason in plan["errs"])
     failed_lock = threading.Lock()
     plain = compact or not console.is_terminal
+    stop_event, force_event = threading.Event(), threading.Event()
+    gate = WorkerGate(worker_count)
+    executor = None
+    futures = []
+    live = contextlib.nullcontext() if plain else \
+        Live(get_renderable=st.render, console=console, refresh_per_second=8, transient=False, screen=True,
+             vertical_overflow="crop")
+    live_obj = live if isinstance(live, Live) else None
+    old_sigint, signal_installed = None, False
+    hard_exit = False
+    force_quit = [False]
+    finalizing = [False]
+    signal_stopped = False
+
+    def handle_sigint(_signum, _frame):
+        if finalizing[0]:
+            stop_event.set()
+            force_event.set()
+            force_quit[0] = True
+            return
+        if stop_event.is_set():
+            force_event.set()
+            gate.wake()
+            force_quit[0] = True
+            return
+        stop_event.set()
+        gate.wake()
+        raise FirstInterrupt()
+
+    if todo and threading.current_thread() is threading.main_thread():
+        try:
+            old_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, handle_sigint)
+            signal_installed = True
+        except (ValueError, OSError):
+            signal_installed = False
+
+    def shutdown_for_stop(force=False):
+        nonlocal hard_exit
+        gate.wake()
+        if executor:
+            executor.shutdown(wait=False, cancel_futures=True)
+        if force:
+            force_event.set()
+            gate.wake()
+            deadline = time.monotonic() + 0.25
+        else:
+            deadline = time.monotonic() + 10
+        pending = {future for future in futures if not future.done()}
+        while pending and time.monotonic() < deadline:
+            if force_event.is_set() and not force:
+                break
+            wait(pending, timeout=min(0.1, deadline - time.monotonic()))
+            pending = {future for future in pending if not future.done()}
+        if pending and force_event.is_set() and not force:
+            force = True
+            deadline = time.monotonic() + 0.25
+            while pending and time.monotonic() < deadline:
+                wait(pending, timeout=min(0.1, deadline - time.monotonic()))
+                pending = {future for future in pending if not future.done()}
+        if pending and not force:
+            force_event.set()
+            gate.wake()
+            deadline = time.monotonic() + 1
+            while pending and time.monotonic() < deadline:
+                wait(pending, timeout=min(0.1, deadline - time.monotonic()))
+                pending = {future for future in pending if not future.done()}
+        hard_exit = bool(pending)
+
+    def show_stopping():
+        message = Text("Stopping… finishing current files (Ctrl+C again to force quit)",
+                       style="#ff8c00")
+        if live_obj:
+            live_obj.update(message, refresh=True)
+        else:
+            console.print(message)
+
+    def stop_after_interrupt():
+        nonlocal hard_exit
+        try:
+            shutdown_for_stop()
+        except (ForceInterrupt, KeyboardInterrupt):
+            force_quit[0] = True
+            try:
+                shutdown_for_stop(force=True)
+            except (ForceInterrupt, KeyboardInterrupt):
+                force_event.set()
+                hard_exit = True
+
     if todo:
         if not plain:
             console.clear()
-        live = contextlib.nullcontext() if plain else \
-            Live(get_renderable=st.render, console=console, refresh_per_second=10, transient=True, screen=True)
         playlist_by_id = {}
         for playlist in plan["pls"]:
             for item in playlist["items"]:
                 playlist_by_id.setdefault(item["id"], playlist["name"])
-        work, gate, stop_event = queue.Queue(), WorkerGate(worker_count), threading.Event()
+        work = queue.Queue()
         for index, e in enumerate(todo):
             work.put((index, e))
         with live:
             executor = ThreadPoolExecutor(max_workers=worker_count)
-            futures = []
+            key_listener = DashboardKeys(st, stop_event, gate) if not plain else None
             try:
+                if key_listener:
+                    key_listener.start()
                 futures = [executor.submit(download_worker, worker_id, work, cfg, out, lib, st, gate, stop_event,
-                                           failed, failed_lock, playlist_by_id, plain)
+                                           failed, failed_lock, playlist_by_id, plain, force_event)
                            for worker_id in range(worker_count)]
                 for future in as_completed(futures):
                     future.result()
+            except FirstInterrupt:
+                stopped = True
+                signal_stopped = True
+                show_stopping()
+                stop_after_interrupt()
             except KeyboardInterrupt:
                 stopped = True
+                signal_stopped = True
                 stop_event.set()
-                gate.wake()
-                for future in futures:
-                    future.cancel()
+                show_stopping()
+                stop_after_interrupt()
+            except ForceInterrupt:
+                stopped = True
+                signal_stopped = True
+                force_quit[0] = True
+                try:
+                    shutdown_for_stop(force=True)
+                except (ForceInterrupt, KeyboardInterrupt):
+                    force_event.set()
+                    hard_exit = True
             except BaseException:
                 stop_event.set()
+                force_event.set()
                 gate.wake()
-                for future in futures:
-                    future.cancel()
+                if executor:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                if signal_installed:
+                    signal.signal(signal.SIGINT, old_sigint)
+                    signal_installed = False
                 raise
             finally:
-                executor.shutdown(wait=True, cancel_futures=stop_event.is_set())
-        for p in list(out.glob("*.part")) + list(out.glob("*.ytdl")):
-            p.unlink(missing_ok=True)
+                if key_listener:
+                    key_listener.stop()
+            if key_listener and key_listener.quit_requested.is_set():
+                stopped = True
+            if not signal_stopped:
+                executor.shutdown(wait=True)
 
+    finalizing[0] = True
     with lib.lock:
         songs, aliases = dict(lib.d["songs"]), dict(plan["aliases"])
         lib.d["aliases"] = aliases
@@ -890,13 +1529,19 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         if stale and questionary.confirm(f"Delete {len(stale)} song(s) no longer in any playlist?", default=False).ask():
             with lib.lock:
                 for k in stale:
-                    (out / lib.d["songs"].pop(k)["file"]).unlink(missing_ok=True)
+                    song = lib.d["songs"].pop(k, {})
+                    filename = song.get("file") if isinstance(song, dict) else None
+                    if filename:
+                        (out / filename).unlink(missing_ok=True)
                 lib.d["aliases"] = {k: v for k, v in lib.d["aliases"].items() if v not in stale}
                 songs = dict(lib.d["songs"])
 
+    cleanup_partial_files(out, lib)
     el = time.time() - st.t0
     with st.lock:
         downloads, downloaded_bytes, failures = st.done, st.bytes, st.fail
+        interrupted = max(st.total - st.done - st.worker_fail, 0) if stopped else 0
+        st.interrupted = interrupted
     with lib.lock:
         s = lib.d["stats"]
         s["runs"] += 1
@@ -905,19 +1550,32 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         s["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         playlist_count = len(lib.d["playlists"])
     lib.save()
-    ff = profile_dir(out) / "failed.txt"
-    if failed:
-        ff.write_text("\n".join(f"{a}\t{b}" for a, b in failed), encoding="utf-8")
+    ff = DATA / "failed.txt"
+    with failed_lock:
+        failed_rows = []
+        for row in failed:
+            if len(row) >= 3:
+                title, artist, reason = row[0], row[1], row[2]
+            else:
+                title, reason = row
+                artist = "Unknown"
+            failed_rows.append((str(title), str(artist), str(reason)))
+    if failed_rows:
+        ff.write_text("\n".join(
+            "\t".join(value.replace("\r", " ").replace("\n", "\\n").replace("\t", " ")
+                      for value in (title, artist, reason))
+            for title, artist, reason in failed_rows), encoding="utf-8")
     else:
         ff.unlink(missing_ok=True)
 
-    head = "■ Stopped, progress saved. Run Update to continue." if stopped else "✔ Sync complete"
-    body = [Text(head, style="bold #ff8c00" if stopped else "bold #22c55e"),
-            Text(f"{downloads} new · {failures} failed · {size(downloaded_bytes)} · {dur(el)} · "
-                 f"avg {size(downloaded_bytes / el if el else 0)}/s")]
-    if not todo and not stopped:
-        body.append(Text("Already up to date.", style="dim"))
-    console.print(Panel(Group(*body), border_style="#ff8c00" if stopped else "#22c55e"))
+    summary_label = "Stopped · " if stopped else "Already up to date · " if not todo else "Done · "
+    summary = Text(summary_label,
+                   style="bold #ff9f1a" if stopped else "bold #3fb950")
+    summary.append(f"{downloads} done · {failures} failed · {size(downloaded_bytes)} · {dur(el)}",
+                   style="#ffffff")
+    if stopped:
+        summary.append(f" · Interrupted {interrupted} (will retry on next Update)", style="#8b8b8b")
+    console.print(summary)
     if rows:
         t = Table(border_style="#3a3a3a")
         for c in ("Playlist", "Songs", "Added", "Removed"):
@@ -927,15 +1585,9 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         console.print(t)
     if plan["bad"]:
         console.print(f"[dim]{plan['bad']} private/deleted videos skipped[/]")
-    if failed:
-        t = Table(title=f"Needs attention ({len(failed)}), saved to {ff}",
-                  border_style="#ef4444", header_style="bold #ef4444")
-        t.add_column("Item", no_wrap=True)
-        t.add_column("Reason")
-        for a, b in failed[:8]:
-            t.add_row(Text(a[:45], style="#ef4444"), Text(b, style="#ef4444"))
-        console.print(t)
-        if sum(1 for _, r in failed if BLOCKED.search(r)) >= 2:
+    if failed_rows:
+        console.print(f"[dim]Failure details saved to {ff}[/]")
+        if sum(1 for _, _, reason in failed_rows if BLOCKED.search(reason)) >= 2:
             console.print("[yellow]These errors usually mean yt-dlp is outdated.[/]")
             if interactive and console.is_terminal:
                 if questionary.confirm("Update yt-dlp now?", default=True).ask():
@@ -946,14 +1598,24 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
                         f"All-time: {s['downloads']} downloads · {s['runs']} runs", title="Library",
                         border_style="#3a3a3a"))
     console.print("[dim]Run again anytime. Only new songs download.[/]")
+    if signal_installed:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal_installed = False
+    if hard_exit or force_quit[0]:
+        with contextlib.suppress(Exception):
+            console.file.flush()
+        if hard_exit:
+            os._exit(130)
+        raise SystemExit(130)
+    return stopped
 
 
 def show_stats(cfg):
-    lib = Lib(cfg["out"])
+    lib = get_lib(cfg["out"])
     s = lib.d["stats"]
     t = Table(title="Library stats", show_header=False, border_style="cyan")
     t.add_row("Folder", cfg["out"])
-    t.add_row("Data folder", str(profile_dir(cfg["out"])))
+    t.add_row("Data folder", short_data_dir())
     t.add_row("Songs", str(len(lib.d["songs"])))
     t.add_row("Size", size(lib.total_size()))
     t.add_row("All-time downloads", str(s["downloads"]))
@@ -968,12 +1630,54 @@ def show_stats(cfg):
 
 # ---------- interactive menus (every menu has "‹ Back"; Ctrl+C = back/exit) ----------
 def ask(msg, choices):
-    return questionary.select(msg, choices=[questionary.Choice(t, v) for t, v in choices],
-                              style=STYLE, instruction=" ").ask()
+    try:
+        return questionary.select(msg, choices=[questionary.Choice(t, v) for t, v in choices],
+                                  style=STYLE, instruction=" ").ask()
+    except KeyboardInterrupt:
+        return None
 
 
 def pause():
-    questionary.press_any_key_to_continue("Press any key to continue...").ask()
+    try:
+        console.input("[dim]Press Enter to continue...[/]")
+    except KeyboardInterrupt:
+        return
+
+
+def short_data_dir():
+    try:
+        return str(Path("~") / DATA.relative_to(Path.home()))
+    except ValueError:
+        return str(DATA)
+
+
+def setup_logging():
+    ensure_data_dir()
+    logging.basicConfig(filename=DATA / "sync.log", level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s", force=True)
+
+
+def menu_error(error):
+    logging.exception("Menu action failed")
+    console.print(f"[red]Error: {short(error)}[/]")
+
+
+def print_timings():
+    if not TIMING_ENABLED:
+        return
+    for name in ("imports", "config", "library load"):
+        if name in TIMINGS:
+            console.print(f"[dim]Timing · {name}: {TIMINGS[name]:.3f}s[/]")
+    if UPDATE_CHECKER and "update check reported" not in TIMINGS:
+        state = "complete" if UPDATE_CHECKER.done.is_set() else "still running"
+        console.print(f"[dim]Timing · update check: {UPDATE_CHECKER.elapsed:.3f}s ({state})[/]")
+
+
+def report_update_timing():
+    if TIMING_ENABLED and UPDATE_CHECKER and UPDATE_CHECKER.done.is_set() \
+            and "update check reported" not in TIMINGS:
+        console.print(f"[dim]Timing · update check: {UPDATE_CHECKER.elapsed:.3f}s[/]")
+        TIMINGS["update check reported"] = 1
 
 
 def val(c, k):
@@ -983,12 +1687,13 @@ def val(c, k):
     return STYLES[v] if k == "name_style" else (str(v) or "-")
 
 
-def save_named_links(path, links):
-    path = Path(path).expanduser()
+def save_named_links(links):
+    path = DATA / "playlists.txt"
     existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
-    existing = set(read_list(path))
+    existing = {normalize_music_url(url) for url in read_list(path)}
     new_links = []
     for url, name in links:
+        url = normalize_music_url(url)
         if url not in existing:
             new_links.append((url, name))
             existing.add(url)
@@ -1006,161 +1711,246 @@ def save_named_links(path, links):
     return len(new_links)
 
 
-def save_my_links(cfg):
-    urls = all_urls(cfg)
-    if not urls:
-        console.print("[dim]No saved links to write.[/]")
+def open_path(path, purpose):
+    path = Path(path)
+    try:
+        if os.name == "nt":
+            os.startfile(str(path))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as e:
+        console.print(f"[yellow]Could not open {purpose}: {e}\nPath: {path}[/]")
+
+
+def open_playlists():
+    ensure_data_dir()
+    path = DATA / "playlists.txt"
+    if not path.exists():
+        path.write_text("# One link per line\n", encoding="utf-8")
+    console.print(f"[dim]{path}[/]")
+    open_path(path, "Playlists.txt")
+
+
+def edit_playlists():
+    ensure_data_dir()
+    path = DATA / "playlists.txt"
+    if not path.exists():
+        path.write_text("# One link per line\n", encoding="utf-8")
+    console.print(f"[dim]{path}[/]")
+    try:
+        if os.name == "nt":
+            subprocess.Popen(["notepad", str(path)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-t", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as e:
+        console.print(f"[yellow]Could not open Playlists.txt: {e}\nPath: {path}[/]")
+
+
+def offer_open_playlists():
+    try:
+        if questionary.confirm("Open Playlists.txt?", default=False).ask():
+            open_playlists()
+    except KeyboardInterrupt:
         return
-    path = questionary.path("Save links to:", default=str(profile_dir(cfg["out"]) / "playlists.txt")).ask()
-    if not path:
-        return
-    existing = set(read_list(path))
-    urls = [url for url in urls if url not in existing]
-    if not urls:
-        console.print("[dim]All saved links are already in that file.[/]")
-        return
-    details, errs = {}, []
-    resolve(urls, cfg, errs, details)
-    for url, reason in errs:
-        console.print(f"[red]Could not read {url}: {reason}[/]")
-    save_named_links(path, [(url, details.get(url, (url, 0, None))[0]) for url in urls])
+
+
+def normalize_music_url(url):
+    parsed = urlparse(url)
+    try:
+        hostname, port = parsed.hostname, parsed.port
+    except ValueError:
+        return url
+    if hostname and hostname.lower() == "music.youtube.com":
+        userinfo = parsed.netloc.rsplit("@", 1)[0] + "@" if "@" in parsed.netloc else ""
+        port_suffix = f":{port}" if port is not None else ""
+        return parsed._replace(netloc=f"{userinfo}www.youtube.com{port_suffix}").geturl()
+    return url
+
+
+def is_playlist_url(url):
+    parsed = urlparse(url)
+    return "list" in parse_qs(parsed.query, keep_blank_values=True) or "/playlist" in parsed.path.lower()
+
+
+def collect_links(cfg):
+    known, added = {normalize_music_url(url) for url in all_urls()}, []
+    while True:
+        try:
+            raw = questionary.text(f"Link #{len(added) + 1} (Enter on empty line = Done)").ask()
+        except KeyboardInterrupt:
+            return None
+        if raw is None:
+            return None
+        link = raw.strip()
+        if not link:
+            return added
+        parsed = urlparse(link)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            console.print("[red]Enter a valid http(s) URL.[/]")
+            continue
+        link = normalize_music_url(link)
+        if link in known:
+            console.print("[dim]Already in Playlists.txt; skipping duplicate link.[/]")
+            continue
+        details, errs = {}, []
+        resolve([link], cfg, errs, details)
+        detail = details.get(link)
+        if errs or not detail or detail[2]:
+            reason = errs[0][1] if errs else (detail[2] if detail else "No playlist or song information found")
+            console.print(f"[red]Could not add link: {reason}[/]")
+            continue
+        name, count, _ = detail
+        added.append((link, name))
+        known.add(link)
+        console.print(f"[green]{status_glyph(True)} {name} · {count} songs[/]")
 
 
 def add_links(cfg):
-    c = ask("Add Music", [("Paste links", "paste"), ("Load from a file", "file"),
-                          ("Save my links to a file", "save"), ("‹ Back", "back")])
-    found = False
-    if c == "paste":
-        known, added, number = set(all_urls(cfg)), [], 1
-        while True:
-            raw = questionary.text(f"Link #{number} (Enter on empty line = Done)").ask()
-            if raw is None:
-                save_cfg(cfg)
-                return False
-            link = raw.strip()
-            if not link:
-                break
-            number += 1
-            parsed = urlparse(link)
-            if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
-                console.print("[red]Enter a valid http(s) URL.[/]")
+    options = [("Paste links", "paste"), ("Load from Playlists.txt", "load"),
+               ("Edit Playlists.txt", "edit"), ("‹ Back", "back")]
+    while True:
+        console.clear()
+        try:
+            choice = ask("Add Music", options)
+        except Exception as e:
+            menu_error(e)
+            continue
+        if choice in (None, "back"):
+            return None
+        try:
+            if choice == "paste":
+                added = collect_links(cfg)
+                if added is None:
+                    return None
+                if not added:
+                    continue
+                playlist_links = [(url, name) for url, name in added if is_playlist_url(url)]
+                if playlist_links:
+                    try:
+                        save = questionary.confirm(
+                            f"Add these {len(playlist_links)} playlist link(s) to Playlists.txt? [Y/n]",
+                            default=True).ask()
+                    except KeyboardInterrupt:
+                        return None
+                    if save is None:
+                        return None
+                    if save:
+                        save_named_links(playlist_links)
+                return [url for url, _ in added]
+            if choice == "load":
+                ensure_data_dir()
+                path = DATA / "playlists.txt"
+                links = read_list(path)
+                if not links:
+                    if not path.exists():
+                        path.write_text("# One link per line\n", encoding="utf-8")
+                    elif "# One link per line" not in path.read_text(encoding="utf-8"):
+                        with path.open("a", encoding="utf-8") as f:
+                            f.write("\n# One link per line\n")
+                    console.print(f"[yellow]No links found. Add one link per line in {path}.[/]")
+                    offer_open_playlists()
+                    continue
+                return links
+            if choice == "edit":
+                edit_playlists()
                 continue
-            if link in known:
-                console.print("[dim]Already saved; skipping duplicate link.[/]")
-                continue
-            details, errs = {}, []
-            resolve([link], cfg, errs, details)
-            if errs or details.get(link, (None, 0, "No playlist or song information found"))[2]:
-                reason = errs[0][1] if errs else details[link][2]
-                console.print(f"[red]Could not add link: {reason}[/]")
-                continue
-            name, count, _ = details[link]
-            cfg["urls"].append(link)
-            known.add(link)
-            added.append((link, name))
-            found = True
-            console.print(f"[green]✔ {name} · {count} songs[/]")
-        save_cfg(cfg)
-        save_to_file = questionary.confirm("Save these links to a file too? [y/N]", default=False).ask() \
-            if added else False
-        if added and save_to_file is None:
-            return False
-        if save_to_file:
-            path = questionary.path("Save links to:", default=str(profile_dir(cfg["out"]) / "playlists.txt")).ask()
-            if not path:
-                return False
-            save_named_links(path, added)
-    elif c == "file":
-        p = questionary.path("File:", default="playlists.txt").ask()
-        if p and Path(p).is_file():
-            f = str(Path(p).resolve())
-            if f not in cfg["files"]:
-                cfg["files"].append(f)
-            found = True
-        elif p:
-            console.print("[red]File not found.[/]")
-            pause()
-    elif c == "save":
-        save_my_links(cfg)
-    save_cfg(cfg)
-    return found
+        except Exception as e:
+            menu_error(e)
+            continue
 
 
-def manage_links(cfg):
-    items = cfg["urls"] + cfg["files"]
-    if not items:
-        console.print("[dim]No saved links.[/]")
-        pause()
-        return
-    r = questionary.checkbox("Space = select · Enter = remove selected", choices=items, style=STYLE).ask()
-    if r:
-        cfg["urls"] = [u for u in cfg["urls"] if u not in r]
-        cfg["files"] = [f for f in cfg["files"] if f not in r]
-
-
-def open_playlists(cfg):
-    p = profile_dir(cfg["out"]) / "playlists.txt"
-    if not p.exists():
-        p.write_text("# One YouTube playlist or song URL per line\n", encoding="utf-8")
-    console.print(f"[dim]{p}[/]")
+def open_data_folder():
     try:
-        if os.name == "nt":
-            os.startfile(str(p))
-        else:
-            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(p)])
-    except Exception:
-        console.print("[yellow]Could not open an editor. Edit the file above by hand.[/]")
-    pause()
+        ensure_data_dir()
+        open_path(DATA, "data folder")
+    except Exception as e:
+        console.print(f"[yellow]Could not open the data folder: {e}\nPath: {DATA}[/]")
 
 
-def open_data_folder(cfg):
-    p = profile_dir(cfg["out"])
-    try:
-        if os.name == "nt":
-            os.startfile(str(p))
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(p)])
-        else:
-            subprocess.Popen(["xdg-open", str(p)])
-    except OSError as e:
-        console.print(f"[yellow]Could not open the data folder: {e}\nData folder: {p}[/]")
+def library_folder_menu(cfg):
+    while True:
+        console.clear()
+        console.print(f"[bold]Library folder[/]\n[dim]{cfg['out']}[/]\n")
+        try:
+            choice = ask("", [("Change folder", "change"), ("Open in file explorer", "open"),
+                              ("‹ Back", "back")])
+        except Exception as e:
+            menu_error(e)
+            continue
+        if choice in (None, "back"):
+            return cfg
+        try:
+            if choice == "open":
+                open_path(cfg["out"], "library folder")
+                continue
+            try:
+                value = questionary.text("Music folder:", default=cfg["out"]).ask()
+            except KeyboardInterrupt:
+                return cfg
+            if value is None or not value.strip():
+                return cfg
+            new_path = Path(value.strip()).expanduser().resolve()
+            if new_path == Path(cfg["out"]).expanduser().resolve():
+                return cfg
+            with console.status("[cyan]Loading library..."):
+                new_path = ensure_lib(new_path)
+                updated = load_cfg(new_path)
+                get_lib(new_path)
+                save_cfg(updated)
+            return updated
+        except Exception as e:
+            menu_error(e)
 
 
 def settings(cfg):
     while True:
         console.clear()
-        console.print(f"[bold orange1]Settings[/]\n[dim]Data folder: {profile_dir(cfg['out'])}[/]\n")
-        n = len(cfg["urls"]) + len(cfg["files"])
-        k = ask("", [(f"{l:<22}{val(cfg, key)}", key) for key, l in LABELS] +
-                [("Library folder", "library"), ("Open data folder", "open_data"),
-                 ("Edit playlists.txt", "edit"), (f"Saved links ({n})", "links"),
-                 ("Reset to defaults", "reset"), ("‹ Back", "back")])
-        if k in (None, "back"):
+        console.print(f"[bold orange1]Settings[/]\n[dim]Data: {short_data_dir()}[/]\n")
+        items = [(f"{label:<22}{val(cfg, key)}", key) for key, label in LABELS]
+        items.extend([("Library folder", "library"), ("Open data folder", "open_data"),
+                      ("Edit Playlists.txt", "edit"), ("Reset to defaults", "reset"), ("‹ Back", "back")])
+        try:
+            choice = ask("", items)
+        except Exception as e:
+            menu_error(e)
+            continue
+        if choice in (None, "back"):
             return cfg
-        if k == "library":
-            p = questionary.path("Music folder:", default=cfg["out"], only_directories=True).ask()
-            if p:
-                cfg = load_cfg(ensure_lib(p))
-                return cfg
-        elif k == "open_data":
-            open_data_folder(cfg)
-        elif k == "reset":
-            cfg.update({**DEFAULTS, "urls": cfg["urls"], "files": cfg["files"]})
-        elif k == "edit":
-            open_playlists(cfg)
-        elif k == "links":
-            manage_links(cfg)
-        elif isinstance(cfg[k], bool):
-            cfg[k] = not cfg[k]
-        elif k in CHOICES:
-            v = ask(dict(LABELS)[k], [(str(STYLES.get(c, c)), c) for c in CHOICES[k]] + [("‹ Back", "back")])
-            if v and v != "back":
-                cfg[k] = v
-        else:
-            v = questionary.text(dict(LABELS)[k] + ":", default=str(cfg[k])).ask()
-            if v is not None:
-                cfg[k] = (int(v) if v.isdigit() else cfg[k]) if k == "retries" else v.strip()
-        save_cfg(cfg)
+        try:
+            save = True
+            if choice == "library":
+                cfg = library_folder_menu(cfg)
+                save = False
+            elif choice == "open_data":
+                open_data_folder()
+                save = False
+            elif choice == "edit":
+                open_playlists()
+                save = False
+            elif choice == "reset":
+                out = cfg["out"]
+                cfg.update(DEFAULTS)
+                cfg["out"] = out
+            elif isinstance(cfg[choice], bool):
+                cfg[choice] = not cfg[choice]
+            elif choice in CHOICES:
+                value = ask(dict(LABELS)[choice],
+                            [(str(STYLES.get(item, item)), item) for item in CHOICES[choice]] + [("‹ Back", "back")])
+                if value and value != "back":
+                    cfg[choice] = value
+            else:
+                value = questionary.text(dict(LABELS)[choice] + ":", default=str(cfg[choice])).ask()
+                if value is not None:
+                    cfg[choice] = (int(value) if value.isdigit() else cfg[choice]) \
+                        if choice == "retries" else value.strip()
+            if save:
+                save_cfg(cfg)
+        except Exception as e:
+            menu_error(e)
 
 
 def review(cfg, plan):
@@ -1178,9 +1968,9 @@ def review(cfg, plan):
     t.add_row("Playlist entries",
               f"{plan['entries']} → {len(plan['unique'])} unique songs "
               f"({plan['repeats']} repeats, {plan['duplicate_count']} same-song duplicates skipped)")
-    t.add_row("", Text.assemble((f"✚ {len(plan['todo'])} new", "#22c55e"),
-                                (f"   ✔ {in_library} in library", "#22c55e"),
-                                (f"   ✖ {plan['bad']} private", "#ef4444")))
+    t.add_row("", Text.assemble((f"+ {len(plan['todo'])} new", "#22c55e"),
+                                (f"   {status_glyph(True)} {in_library} in library", "#22c55e"),
+                                (f"   {status_glyph(False)} {plan['bad']} private", "#ef4444")))
     if plan["errs"]:
         t.add_row("Problems", Text(f"{len(plan['errs'])} link(s) failed to load", style="#ef4444"))
     t.add_row("Duration", dur(total_duration))
@@ -1201,34 +1991,42 @@ def review(cfg, plan):
     return ask("", [("Start", "start"), ("Edit settings", "edit"), ("‹ Back", "back"), ("✕ Exit", "exit")])
 
 
-def run_flow(cfg, with_review):
+def run_flow(cfg, with_review, extra_urls=None):
+    extra_urls = list(extra_urls or [])
     while True:
-        urls = all_urls(cfg)
+        urls = list(dict.fromkeys(all_urls(cfg) + extra_urls))
         if not urls:
-            console.print("[yellow]No links yet. Use 'Add Music'.[/]")
+            console.print(f"[yellow]No links yet. Add them to {DATA / 'playlists.txt'} with Add Music.[/]")
             pause()
             return "home"
-        plan = scan(cfg, urls)
-        a = review(cfg, plan) if with_review else "start"
-        if not with_review:
-            console.print(f"[bold]{len(plan['todo'])} new[/] · "
-                          f"{len(plan['unique']) - len(plan['todo'])} in library\n")
-        if a == "start":
-            execute(cfg, plan, interactive=True, prune_ok=True)
-            pause()
+        if not need_ffmpeg():
             return "home"
-        if a == "edit":
-            cfg = settings(cfg)
-            continue
-        return "exit" if a == "exit" else "home"
+        try:
+            plan = scan(cfg, urls)
+            choice = review(cfg, plan) if with_review else "start"
+            if not with_review:
+                console.print(f"[bold]{len(plan['todo'])} new[/] · "
+                              f"{len(plan['unique']) - len(plan['todo'])} in library\n")
+            if choice == "start":
+                stopped = execute(cfg, plan, interactive=True, prune_ok=True)
+                if not stopped:
+                    pause()
+                return "home"
+            if choice == "edit":
+                cfg = settings(cfg)
+                continue
+            return "exit" if choice == "exit" else "home"
+        except Exception as e:
+            menu_error(e)
+            return "home"
 
 
 def header(cfg, upd):
-    lib = Lib(cfg["out"])
+    lib = get_lib(cfg["out"])
     console.print(Panel(f"[bold orange1]♪  ytmusic-sync[/]  v{VERSION}\n[dim]YouTube music + Local, always in sync[/]",
                         border_style="orange1", expand=False))
     console.print(f" {cfg['out']} · {len(lib.d['songs'])} songs · {size(lib.total_size())}\n"
-                  f" Last sync: {ago(lib.d['stats']['last_run'])}")
+                  f" Last sync: {ago(lib.d['stats']['last_run'])} · Data: {short_data_dir()}")
     if upd:
         console.print(f" [yellow]⚠ yt-dlp update available ({upd[0]} → {upd[1]})[/]")
     console.print()
@@ -1236,22 +2034,21 @@ def header(cfg, upd):
 
 def pick_library():
     console.print(Panel("[bold orange1]Welcome![/]\nWhere should your music library live?\n"
-                        "[dim]Songs and .m3u8 playlists go here; app data is stored in your user profile.[/]",
+                        "[dim]Songs and .m3u8 playlists go here; app data is stored in ~/.ytmusic-sync.[/]",
                         border_style="orange1", expand=False))
     p = questionary.path("Music folder:", default=str(Path.home() / "music"), only_directories=True).ask()
     return Path(p).expanduser() if p else None
 
 
-def interactive(out):
-    if out is None:
-        out = pick_library()
-        if out is None:
-            return
-    cfg = load_cfg(ensure_lib(out))
-    upd = outdated(cfg["out"])
+def interactive(cfg):
     while True:
         console.clear()
+        upd = UPDATE_CHECKER.result if UPDATE_CHECKER and UPDATE_CHECKER.done.is_set() else None
         header(cfg, upd)
+        report_update_timing()
+        if TIMING_ENABLED and "startup timing printed" not in TIMINGS:
+            print_timings()
+            TIMINGS["startup timing printed"] = 1
         first = not all_urls(cfg)
         menu = [("Use defaults & start", "go"), ("Customize", "set"), ("Quit", "q")] if first else \
                [("Update library", "upd"), ("Add Music", "add"), ("Settings", "set"), ("Stats", "stats")]
@@ -1259,28 +2056,59 @@ def interactive(out):
             menu.append((f"Update yt-dlp ({upd[0]} → {upd[1]})", "ytdlp"))
         if not first:
             menu.append(("Quit", "q"))
-        k = ask("", menu)
+        try:
+            k = ask("", menu)
+        except Exception as e:
+            menu_error(e)
+            continue
         if k in (None, "q"):
             return
-        if k == "set":
-            cfg = settings(cfg)
-            upd = outdated(cfg["out"])
-        elif k == "stats":
-            show_stats(cfg)
-            pause()
-        elif k == "ytdlp":
-            upgrade_ytdlp()
-            pause()
-            return
-        elif k in ("go", "add"):
-            if add_links(cfg) and run_flow(cfg, True) == "exit":
+        try:
+            if k == "set":
+                cfg = settings(cfg)
+            elif k == "stats":
+                show_stats(cfg)
+                pause()
+            elif k == "ytdlp":
+                upgrade_ytdlp()
+                pause()
+            elif k == "go":
+                links = all_urls(cfg)
+                if not links:
+                    links = add_links(cfg) or []
+                if links and run_flow(cfg, True, links) == "exit":
+                    return
+            elif k == "add":
+                links = add_links(cfg)
+                if links and run_flow(cfg, True, links) == "exit":
+                    return
+            elif k == "upd" and run_flow(cfg, False) == "exit":
                 return
-        elif k == "upd" and run_flow(cfg, False) == "exit":
-            return
+        except Exception as e:
+            menu_error(e)
 
 
 # ---------- command line ----------
+class VersionAction(argparse.Action):
+    def __init__(self, option_strings, dest, nargs=0, **kwargs):
+        super().__init__(option_strings, dest, nargs=nargs, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.exit(message=f"{parser.prog} {VERSION} (yt-dlp {installed_ytdlp_version()})\n")
+
+
+def save_cli_links(cfg, urls):
+    if not urls:
+        return
+    details, errors = {}, []
+    resolve(urls, cfg, errors, details)
+    for url, reason in errors:
+        console.print(f"[yellow]Could not get a name for {url}: {reason}[/]")
+    save_named_links([(url, details.get(url, (url, 0, None))[0]) for url in urls])
+
+
 def main():
+    global TIMING_ENABLED, UPDATE_CHECKER
     ap = argparse.ArgumentParser(prog="ytsync", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Download YouTube songs/playlists with clean tags and keep .m3u8 playlists in sync.\n"
                     "Run with no arguments for interactive mode.",
@@ -1309,33 +2137,75 @@ def main():
     g.add_argument("--jobs", type=int, choices=range(1, 7), help="parallel downloads (1-6, default 3)")
     g = ap.add_argument_group("other")
     g.add_argument("--compact", action="store_true", help="one line per song instead of the dashboard")
-    g.add_argument("--where", action="store_true", help="print the profile and library folder paths, then exit")
+    g.add_argument("--demo", action="store_true", help="show a simulated 64-track progress dashboard")
+    g.add_argument("--where", action="store_true", help="print the data folder and music library folder, then exit")
+    g.add_argument("--timing", action="store_true", help="print startup step timings")
     g.add_argument("--update-ytdlp", action="store_true", help="upgrade yt-dlp and exit")
-    g.add_argument("-V", "--version", action="version", version=f"%(prog)s {VERSION} (yt-dlp {YTDLP_VERSION})")
+    g.add_argument("-V", "--version", action=VersionAction, help="show program and yt-dlp versions, then exit")
     a = ap.parse_args()
 
+    direct = bool(a.urls or a.playlists or a.update or a.stats or a.dry_run or a.where or
+                  a.update_ytdlp or a.demo)
+    if not direct and not sys.stdin.isatty():
+        return ap.print_help()
+    TIMING_ENABLED = a.timing
+    import_started = time.perf_counter()
     try:
+        ensure_ui()
+        TIMINGS["imports"] = time.perf_counter() - import_started
+        config_started = time.perf_counter()
+        ensure_data_dir()
+        migrate_legacy_profiles()
+        cfg = load_cfg()
+        TIMINGS["config"] = time.perf_counter() - config_started
+
         if a.update_ytdlp:
+            if a.timing:
+                print_timings()
             return upgrade_ytdlp()
-        out = find_lib(a.out)
-        direct = bool(a.urls or a.playlists or a.update or a.stats or a.dry_run or a.where)
-        if not direct:
-            if not sys.stdin.isatty():
-                return ap.print_help()
-            if need_ffmpeg():
-                interactive(out)
-            return
+
+        if a.where:
+            selected = a.out or cfg.get("out")
+            library = str(Path(selected).expanduser().resolve()) if selected else "(not selected)"
+            console.print(f"Data folder: {DATA}\nLibrary folder: {library}")
+            if a.timing:
+                print_timings()
+            return 0
+
+        if a.demo:
+            run_demo()
+            if a.timing:
+                print_timings()
+            return 0
+
+        out = Path(a.out).expanduser().resolve() if a.out else \
+            (Path(cfg["out"]).expanduser().resolve() if cfg["out"] else None)
+        if out is not None and not a.out and not out.is_dir():
+            console.print(f"[yellow]Last used music folder is unavailable: {out}. "
+                          "Reconnect the drive or choose a folder.[/]")
+            out = None
         if out is None:
             if sys.stdin.isatty():
                 out = pick_library()
             if out is None:
                 console.print("[yellow]No library folder selected. Run [bold]ytsync[/bold] to pick one, or pass -o FOLDER.[/]")
                 return 1
+
+        config_reload_started = time.perf_counter()
         out = ensure_lib(out)
-        if a.where:
-            console.print(f"Profile folder: {profile_dir(out)}\nLibrary folder: {out}")
-            return 0
+        setup_logging()
         cfg = load_cfg(out)
+        save_cfg(cfg)
+        TIMINGS["config"] += time.perf_counter() - config_reload_started
+        UPDATE_CHECKER = start_update_check()
+        library_started = time.perf_counter()
+        if not (a.urls or a.playlists or a.update or a.stats or a.dry_run):
+            with console.status("[cyan]Loading library..."):
+                get_lib(out)
+        else:
+            get_lib(out)
+        TIMINGS["library load"] = time.perf_counter() - library_started
+
         for k in ("format", "quality", "name_style", "cookies", "rate_limit", "retries", "jobs"):
             if getattr(a, k) is not None:
                 cfg[k] = getattr(a, k)
@@ -1346,32 +2216,61 @@ def main():
         if a.prune:
             cfg["prune"] = True
         if a.stats:
-            return show_stats(cfg)
-        upd = outdated(cfg["out"])
-        if upd:
-            console.print(f"[yellow]⚠ yt-dlp {upd[0]} → {upd[1]} available. Run: ytsync --update-ytdlp[/]")
+            show_stats(cfg)
+            if a.timing:
+                print_timings()
+            return 0
+
+        if not direct:
+            interactive(cfg)
+            report_update_timing()
+            if a.timing and "startup timing printed" not in TIMINGS:
+                print_timings()
+            return 0
+
         urls = a.urls + (read_list(a.playlists) if a.playlists else [])
         if a.save and a.urls:
-            cfg["urls"] += [u for u in a.urls if u not in cfg["urls"]]
-            save_cfg(cfg)
+            save_cli_links(cfg, list(dict.fromkeys(a.urls)))
         if a.update:
             urls += all_urls(cfg)
         urls = list(dict.fromkeys(urls))
         if not urls:
-            return console.print("[yellow]No links saved yet. Run ytsync, or: ytsync <url> --save[/]")
+            console.print(f"[yellow]No links saved yet. Add links to {DATA / 'playlists.txt'} or pass a URL.[/]")
+            if a.timing:
+                print_timings()
+            return 0
         if not a.dry_run and not need_ffmpeg():
-            return
+            return 1
         plan = scan(cfg, urls)
         if a.dry_run:
             for e in plan["todo"]:
                 console.print(f"  [green]+[/] {e['title']}")
-            return console.print(f"\n[yellow]Dry run: {len(plan['todo'])} new, nothing downloaded.[/]")
-        execute(cfg, plan, compact=a.compact, prune_ok=a.update)
+            console.print(f"\n[yellow]Dry run: {len(plan['todo'])} new, nothing downloaded.[/]")
+        else:
+            execute(cfg, plan, compact=a.compact, prune_ok=a.update)
+        report_update_timing()
+        if a.timing:
+            print_timings()
+        return 0
     except KeyboardInterrupt:
-        console.print("\n[yellow]Cancelled.[/]")
+        if console is not None:
+            console.print("\n[yellow]Cancelled.[/]")
+            report_update_timing()
+            if a.timing:
+                print_timings()
+        else:
+            print("Cancelled.", file=sys.stderr)
+        return 130
     except OSError as e:
         console.print(f"[red]Could not access the music or data folder: {e}[/]")
         console.print("[dim]Check that the music folder is connected and writable.[/]")
+        return 1
+    except Exception as e:
+        logging.exception("Startup or command failed")
+        if console is not None:
+            console.print(f"[red]Error: {short(e)}[/]")
+        else:
+            print(f"Error: {short(e)}", file=sys.stderr)
         return 1
 
 
