@@ -2743,95 +2743,6 @@ def ask(msg, choices):
         return None
 
 
-MENU_STAY = object()
-MENU_ARROW_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left",
-                   "H": "up", "P": "down", "M": "right", "K": "left"}
-
-
-@contextlib.contextmanager
-def menu_terminal_mode():
-    saved = None
-    fd = None
-    termios = None
-    try:
-        if os.name != "nt":
-            import termios as _termios
-            import tty
-            termios = _termios
-            fd = sys.stdin.fileno()
-            saved = termios.tcgetattr(fd)
-            tty.setcbreak(fd)
-        yield
-    finally:
-        try:
-            if saved is not None and termios is not None:
-                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        finally:
-            if console is not None:
-                with contextlib.suppress(Exception):
-                    console.show_cursor(True)
-
-
-def _arrow_from_sequence(value):
-    if not value:
-        return "esc"
-    return MENU_ARROW_KEYS.get(value[-1], "esc")
-
-
-def read_menu_key():
-    with menu_terminal_mode():
-        if os.name == "nt":
-            import msvcrt
-            key = msvcrt.getwch()
-            if key in ("\x00", "\xe0"):
-                return MENU_ARROW_KEYS.get(msvcrt.getwch(), "unknown")
-            if key == "\x1b":
-                sequence = ""
-                while msvcrt.kbhit() and len(sequence) < 3:
-                    sequence += msvcrt.getwch()
-                if sequence:
-                    return _arrow_from_sequence(sequence)
-                return "esc"
-        else:
-            import select
-            fd = sys.stdin.fileno()
-            key = os.read(fd, 1)
-            if key == b"\x1b":
-                sequence = b""
-                if select.select([fd], [], [], 0.04)[0]:
-                    sequence += os.read(fd, 1)
-                    if sequence in (b"[", b"O") and select.select([fd], [], [], 0.04)[0]:
-                        sequence += os.read(fd, 1)
-                if sequence.startswith((b"[", b"O")):
-                    return _arrow_from_sequence(sequence.decode("ascii", "ignore"))
-                return "esc"
-            key = key.decode("utf-8", "ignore")
-        if key in ("\r", "\n"):
-            return "enter"
-        if key in ("\x03", "\x04"):
-            return "ctrl+c"
-        if key == "\x1b":
-            return "esc"
-        if key:
-            return key.lower()
-        return "unknown"
-
-
-def key_screen_loop(render, handle_key):
-    try:
-        while True:
-            console.clear()
-            console.print(render())
-            result = handle_key(read_menu_key())
-            if result is not MENU_STAY:
-                return result
-    except KeyboardInterrupt:
-        return "ctrl+c"
-    finally:
-        with contextlib.suppress(Exception):
-            console.show_cursor(True)
-
-
 def pause():
     try:
         console.input("[dim]Press Enter to continue...[/]")
@@ -3206,256 +3117,51 @@ def library_folder_menu(cfg):
             menu_error(e)
 
 
-SETTING_SECTIONS = [
-    ("Audio", [
-        ("format", "Format", "choice", "output file type, mp3 plays everywhere"),
-        ("quality", "Quality", "choice", "audio bitrate, best uses the highest available"),
-        ("cover", "Cover art", "bool", "embed the thumbnail in each file"),
-        ("square", "Square cover", "bool", "crop the cover art to a square"),
-    ]),
-    ("Library", [
-        ("name_style", "Filename style", "choice", "how song files are named"),
-        ("clean", "Clean titles", "bool", "remove Official Video and similar tags"),
-        ("playlist_files", "Playlist .m3u8 files", "bool", "create a playlist file for each link"),
-        ("prune", "Prune removed songs", "bool", "delete local songs no longer in a playlist"),
-        ("skip_duplicate_songs", "Skip duplicate songs", "bool", "don't download a song you already have"),
-    ]),
-    ("Downloads", [
-        ("jobs", "Parallel downloads", "number", "how many songs download at once"),
-        ("rate_limit", "Speed limit", "text", "cap download speed, unlimited by default"),
-        ("retries", "Retries", "number", "attempts before a download is marked failed"),
-        ("cookies", "Browser cookies", "text", "use your browser login for restricted videos"),
-    ]),
-    ("Folders", [
-        ("library", "Library folder", "library", "where your music is saved"),
-        ("data", "Data folder", "data", "where settings and caches are stored"),
-        ("edit", "Edit Playlists.txt", "action", "open your playlist links to edit"),
-    ]),
-]
-
-
-def setting_value(cfg, key):
-    if key == "library":
-        return cfg.get("out") or "none", "path"
-    if key == "data":
-        return str(DATA), "path"
-    if key == "edit":
-        return "", "action"
-    value = cfg[key]
-    if isinstance(value, bool):
-        return ("on" if value else "off"), ("on" if value else "off")
-    if key == "name_style":
-        return STYLES[value], "choice"
-    if key == "rate_limit":
-        return (str(value) if value else "unlimited"), ("text" if value else "empty")
-    if key == "cookies":
-        return (str(value) if value else "none"), ("text" if value else "empty")
-    if key in ("format", "quality"):
-        return str(value), "choice"
-    if isinstance(value, (int, float)):
-        return str(value), "number"
-    return str(value), "text"
-
-
-def render_settings(cfg, category_index, category_cursor, selected_row, focus_right, narrow):
-    from rich import box
-    from rich.console import Group
-
-    category_name, setting_rows = SETTING_SECTIONS[category_index]
-    row_table = Table.grid(expand=True, padding=(0, 1))
-    row_table.add_column(width=2, no_wrap=True)
-    row_table.add_column(width=20, no_wrap=True, overflow="ellipsis")
-    row_table.add_column(ratio=1, no_wrap=True, justify="right", overflow="ellipsis")
-    for index, (key, label, kind, _) in enumerate(setting_rows):
-        selected = index == selected_row and focus_right
-        marker = Text("» " if selected else "  ", style="bold #ff9f1a" if selected else None)
-        name = Text(label, style="bold #ff9f1a" if selected else "#e6e6e6")
-        value, value_type = setting_value(cfg, key)
-        if selected and kind != "action":
-            value = f"‹ {value} ›" if terminal_columns() >= 60 else value
-            value_style = "bold #ff9f1a"
-        else:
-            value_style = {"on": "#3fb950", "off": "#8b8b8b", "number": "#4dd0e1",
-                           "choice": "#4dd0e1", "text": "#4dd0e1", "empty": "#8b8b8b",
-                           "path": "#8b8b8b", "action": "#8b8b8b"}[value_type]
-        row_table.add_row(marker, name, Text(value, style=value_style, no_wrap=True, overflow="ellipsis"))
-
-    note = setting_rows[selected_row]
-    description = Text.assemble((note[1], "#e6e6e6"), (" · ", "#8b8b8b"),
-                                (note[3], "#8b8b8b"), no_wrap=True, overflow="ellipsis")
-    right_panel = Panel(
-        Group(Text(category_name, style="#8b8b8b"), row_table,
-              Text("─" * max(1, terminal_columns() - (8 if not narrow else 4)),
-                   style="#333333", no_wrap=True, overflow="crop"),
-              description),
-        border_style="#5a5a5a", box=box.ROUNDED, padding=(0, 1), expand=True)
-
-    if narrow:
-        tab_name = category_name if category_cursor < 4 else ("Reset" if category_cursor == 4 else "‹ Back")
-        category_tab = Text(f"‹ {tab_name} ›", style="bold #ff9f1a", no_wrap=True)
-        panes = Group(category_tab, right_panel)
-    else:
-        left_rows = Table.grid(expand=True, padding=(0, 1))
-        left_rows.add_column(width=2, no_wrap=True)
-        left_rows.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-        for index, (name, _) in enumerate(SETTING_SECTIONS):
-            focused = index == category_cursor
-            left_rows.add_row(Text("» " if focused else "  ",
-                                   style="bold #ff9f1a" if focused else None),
-                              Text(name, style="bold #ff9f1a" if focused else "#e6e6e6"))
-        left_rows.add_row("", Text(""))
-        for index, label in ((4, "Reset"), (5, "‹ Back")):
-            focused = index == category_cursor
-            left_rows.add_row(Text("» " if focused else "  ",
-                                   style="bold #ff9f1a" if focused else None),
-                              Text(label, style="#8b8b8b"))
-        left_panel = Panel(left_rows, width=20, border_style="#333333",
-                           box=box.ROUNDED, padding=(0, 1), expand=False)
-        pane_table = Table.grid(expand=True, padding=(0, 0))
-        pane_table.add_column(width=20, no_wrap=True)
-        pane_table.add_column(width=2, no_wrap=True)
-        pane_table.add_column(ratio=1)
-        pane_table.add_row(left_panel, Text(""), right_panel)
-        panes = pane_table
-
-    guide = Text("↑↓ move  ·  ←→ change value  ·  enter edit  ·  esc back",
-                 style="#5a5a5a", no_wrap=True, overflow="ellipsis")
-    return Group(Text("Settings", style="bold #ff9f1a"), Text(""), panes, guide)
-
-
 def settings(cfg):
-    category_index, category_cursor, selected_row = 0, 0, 0
-    focus_right = False
-    narrow = terminal_columns() < 80
-
-    def save_current_setting(key):
-        save_cfg(cfg)
-        return key
-
-    def handle_category_action(index):
-        nonlocal cfg
-        if index == 4:
-            try:
-                if questionary.confirm("Reset settings to defaults?", default=False).ask():
-                    out = cfg["out"]
-                    cfg.update(DEFAULTS)
-                    cfg["out"] = out
-                    save_cfg(cfg)
-            except KeyboardInterrupt:
-                return "ctrl+c"
-            return MENU_STAY
-        if index == 5:
-            return cfg
-        return None
-
-    def cycle_setting(setting, direction):
-        key, _, kind, _ = setting
-        if kind == "bool":
-            cfg[key] = not cfg[key]
-        elif kind == "choice":
-            choices = CHOICES[key]
-            current = choices.index(cfg[key]) if cfg[key] in choices else 0
-            cfg[key] = choices[(current + direction) % len(choices)]
-        elif key == "jobs":
-            cfg[key] = min(6, max(1, int(cfg[key]) + direction))
-        elif key == "retries":
-            cfg[key] = min(10, max(1, int(cfg[key]) + direction))
-        else:
-            return False
-        save_current_setting(key)
-        return True
-
-    def activate_setting(setting):
-        nonlocal cfg
-        key, label, kind, _ = setting
-        if kind == "bool":
-            cfg[key] = not cfg[key]
-            save_current_setting(key)
-        elif kind == "text":
-            try:
-                value = questionary.text(label + ":", default=str(cfg[key] or "")).ask()
-            except KeyboardInterrupt:
-                return "ctrl+c"
-            if value is not None:
-                cfg[key] = value.strip()
-                save_current_setting(key)
-        elif kind == "library":
-            try:
-                value = questionary.text("Music folder:", default=cfg["out"]).ask()
-            except KeyboardInterrupt:
-                return "ctrl+c"
-            if value and value.strip():
-                new_path = Path(value.strip()).expanduser().resolve()
-                if new_path != Path(cfg["out"]).expanduser().resolve():
-                    with console.status("[cyan]Loading library..."):
-                        new_path = ensure_lib(new_path)
-                        cfg = load_cfg(new_path)
-                        get_lib(new_path)
-                        save_cfg(cfg)
-        elif kind == "data":
-            data_folder_menu()
-        elif kind == "action":
-            open_playlists()
-        return MENU_STAY
-
-    def render():
-        return render_settings(cfg, category_index, category_cursor, selected_row, focus_right, narrow)
-
-    def handle(key):
-        nonlocal category_index, category_cursor, selected_row, focus_right, cfg
-        if key in ("ctrl+c", "q"):
-            return cfg
-        if key == "esc":
-            if focus_right:
-                focus_right = False
-                return MENU_STAY
-            return cfg
-
-        if narrow:
-            if not focus_right:
-                if key in ("left", "right"):
-                    category_cursor = (category_cursor + (-1 if key == "left" else 1)) % 4
-                    category_index, selected_row = category_cursor, 0
-                elif key in ("up", "down"):
-                    category_cursor = min(5, max(0, category_cursor + (1 if key == "down" else -1)))
-                    if category_cursor < 4:
-                        category_index, selected_row = category_cursor, 0
-                elif key == "enter":
-                    action = handle_category_action(category_cursor)
-                    if action is not None:
-                        return action
-                    focus_right = True
-                return MENU_STAY
-        elif not focus_right:
-            if key in ("up", "down"):
-                category_cursor = min(5, max(0, category_cursor + (1 if key == "down" else -1)))
-                if category_cursor < 4:
-                    category_index, selected_row = category_cursor, 0
-            elif key in ("right", "enter"):
-                action = handle_category_action(category_cursor)
-                if action is not None:
-                    return action
-                focus_right = True
-            return MENU_STAY
-
-        setting_rows = SETTING_SECTIONS[category_index][1]
-        if key in ("up", "down"):
-            selected_row = (selected_row + (1 if key == "down" else -1)) % len(setting_rows)
-        elif key == "left":
-            if not cycle_setting(setting_rows[selected_row], -1):
-                focus_right = False
-        elif key == "right":
-            cycle_setting(setting_rows[selected_row], 1)
-        elif key == "enter":
-            action = activate_setting(setting_rows[selected_row])
-            if action == "ctrl+c":
-                return cfg
-        return MENU_STAY
-
     while True:
-        result = key_screen_loop(render, handle)
-        if result is cfg or result == "ctrl+c":
+        console.clear()
+        console.print(f"[bold orange1]Settings[/]\n[dim]Data: {short_data_dir()}[/]\n")
+        items = [(f"{label:<22}{val(cfg, key)}", key) for key, label in LABELS]
+        items.extend([("Library folder", "library"), ("Data folder", "data"),
+                      ("Edit Playlists.txt", "edit"), ("Reset to defaults", "reset"), ("‹ Back", "back")])
+        try:
+            choice = ask("", items)
+        except Exception as e:
+            menu_error(e)
+            continue
+        if choice in (None, "back"):
             return cfg
+        try:
+            save = True
+            if choice == "library":
+                cfg = library_folder_menu(cfg)
+                save = False
+            elif choice == "data":
+                data_folder_menu()
+                save = False
+            elif choice == "edit":
+                open_playlists()
+                save = False
+            elif choice == "reset":
+                out = cfg["out"]
+                cfg.update(DEFAULTS)
+                cfg["out"] = out
+            elif isinstance(cfg[choice], bool):
+                cfg[choice] = not cfg[choice]
+            elif choice in CHOICES:
+                value = ask(dict(LABELS)[choice],
+                            [(str(STYLES.get(item, item)), item) for item in CHOICES[choice]] + [("‹ Back", "back")])
+                if value and value != "back":
+                    cfg[choice] = value
+            else:
+                value = questionary.text(dict(LABELS)[choice] + ":", default=str(cfg[choice])).ask()
+                if value is not None:
+                    cfg[choice] = (int(value) if value.isdigit() else cfg[choice]) \
+                        if choice == "retries" else value.strip()
+            if save:
+                save_cfg(cfg)
+        except Exception as e:
+            menu_error(e)
 
 
 def review(cfg, plan):
@@ -3539,65 +3245,6 @@ def header(cfg, upd):
     console.print()
 
 
-def render_main_menu(cfg, selected):
-    from rich import box
-    from rich.console import Group
-
-    lib = get_lib(cfg["out"])
-    cards = [
-        ("Songs", str(len(lib.d["songs"])), "#4dd0e1"),
-        ("Size", size(lib.total_size()), "#4dd0e1"),
-        ("Playlists", str(len(all_urls(cfg))), "#4dd0e1"),
-        ("Last sync", ago(lib.d["stats"]["last_run"]), "#e6e6e6"),
-    ]
-    header_text = Group(
-        Text.assemble(("♪  ytmusic-sync", "bold #f5a623"),
-                      (f"  v{VERSION}", "#e6e6e6")),
-        Text("YouTube music + Local, always in sync", style="#8b8b8b"))
-    header_panel = Panel(header_text, border_style="#f5a623", box=box.ROUNDED,
-                         padding=(0, 1), expand=False)
-
-    card_grid = Table.grid(expand=True, padding=(0, 1))
-    if terminal_columns() < 70:
-        card_grid.add_column(ratio=1)
-        card_grid.add_column(ratio=1)
-        rendered_cards = [
-            Panel(Group(Text(label, style="#8b8b8b"),
-                        Text(value, style=f"bold {color}", no_wrap=True, overflow="ellipsis")),
-                  border_style="#333333", box=box.ROUNDED, padding=(0, 1), expand=True)
-            for label, value, color in cards
-        ]
-        card_grid.add_row(rendered_cards[0], rendered_cards[1])
-        card_grid.add_row(rendered_cards[2], rendered_cards[3])
-    else:
-        for _ in cards:
-            card_grid.add_column(ratio=1)
-        rendered_cards = [
-            Panel(Group(Text(label, style="#8b8b8b"),
-                        Text(value, style=f"bold {color}", no_wrap=True, overflow="ellipsis")),
-                  border_style="#333333", box=box.ROUNDED, padding=(0, 1), expand=True)
-            for label, value, color in cards
-        ]
-        card_grid.add_row(*rendered_cards)
-
-    path_line = Text(f"{cfg['out']} · Data: {short_data_dir()}",
-                     style="#8b8b8b", no_wrap=True, overflow="ellipsis")
-    menu = Table.grid(expand=True, padding=(0, 0))
-    menu.add_column(width=2, no_wrap=True)
-    menu.add_column(width=3, no_wrap=True)
-    menu.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-    labels = ("Update library", "Add Music", "Settings", "Stats", "Quit")
-    for index, label in enumerate(labels):
-        active = index == selected
-        menu.add_row(Text("» " if active else "  ",
-                          style="bold #ff9f1a" if active else None),
-                     Text(str(index + 1) if index < 4 else "q", style="#8b8b8b"),
-                     Text(label, style="bold #ff9f1a" if active else "#e6e6e6"))
-    guide = Text("↑↓ move  ·  enter select  ·  q quit",
-                 style="#5a5a5a", no_wrap=True, overflow="ellipsis")
-    return Group(header_panel, card_grid, path_line, Text(""), menu, guide)
-
-
 def pick_library():
     console.print(Panel("[bold orange1]Welcome![/]\nWhere should your music library live?\n"
                         "[dim]Songs and .m3u8 playlists go here; app data is stored in ~/.ytmusic-sync.[/]",
@@ -3607,50 +3254,51 @@ def pick_library():
 
 
 def interactive(cfg):
-    selected = 0
-    if TIMING_ENABLED and "startup timing printed" not in TIMINGS:
-        print_timings()
-        TIMINGS["startup timing printed"] = 1
-
-    def handle(key):
-        nonlocal cfg, selected
-        if key in ("q", "ctrl+c"):
-            return "quit"
-        if key in ("up", "down"):
-            selected = (selected + (1 if key == "down" else -1)) % 5
-            return MENU_STAY
-        if key in ("1", "2", "3", "4"):
-            selected = int(key) - 1
-        elif key == "enter":
-            pass
-        else:
-            return MENU_STAY
-
+    while True:
+        console.clear()
+        upd = UPDATE_CHECKER.result if UPDATE_CHECKER and UPDATE_CHECKER.done.is_set() else None
+        header(cfg, upd)
+        report_update_timing()
+        if TIMING_ENABLED and "startup timing printed" not in TIMINGS:
+            print_timings()
+            TIMINGS["startup timing printed"] = 1
+        first = not all_urls(cfg)
+        menu = [("Use defaults & start", "go"), ("Customize", "set"), ("Quit", "q")] if first else \
+               [("Update library", "upd"), ("Add Music", "add"), ("Settings", "set"), ("Stats", "stats")]
+        if upd:
+            menu.append((f"Update yt-dlp ({upd[0]} → {upd[1]})", "ytdlp"))
+        if not first:
+            menu.append(("Quit", "q"))
         try:
-            if selected == 0:
-                if run_flow(cfg, False) == "exit":
-                    return "quit"
-            elif selected == 1:
-                links = add_links(cfg)
-                if links and run_flow(cfg, True, links) == "exit":
-                    return "quit"
-            elif selected == 2:
-                cfg = settings(cfg)
-            elif selected == 3:
-                show_stats(cfg)
-                pause()
-            else:
-                return "quit"
+            k = ask("", menu)
         except Exception as e:
             menu_error(e)
-            pause()
-        return MENU_STAY
-
-    while True:
-        report_update_timing()
-        result = key_screen_loop(lambda: render_main_menu(cfg, selected), handle)
-        if result in ("quit", "ctrl+c"):
+            continue
+        if k in (None, "q"):
             return
+        try:
+            if k == "set":
+                cfg = settings(cfg)
+            elif k == "stats":
+                show_stats(cfg)
+                pause()
+            elif k == "ytdlp":
+                upgrade_ytdlp()
+                pause()
+            elif k == "go":
+                links = all_urls(cfg)
+                if not links:
+                    links = add_links(cfg) or []
+                if links and run_flow(cfg, True, links) == "exit":
+                    return
+            elif k == "add":
+                links = add_links(cfg)
+                if links and run_flow(cfg, True, links) == "exit":
+                    return
+            elif k == "upd" and run_flow(cfg, False) == "exit":
+                return
+        except Exception as e:
+            menu_error(e)
 
 
 # ---------- command line ----------
