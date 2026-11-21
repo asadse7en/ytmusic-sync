@@ -20,6 +20,7 @@ LIB_CACHE, LIB_CACHE_LOCK = {}, threading.RLock()
 TIMING_ENABLED = False
 TIMINGS = {}
 UPDATE_CHECKER = None
+LAST_SYNC_RESULT = None
 _YT_DLP = None
 _POSTPROCESSOR_TYPES = None
 _ANSI_ENABLED = False
@@ -992,7 +993,6 @@ def _scan_visible_rows(rows, capacity):
 
 
 def render_scan(state):
-    from rich import box
     from rich.console import Group
     from rich.spinner import Spinner
 
@@ -1027,7 +1027,7 @@ def render_scan(state):
                     ("#3fb950", "#f85149", "#ff9f1a", "#333333"))
 
     narrow = width < 100
-    row_capacity = max(1, height - (17 if narrow else 10))
+    row_capacity = max(1, (height - 7) // (2 if narrow else 1))
     visible, hidden_queued = _scan_visible_rows(rows, row_capacity)
     show_song_columns = width >= 70
     table = Table.grid(expand=True, padding=(0, 1))
@@ -1042,8 +1042,10 @@ def render_scan(state):
         icon = {"done": ("✓", "#3fb950"), "scanning": ("●", "#ff9f1a"),
                 "queued": ("○", "#8b8b8b"), "failed": ("✗", "#f85149")}[status]
         icon_text = Text(icon[0], style=icon[1])
-        name_text = Text(row.get("name") or "playlist",
-                         style="#8b8b8b" if not row.get("title_known") or status == "queued" else None)
+        name = row.get("name") or row.get("playlist_id") or row.get("url", "")
+        name_text = Text(name, style="#8b8b8b" if not row.get("title_known")
+                         or status == "queued" else "#e6e6e6",
+                         no_wrap=True, overflow="ellipsis")
         count_text = Text()
         status_text = Text()
         if status == "done":
@@ -1056,9 +1058,12 @@ def render_scan(state):
             status_text.append("queued", style="#8b8b8b")
         else:
             status_text.append(row.get("error", "unavailable"), style="#f85149")
-        cells = [icon_text, name_text, count_text]
+        status_text.no_wrap = True
+        status_text.overflow = "ellipsis"
+        count_text.no_wrap = True
+        cells = [icon_text, name_text]
         if show_song_columns:
-            cells.append(status_text)
+            cells.extend((count_text, status_text))
         table.add_row(*cells)
     if hidden_queued:
         table.add_row("", Text(f"+ {hidden_queued} more queued", style="#8b8b8b"),
@@ -1092,7 +1097,7 @@ def render_scan(state):
     while len(table.rows) < area_height:
         table.add_row(*([Text("")] * len(table.columns)))
 
-    sidebar_width = inner_width if narrow else min(28, max(inner_width - 2, 1))
+    sidebar_width = inner_width if narrow else 28
     sidebar = Table.grid(expand=True, padding=(0, 0))
     sidebar.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
     sidebar.add_row(Text("New songs", style="#8b8b8b"))
@@ -1115,9 +1120,9 @@ def render_scan(state):
     failed_line.append(" failed", style="#f85149" if failed else "#8b8b8b")
     sidebar.add_row(failed_line)
     sidebar.add_row(Text("─" * sidebar_width, style="#333333", no_wrap=True, overflow="crop"))
-    sidebar.add_row(Text("Found", style="#8b8b8b"))
+    sidebar.add_row(Text("Latest new", style="#8b8b8b"))
     for _, item, _ in shown_latest:
-        title = Text(item.get("title") or item["id"])
+        title = Text(item.get("title") or item["id"], no_wrap=True, overflow="ellipsis")
         title.truncate(max(sidebar_width - 1, 1), overflow="ellipsis")
         sidebar.add_row(title)
     if more_latest:
@@ -1130,13 +1135,12 @@ def render_scan(state):
     else:
         columns = Table.grid(expand=True, padding=(0, 0))
         columns.add_column(ratio=1)
-        columns.add_column(width=1, no_wrap=True)
-        columns.add_column(width=sidebar_width, no_wrap=True)
-        columns.add_row(table, Text("│", style="#333333"), sidebar)
+        columns.add_column(width=22, no_wrap=True)
+        columns.add_column(width=28, no_wrap=True)
+        columns.add_row(table, Text("│" + " " * 21, style="#333333", no_wrap=True), sidebar)
         content = Group(header, bar, columns)
-    panel = Panel(content, expand=True, padding=(1, 2),
-                  border_style="#5a5a5a", box=box.ROUNDED)
-    return Group(panel, Text("q cancel scan", style="#8b8b8b"))
+    return Group(panel_with_title("Update library", border_color="#5a5a5a", body=content),
+                 footer_hint("q cancel scan"))
 
 
 class ScanKeyListener:
@@ -1493,7 +1497,6 @@ class WorkerStatus:
 
 
 def build_overall_panel(state, width):
-    from rich import box
     from rich.cells import cell_len
 
     with state.lock:
@@ -1509,32 +1512,15 @@ def build_overall_panel(state, width):
     left = max(total - done - failed - active, 0)
     finished = done + failed
     percent = min(finished / total, 1) if total else 0
-    panel_width = max(width - int(getattr(console, "legacy_windows", False)), 1)
-    inner_width = max(panel_width - 4, 0)
-    percent_text = Text(f"{percent:.1%}", style="bold #ff9f1a")
+    inner_width = max(width - 4, 1)
+    percent_text = Text(f"{percent * 100:.1f}%", style="bold #ff9f1a")
     count_text = Text(f"{finished} / {total}", style="#8b8b8b")
     bar_width = max(inner_width - cell_len(percent_text.plain) - cell_len(count_text.plain) - 2, 0)
 
     counts = [done, failed, active, left]
-    denominator = sum(counts)
-    if denominator:
-        widths, remainders = [], []
-        for count in counts:
-            quotient, remainder = divmod(max(count, 0) * bar_width, denominator)
-            widths.append(quotient)
-            remainders.append(remainder)
-        for index in sorted(range(len(widths)), key=lambda i: remainders[i], reverse=True)[
-                :bar_width - sum(widths)]:
-            widths[index] += 1
-    else:
+    widths = _proportional_widths(counts, bar_width)
+    if not any(counts):
         widths = [0, 0, 0, bar_width]
-    for index, count in enumerate(counts):
-        if count > 0 and widths[index] == 0:
-            donor = max((i for i, segment_width in enumerate(widths) if segment_width > 1),
-                        key=lambda i: widths[i], default=None)
-            if donor is not None:
-                widths[donor] -= 1
-                widths[index] = 1
 
     bar = Text()
     for segment_width, color in zip(widths, ("#3fb950", "#f85149", "#ff9f1a", "#333333")):
@@ -1545,6 +1531,8 @@ def build_overall_panel(state, width):
     row.append(bar)
     row.append(" ")
     row.append(count_text)
+    row.no_wrap = True
+    row.overflow = "crop"
 
     bytes_so_far = completed_bytes + sum(max(worker.get("dl", 0), 0) for worker in active_workers)
     speed = sum(max(worker.get("speed", 0), 0) for worker in active_workers)
@@ -1612,9 +1600,12 @@ def build_overall_panel(state, width):
         stats = make_stats(spacing)
     if cell_len(stats.plain) > inner_width:
         stats.truncate(inner_width, overflow="crop")
+    stats.no_wrap = True
+    stats.overflow = "crop"
 
-    return Panel(Group(Text(""), row, stats), expand=True, padding=(0, 1),
-                 border_style="#5a5a5a", box=box.ROUNDED)
+    return panel_with_title(
+        "Downloading", "Update library", "#5a5a5a",
+        Group(row, stats), padding=(1, 1), subtitle_color="#6b6b6b")
 
 
 def short_failure_reason(reason):
@@ -1638,8 +1629,6 @@ def short_failure_reason(reason):
 
 
 def build_failures_view(state, width, height):
-    from rich import box
-
     with state.lock:
         failures = list(state.failures)
     display_rows = []
@@ -1654,10 +1643,11 @@ def build_failures_view(state, width, height):
         display_rows.append((str(title), str(artist), short_failure_reason(reason), str(video_id)))
 
     def make_view(visible_count):
-        table = Table(title=f"Failures ({len(failures)})", expand=True,
-                      border_style="#5a5a5a", box=box.SQUARE)
-        table.add_column("Title", style="bold #ffffff", ratio=4, no_wrap=False)
-        table.add_column("Artist", style="#8b8b8b", ratio=2)
+        table = Table(expand=True, border_style="#5a5a5a")
+        table.add_column("Title", style="bold #ffffff", ratio=4,
+                         no_wrap=True, overflow="ellipsis")
+        table.add_column("Artist", style="#8b8b8b", ratio=2,
+                         no_wrap=True, overflow="ellipsis")
         table.add_column("Reason", style="#f85149", ratio=3, no_wrap=True, overflow="ellipsis")
         if width >= 90:
             table.add_column("ID", style="#8b8b8b", width=11, no_wrap=True, overflow="ellipsis")
@@ -1670,10 +1660,12 @@ def build_failures_view(state, width, height):
         parts = [table]
         if omitted:
             parts.append(Text(f"+{omitted} more", style="#8b8b8b"))
-        parts.append(Text("Press any key to return", style="#8b8b8b"))
-        return Group(*parts)
+        return Group(
+            panel_with_title("Failures", f"{len(failures)} total", "#5a5a5a",
+                             Group(*parts)),
+            footer_hint("press any key to return"))
 
-    visible_count = max(1, min(len(display_rows), max(height - 8, 1)))
+    visible_count = max(1, min(len(display_rows), max(height - 10, 1)))
     while True:
         view = make_view(visible_count)
         lines = console.render_lines(view, options=console.options.update(height=None), pad=False)
@@ -1765,7 +1757,6 @@ class St:
 
     def render(self):
         width = max(console.size.width, 1)
-        narrow = width < 100
         with self.lock:
             failed = self.fail
             workers = []
@@ -1781,28 +1772,48 @@ class St:
                 workers.append((worker_id, state))
 
         blocks = [build_overall_panel(self, width)]
+        from rich.cells import cell_len
 
         orange, green, red, grey = "#ff9f1a", "#3fb950", "#f85149", "#8b8b8b"
         stage_names = ("Fetch", "Download", "Convert", "Tag")
         for worker_id, state in workers:
+            if not state["active"]:
+                continue
+            inner_width = max(width - 4, 1)
             title_line = Text()
             title_line.append(f"W{worker_id + 1}  ", style=orange)
-            title_line.append(state["title"] or "Waiting for data…", style="bold #ffffff")
-            if not narrow and state["artist"]:
+            title_line.append(state["title"] or "Waiting for data…", style="bold #e6e6e6")
+            if state["artist"]:
                 title_line.append(f" · {state['artist']}", style=grey)
             if state["dl"] > 0:
-                right_text = f"{size(state['dl'])} / {size(state['total'])} · {size(state['speed'])}/s"
+                if max(state["dl"], state["total"]) >= 1024 * 1024:
+                    amount = (f"{state['dl'] / (1024 * 1024):.1f} / "
+                              f"{state['total'] / (1024 * 1024):.1f} MB")
+                elif max(state["dl"], state["total"]) >= 1024:
+                    amount = f"{state['dl'] / 1024:.0f} / {state['total'] / 1024:.0f} KB"
+                else:
+                    amount = f"{state['dl']:.0f} / {state['total']:.0f} B"
+                if state["speed"] >= 1024 * 1024:
+                    speed = f"{state['speed'] / (1024 * 1024):.1f} MB/s"
+                elif state["speed"] >= 1024:
+                    speed = f"{state['speed'] / 1024:.0f} KB/s"
+                else:
+                    speed = f"{state['speed']:.0f} B/s"
+                right_text = f"{amount} · {speed}"
             else:
                 right_text = "waiting for data…"
-            title_line.truncate(max(width - len(right_text) - 8, 1), overflow="ellipsis")
+            title_line.truncate(max(inner_width - cell_len(right_text) - 2, 1),
+                                overflow="ellipsis")
+            title_line.no_wrap = True
+            title_line.overflow = "crop"
             line1 = Table.grid(expand=True, padding=0)
-            line1.add_column(ratio=1)
+            line1.add_column(ratio=1, no_wrap=True)
             line1.add_column(no_wrap=True, justify="right")
             line1.add_row(title_line, Text(right_text, style=grey))
 
             stage = min(max(state["stage"], 0), len(stage_names) - 1)
             progress = min(state["dl"] / state["total"], 1) if state["total"] else 0
-            percent_style = green if progress >= 1 else orange if progress > 0 else grey
+            percent_style = green if progress >= 1 else orange if progress > 0 else "#5a5a5a"
             percent_text = Text(f"{progress:.0%}", style=percent_style)
             chips = Text()
             for index, name in enumerate(stage_names):
@@ -1813,22 +1824,24 @@ class St:
                 elif index == stage:
                     chips.append(f"● {name}", style=orange)
                 else:
-                    chips.append(f"○ {name}", style=grey)
-            inner_width = max(width - 4, 1)
-            bar_cells = max(inner_width - 6 - len(chips.plain), 1)
+                    chips.append(f"○ {name}", style="#5a5a5a")
+            chips.no_wrap = True
+            bar_cells = max(inner_width - cell_len(percent_text.plain) - cell_len(chips.plain) - 2, 0)
             filled = min(int(bar_cells * progress), bar_cells)
             progress_bar = Text("━" * filled, style=green if progress >= 1 else orange)
-            progress_bar.append("━" * (bar_cells - filled), style="#3a3a3a")
+            progress_bar.append("━" * (bar_cells - filled), style="#333333")
+            progress_bar.no_wrap = True
             line2 = Table.grid(expand=True, padding=0)
-            line2.add_column(width=5, no_wrap=True)
+            line2.add_column(width=cell_len(percent_text.plain) + 1, no_wrap=True)
             line2.add_column(ratio=1, no_wrap=True)
             line2.add_column(no_wrap=True, justify="right")
             line2.add_row(percent_text, progress_bar, chips)
-            blocks.append(Panel(Group(line1, line2), expand=True, padding=(0, 1),
-                                border_style="#6b4a12"))
+            blocks.append(panel_with_title(None, border_color="#6b4a12",
+                                           body=Group(line1, line2), padding=(0, 1)))
 
-        blocks.append(Text(f"Failed: {failed} · press f to view failures", style=grey))
-        blocks.append(Text("Q = stop safely · Ctrl+C = force quit", style=grey))
+        footer = f"f failures ({failed})" if failed else "f failures"
+        footer += " · q stop safely · Ctrl+C force quit"
+        blocks.append(footer_hint(footer))
         return Group(*blocks)
 
 
@@ -1922,7 +1935,6 @@ class DashboardKeys:
         return True
 
     def render_quit(self):
-        from rich import box
         from rich.spinner import Spinner
 
         with self.quit_status_lock:
@@ -1938,14 +1950,26 @@ class DashboardKeys:
             elif value == "failed":
                 lines.append(Text(f"✗ {label}", style="#f85149"))
             else:
-                lines.append(Text(f"○ {label}", style="#8b8b8b"))
-        body = Group(
-            Text("Stopping safely", style="bold #ff9f1a"),
-            *lines,
-            Text(f"Elapsed {self.quit_elapsed:.1f}s", style="#8b8b8b"),
-            Text("Your finished songs are saved. Ctrl+C to exit now.", style="#8b8b8b"),
-        )
-        return Panel(body, border_style="#5a5a5a", box=box.ROUNDED, padding=(1, 2))
+                lines.append(Text(f"○ {label}", style="#5a5a5a"))
+        with self.quit_status_lock:
+            finished = sum(value in ("done", "failed") for value in self.quit_status.values())
+        total = len(self.quit_steps)
+        bar_width = max(console.size.width - 6, 1)
+        widths = _proportional_widths((finished, total - finished), bar_width)
+        bar = Text("━" * widths[0], style="#ff9f1a")
+        bar.append("━" * widths[1], style="#333333")
+        bar.no_wrap = True
+        elapsed = Table.grid(expand=True, padding=0)
+        elapsed.add_column(ratio=1, no_wrap=True)
+        elapsed.add_column(no_wrap=True, justify="right")
+        elapsed.add_row(Text("Your finished songs are saved.", style="#8b8b8b"),
+                        Text.assemble(("Elapsed ", "#8b8b8b"),
+                                     (f"{self.quit_elapsed:.1f}s", "#e6e6e6"),
+                                     no_wrap=True))
+        body = Group(*lines, bar, elapsed)
+        return Group(panel_with_title("Stopping safely", body=body,
+                                      border_color="#5a5a5a"),
+                     footer_hint("Ctrl+C exit now"))
 
     def restore_terminal_mode(self):
         if self.old_terminal is not None and os.name != "nt":
@@ -2373,6 +2397,7 @@ def cleanup_partial_files(out, lib):
 
 
 def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
+    global LAST_SYNC_RESULT
     out, lib, todo = plan["out"], plan["lib"], plan["todo"]
     jobs = max(1, min(6, int(cfg.get("jobs", 3))))
     worker_count = min(jobs, max(1, len(todo)))
@@ -2611,6 +2636,9 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         with st.lock:
             downloads, failures = st.done, st.fail
             left = max(st.total - st.done - st.worker_fail, 0)
+        LAST_SYNC_RESULT = {"out": str(Path(out).expanduser().resolve()),
+                            "new": downloads, "failed": failures,
+                            "elapsed": time.time() - st.t0}
         stop_warning = (f" · {key_listener.quit_error} step failed or timed out"
                         if key_listener.quit_error else "")
         console.show_cursor(True)
@@ -2654,6 +2682,8 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         downloads, downloaded_bytes, failures = st.done, st.bytes, st.fail
         interrupted = max(st.total - st.done - st.worker_fail, 0) if stopped else 0
         st.interrupted = interrupted
+    LAST_SYNC_RESULT = {"out": str(Path(out).expanduser().resolve()),
+                        "new": downloads, "failed": failures, "elapsed": el}
     with lib.lock:
         s = lib.d["stats"]
         s["runs"] += 1
@@ -2716,22 +2746,133 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
     return stopped
 
 
-def show_stats(cfg):
+def show_stats(cfg, wait_for_key=False):
+    from rich import box
+    from rich.cells import cell_len
+
     lib = get_lib(cfg["out"])
-    s = lib.d["stats"]
-    t = Table(title="Library stats", show_header=False, border_style="cyan")
-    t.add_row("Folder", cfg["out"])
-    t.add_row("Data folder", short_data_dir())
-    t.add_row("Songs", str(len(lib.d["songs"])))
-    t.add_row("Size", size(lib.total_size()))
-    t.add_row("All-time downloads", str(s["downloads"]))
-    t.add_row("Runs", str(s["runs"]))
-    t.add_row("Last sync", ago(s["last_run"]))
-    aliases = lib.d["aliases"]
-    for n, ids in lib.d["playlists"].items():
+    with lib.lock:
+        songs = dict(lib.d["songs"])
+        playlists = dict(lib.d["playlists"])
+        stats = dict(lib.d["stats"])
+        aliases = dict(lib.d["aliases"])
+
+    playlist_counts = []
+    for name, ids in playlists.items():
         kept = {canonical_id(i, aliases) for i in ids}
-        t.add_row(f"  {n}", f"{sum(1 for i in kept if i in lib.d['songs'])} songs")
-    console.print(t)
+        playlist_counts.append((name, sum(1 for i in kept if i in songs)))
+    playlist_counts.sort(key=lambda item: (-item[1], item[0].casefold()))
+    unique_count = len(songs)
+    entry_count = sum(count for _, count in playlist_counts)
+    show_note = entry_count > unique_count
+    width = max(console.size.width, 1)
+    inner_width = max(width - 6, 1)
+
+    tile_values = [
+        ("Songs", str(unique_count)),
+        ("Size", size(lib.total_size())),
+        ("Downloads", str(stats["downloads"])),
+        ("Runs", str(stats["runs"])),
+    ]
+    tile_columns = 4 if width >= 80 else 2
+    tiles = Table.grid(expand=True, padding=(0, 1))
+    for _ in range(tile_columns):
+        tiles.add_column(ratio=1)
+
+    def tile(label, value):
+        content = Group(Text(label, style="#8b8b8b", no_wrap=True),
+                        Text(value, style="bold #ff9f1a", no_wrap=True))
+        return Panel(content, border_style="#4a3a1a", box=box.ROUNDED,
+                     padding=(0, 1), expand=True)
+
+    tile_items = [tile(label, value) for label, value in tile_values]
+    for start in range(0, len(tile_items), tile_columns):
+        tiles.add_row(*tile_items[start:start + tile_columns])
+
+    playlist_header = Table.grid(expand=True, padding=0)
+    playlist_header.add_column(ratio=1, no_wrap=True)
+    playlist_header.add_column(no_wrap=True, justify="right")
+    playlist_header.add_row(
+        Text("Playlists", style="bold #f5a623"),
+        Text(f"{len(playlist_counts)} total · songs each", style="#8b8b8b"))
+
+    max_count = max((count for _, count in playlist_counts), default=0)
+    rank_width, count_width = 3, max(3, max((len(str(count)) for _, count in playlist_counts), default=1))
+    name_width = min(28, max(8, int(inner_width * 0.35)))
+    while rank_width + count_width + name_width + 3 >= inner_width and name_width > 1:
+        name_width -= 1
+    bar_width = max(inner_width - rank_width - count_width - name_width - 3, 1)
+
+    def playlist_line(rank, name, count):
+        top = rank <= 3
+        line = Text(f"{rank:>{rank_width}} ", style="#8b8b8b" if top else "#5a5a5a")
+        name_text = truncate_display(name, name_width)
+        line.append(name_text.plain, style="bold #ffffff" if top else "#e6e6e6")
+        line.append(" " * max(name_width - cell_len(name_text.plain), 0))
+        line.append(" ")
+        filled = (min(bar_width, max(1, round(bar_width * count / max_count)))
+                  if count > 0 and max_count else 0)
+        line.append("━" * filled, style="#ff9f1a" if top else "#8a5a12")
+        line.append("━" * (bar_width - filled), style="#2e2e2e")
+        line.append(" ")
+        line.append(f"{count:>{count_width}}", style="#ff9f1a" if top else "#8b8b8b")
+        line.no_wrap = True
+        line.overflow = "crop"
+        return line
+
+    tile_height = 4 if tile_columns == 4 else 8
+    available_rows = max(0, console.size.height - tile_height - 8 - int(show_note))
+    if len(playlist_counts) > available_rows:
+        visible_count = max(available_rows - 1, 0)
+    else:
+        visible_count = len(playlist_counts)
+    playlist_lines = [
+        playlist_line(index, name, count)
+        for index, (name, count) in enumerate(playlist_counts[:visible_count], 1)
+    ]
+    if len(playlist_counts) > visible_count and available_rows:
+        playlist_lines.append(Text(f"+ {len(playlist_counts) - visible_count} more",
+                                   style="#8b8b8b", no_wrap=True))
+
+    body = [tiles, playlist_header, *playlist_lines]
+    if show_note:
+        note = Text(f"{entry_count} playlist entries · {unique_count} unique songs "
+                    "(a song in several playlists counts once)",
+                    style="#5a5a5a", no_wrap=True, overflow="ellipsis")
+        body.append(note)
+    body.append(Text("─" * inner_width, style="#4a3a1a", no_wrap=True, overflow="crop"))
+
+    last_sync = ago(stats.get("last_run", "never"))
+    library_path = str(cfg["out"])
+    data_path = short_data_dir()
+    fixed_width = cell_len(f"Last sync {last_sync} ·  · Data ")
+    library_budget = max(inner_width - fixed_width - cell_len(data_path), 0)
+    if cell_len(library_path) > library_budget:
+        library_path = _middle_truncate(library_path, library_budget)
+    remaining = inner_width - cell_len(
+        f"Last sync {last_sync} · {library_path} · Data {data_path}")
+    if remaining < 0:
+        data_path = _middle_truncate(data_path, max(cell_len(data_path) + remaining, 0))
+    last_line = Text.assemble(
+        ("Last sync ", "#8b8b8b"), (last_sync, "#e6e6e6"),
+        (" · ", "#8b8b8b"), (library_path, "#6b6b6b"),
+        (" · Data ", "#8b8b8b"), (data_path, "#6b6b6b"),
+        no_wrap=True, overflow="crop")
+    if cell_len(last_line.plain) > inner_width:
+        last_line.truncate(inner_width, overflow="crop")
+    body.append(last_line)
+    panel = panel_with_title("♪ Stats", "Library overview", "#f5a623",
+                             Group(*body), title_color="#f5a623")
+    if wait_for_key:
+        console.clear()
+    console.print(Group(panel, footer_hint("enter or esc back")))
+    if wait_for_key:
+        try:
+            with TerminalKeyReader() as reader:
+                while reader.read_key() not in ("enter", "escape", "ctrl_c"):
+                    pass
+        except KeyboardInterrupt:
+            return
 
 
 # ---------- interactive menus (every menu has "‹ Back"; Ctrl+C = back/exit) ----------
@@ -2739,6 +2880,193 @@ def ask(msg, choices):
     try:
         return questionary.select(msg, choices=[questionary.Choice(t, v) for t, v in choices],
                                   style=STYLE, instruction=" ").ask()
+    except KeyboardInterrupt:
+        return None
+
+
+def panel_with_title(title, subtitle=None, border_color="#5a5a5a", body=None,
+                     title_color="#ff9f1a", padding=(1, 2),
+                     subtitle_color="#8b8b8b"):
+    from rich import box
+    title_text = Text(title, style=f"bold {title_color}") if title else None
+    if title_text is not None and subtitle:
+        title_text.append(f"  {subtitle}", style=subtitle_color)
+    return Panel(body if body is not None else Text(""), title=title_text,
+                 border_style=border_color, box=box.ROUNDED, padding=padding, expand=True)
+
+
+def footer_hint(text):
+    return Text(text, style="#5a5a5a", no_wrap=True, overflow="ellipsis")
+
+
+class TerminalKeyReader:
+    def __init__(self):
+        self.old_terminal = None
+
+    def __enter__(self):
+        if os.name != "nt":
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            self.old_terminal = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        return self
+
+    def __exit__(self, *_):
+        if self.old_terminal is not None:
+            import termios
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.old_terminal)
+            self.old_terminal = None
+
+    def read_key(self):
+        if os.name == "nt":
+            import msvcrt
+            while not msvcrt.kbhit():
+                time.sleep(0.03)
+            key = msvcrt.getwch()
+            if key in ("\x00", "\xe0"):
+                return {"H": "up", "P": "down", "K": "left", "M": "right"}.get(msvcrt.getwch())
+            return {"\r": "enter", "\n": "enter", "\x1b": "escape",
+                    "\x03": "ctrl_c", "\x08": "backspace"}.get(key, key)
+        import select
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], None)
+        if not ready:
+            return None
+        first = os.read(fd, 1)
+        if first == b"\x1b":
+            sequence = bytearray(first)
+            deadline = time.monotonic() + 0.04
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], 0.005)
+                if not ready:
+                    continue
+                sequence.extend(os.read(fd, 1))
+                if sequence[-1:] in (b"A", b"B", b"C", b"D"):
+                    return {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}[sequence[-1:]]
+            return "escape"
+        return {b"\r": "enter", b"\n": "enter", b"\x03": "ctrl_c",
+                b"\x7f": "backspace", b"\x08": "backspace"}.get(
+                    first, first.decode("utf-8", "ignore"))
+
+    def read_chunk(self):
+        if os.name == "nt":
+            import msvcrt
+            while not msvcrt.kbhit():
+                time.sleep(0.03)
+            chars = []
+            while msvcrt.kbhit():
+                char = msvcrt.getwch()
+                if char in ("\x00", "\xe0"):
+                    if msvcrt.kbhit():
+                        msvcrt.getwch()
+                    continue
+                chars.append(char)
+            return "".join(chars)
+        import select
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], None)
+        return os.read(fd, 4096).decode("utf-8", "replace") if ready else ""
+
+
+def _selector_item(item):
+    if len(item) == 2:
+        return item[0], item[1], "", "", True
+    if len(item) == 3:
+        return item[0], item[1], item[2], "", True
+    if len(item) == 4:
+        return item[0], item[1], item[2], item[3], True
+    return item[:5]
+
+
+def _selector_row(label, badge, badge_style, selected, width, label_width=None):
+    from rich.cells import cell_len
+
+    width = max(width, 1)
+    prefix = "▌ " if selected else "  "
+    badge = str(badge or "")
+    badge_width = cell_len(badge)
+    label_room = max(width - cell_len(prefix) - badge_width - (1 if badge else 0), 0)
+    if label_width is not None:
+        label_room = min(label_room, label_width)
+    shown_label = truncate_display(label, label_room).plain
+    gap = max(width - cell_len(prefix + shown_label) - badge_width, 0)
+    line = Text()
+    bg = " on #2a2417" if selected else ""
+    line.append(prefix, style=f"#ff9f1a{bg}" if selected else None)
+    line.append(shown_label, style=f"bold #ff9f1a{bg}" if selected else "#e6e6e6")
+    line.append(" " * gap, style=bg.strip() if bg else None)
+    if badge:
+        style = badge_style or ("#8b8b8b" if selected else "#5a5a5a")
+        line.append(badge, style=f"{style}{bg}")
+    tail = width - cell_len(line.plain)
+    if tail > 0:
+        line.append(" " * tail, style=bg.strip() if bg else None)
+    line.no_wrap = True
+    line.overflow = "crop"
+    return line
+
+
+def select_menu(items, title=None, subtitle=None, border_color="#5a5a5a",
+                footer="↑↓ move · enter select · esc back", on_adjust=None,
+                extra_content=None, label_width=None, blank_before=False,
+                on_enter=None, selected_badge_brackets=False):
+    def get_items():
+        return list(items() if callable(items) else items)
+
+    current_items = get_items()
+    selectable = [i for i, item in enumerate(current_items) if _selector_item(item)[4]]
+    if not selectable:
+        return None
+    selected_index = selectable[0]
+    width = max(console.size.width - (6 if title else 0), 1)
+
+    def render():
+        rows = [Text("")] if blank_before else []
+        current_items[:] = get_items()
+        for index, raw_item in enumerate(current_items):
+            label, value, badge, badge_style, enabled = _selector_item(raw_item)
+            if not enabled:
+                rows.append(Text(f"  {label}", style="#5a5a5a", no_wrap=True, overflow="ellipsis"))
+                continue
+            if selected_badge_brackets and index == selected_index and badge:
+                badge = f"‹ {badge} ›"
+            rows.append(_selector_row(label, badge, badge_style, index == selected_index,
+                                      width, label_width))
+        if extra_content:
+            extra = extra_content(_selector_item(current_items[selected_index])[1])
+            if extra is not None:
+                rows.append(extra)
+        body = Group(*rows)
+        if title:
+            body = panel_with_title(title, subtitle, border_color, body)
+        return Group(body, footer_hint(footer))
+
+    try:
+        with Live(get_renderable=render, console=console, refresh_per_second=10,
+                  transient=True, vertical_overflow="crop"):
+            with TerminalKeyReader() as reader:
+                while True:
+                    key = reader.read_key()
+                    if key == "ctrl_c":
+                        return None
+                    if key in ("escape", "q", "Q"):
+                        return None
+                    selectable = [i for i, item in enumerate(current_items) if _selector_item(item)[4]]
+                    if not selectable:
+                        return None
+                    if key in ("up", "down"):
+                        position = selectable.index(selected_index)
+                        step = -1 if key == "up" else 1
+                        selected_index = selectable[(position + step) % len(selectable)]
+                    elif key in ("left", "right") and on_adjust:
+                        _, value, _, _, _ = _selector_item(current_items[selected_index])
+                        on_adjust(value, key)
+                    elif key == "enter":
+                        value = _selector_item(current_items[selected_index])[1]
+                        if on_enter and on_enter(value):
+                            continue
+                        return value
     except KeyboardInterrupt:
         return None
 
@@ -2793,16 +3121,25 @@ def val(c, k):
     return STYLES[v] if k == "name_style" else (str(v) or "-")
 
 
-def save_named_links(links):
+def save_named_links(links, preserve_original=False):
     path = DATA / "playlists.txt"
     existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
-    existing = {normalize_music_url(url) for url in read_list(path)}
+    if preserve_original:
+        existing = {_link_identity(url) or ("url", normalize_music_url(url))
+                    for url in read_list(path)}
+    else:
+        existing = {normalize_music_url(url) for url in read_list(path)}
     new_links = []
     for url, name in links:
-        url = normalize_music_url(url)
-        if url not in existing:
-            new_links.append((url, name))
-            existing.add(url)
+        if preserve_original:
+            identity = _link_identity(url) or ("url", normalize_music_url(url))
+            stored_url = url
+        else:
+            stored_url = normalize_music_url(url)
+            identity = stored_url
+        if identity not in existing:
+            new_links.append((stored_url, name))
+            existing.add(identity)
     if not new_links:
         console.print("[dim]No new links to save.[/]")
         return 0
@@ -2813,7 +3150,8 @@ def save_named_links(links):
         for url, name in new_links:
             label = str(name).replace("\r", " ").replace("\n", " ").strip()
             f.write(f"# {label}\n{url}\n")
-    console.print(f"[green]Saved {len(new_links)} link(s) to {path}.[/]")
+    suffix = "" if preserve_original else "."
+    console.print(Text(f"Saved {len(new_links)} link(s) to {path}{suffix}", style="#3fb950"))
     return len(new_links)
 
 
@@ -2870,6 +3208,25 @@ def normalize_music_url(url):
     return url
 
 
+def _link_identity(url):
+    parsed = urlparse(str(url).strip())
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/", 1)[0]
+        return ("video", video_id) if video_id else None
+    if host == "youtube.com" or host.endswith(".youtube.com"):
+        query = parse_qs(parsed.query)
+        playlist_id = (query.get("list") or [None])[0]
+        if playlist_id:
+            return "playlist", playlist_id
+        video_id = (query.get("v") or [None])[0]
+        if video_id:
+            return "video", video_id
+    return None
+
+
 def is_playlist_url(url):
     parsed = urlparse(url)
     return "list" in parse_qs(parsed.query, keep_blank_values=True) or "/playlist" in parsed.path.lower()
@@ -2904,100 +3261,209 @@ def print_single_line(value, style=None):
     console.print(line, no_wrap=True, soft_wrap=True)
 
 
-def redraw_prompt_line(display_prompt, entered, shown, value_style):
-    from rich.cells import cell_len
-
-    if sys.stdout.isatty():
-        columns = terminal_columns()
-        occupied = cell_len(display_prompt) + cell_len(entered)
-        rows = max(1, (occupied + columns - 1) // columns)
-        sys.stdout.write(f"\x1b[{rows}A")
-        for row in range(rows):
-            sys.stdout.write("\r\x1b[2K")
-            if row < rows - 1:
-                sys.stdout.write("\x1b[1B")
-        if rows > 1:
-            sys.stdout.write(f"\x1b[{rows - 1}A")
-        sys.stdout.write("\r")
-        sys.stdout.flush()
-
-    columns = terminal_columns()
-    prompt_width = cell_len(display_prompt)
-    visible_value = truncate_display(shown, columns - prompt_width - 1)
-    line = Text(display_prompt)
-    line.append(visible_value.plain, style=value_style)
-    print_single_line(line)
-
-
-def redraw_link_prompt(prompt, value):
-    redraw_prompt_line(f"? {prompt} ", value, value, "#ff8c00")
-
-
 def confirm_playlist_save(count):
     prompt = f"Add these {count} playlist link(s) to Playlists.txt? [Y/n]"
-    display_prompt = f"? {prompt} "
-    while True:
-        try:
-            answer = questionary.text(prompt).ask()
-        except KeyboardInterrupt:
-            return None
-        if answer is None:
-            return None
-        normalized = answer.strip().casefold()
-        if normalized in ("", "y", "yes"):
-            result, label = True, "Yes"
-        elif normalized in ("n", "no"):
-            result, label = False, "No"
-        else:
-            redraw_prompt_line(display_prompt, answer, answer, "#ffffff")
-            print_single_line("Please answer y/yes or n/no.", style="#ef4444")
-            continue
-        redraw_prompt_line(display_prompt, answer, label, "#ffffff")
-        return result
+    console.print(Text(prompt, style="#e6e6e6"), end="", no_wrap=True)
+    try:
+        answer = input().strip().casefold()
+    except KeyboardInterrupt:
+        return None
+    return answer in ("", "y", "yes")
 
 
 def collect_links(cfg):
-    known, added = {normalize_music_url(url) for url in all_urls()}, []
-    while True:
-        prompt = f"Link #{len(added) + 1} (Enter on empty line = Done)"
+    state = {"rows": [], "buffer": "", "lock": threading.Lock()}
+    known = {_link_identity(url) or ("url", normalize_music_url(url)) for url in all_urls()}
+    pending = {}
+    executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="paste-resolve")
+    finished_input = False
+    cancelled = False
+
+    def resolve_link(url):
+        ytdlp = get_ytdlp()
+        options = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist",
+                   "skip_download": True, "socket_timeout": 10, "retries": 2,
+                   "logger": Quiet()}
+        if cfg.get("cookies"):
+            options["cookiesfrombrowser"] = (cfg["cookies"],)
+        with ytdlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            raise ValueError("No link information found")
+        entries = info.get("entries")
+        if entries is not None:
+            count = info.get("playlist_count") or info.get("n_entries")
+            if count is None:
+                count = sum(1 for entry in entries if entry)
+            return str(info.get("title") or "Untitled playlist"), int(count or 0)
+        return str(info.get("title") or "Untitled song"), 1
+
+    def queue_line(raw):
+        url = raw.strip()
+        identity = _link_identity(url)
+        row = {"url": url, "identity": identity, "status": "checking", "name": "", "count": 0}
+        with state["lock"]:
+            state["rows"].append(row)
+        if identity is None:
+            with state["lock"]:
+                row["status"] = "invalid"
+            return
+        if identity in known:
+            with state["lock"]:
+                row["status"] = "skipped"
+            return
+        known.add(identity)
+        future = executor.submit(resolve_link, url)
+        pending[future] = row
+        future.add_done_callback(lambda completed, item=row: publish_result(completed, item))
+
+    def publish_result(future, row):
         try:
-            raw = questionary.text(prompt).ask()
-        except KeyboardInterrupt:
-            return None
-        if raw is None:
-            return None
-        redraw_link_prompt(prompt, raw)
-        link = raw.strip()
-        if not link:
-            return added
-        parsed = urlparse(link)
-        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
-            print_single_line("Enter a valid http(s) URL.", style="#ef4444")
-            continue
-        link = normalize_music_url(link)
-        if link in known:
-            print_single_line("Already in Playlists.txt; skipping duplicate link.", style="#8b8b8b")
-            continue
-        details, errs = {}, []
-        resolve([link], cfg, errs, details)
-        detail = details.get(link)
-        if errs or not detail or detail[2]:
-            reason = errs[0][1] if errs else (detail[2] if detail else "No playlist or song information found")
-            print_single_line(f"Could not add link: {reason}", style="#ef4444")
-            continue
-        name, count, _ = detail
-        added.append((link, name))
-        known.add(link)
-        print_single_line(f"{status_glyph(True)} {name} · {count} songs", style="#22c55e")
+            title, count = future.result()
+        except Exception:
+            status, title, count = "invalid", "", 0
+        else:
+            status = "ready"
+        with state["lock"]:
+            row["name"] = title
+            row["count"] = count
+            row["status"] = status
+
+    def update_finished():
+        for future in list(pending):
+            if not future.done():
+                continue
+            pending.pop(future)
+
+    def render():
+        from rich.cells import cell_len
+
+        with state["lock"]:
+            rows = [dict(row) for row in state["rows"]]
+            buffer = state["buffer"]
+        width = max(console.size.width - 8, 1)
+        body = [Text("Paste one playlist or song link per line.", style="#8b8b8b", no_wrap=True),
+                Text.assemble(("Press ", "#8b8b8b"), ("Enter", "#e6e6e6"),
+                              (" on an empty line when you're done.", "#8b8b8b"),
+                              no_wrap=True),
+                Text("─" * width, style="#333333", no_wrap=True)]
+        grid = Table.grid(padding=(0, 1), expand=True)
+        grid.add_column(width=3, justify="right", no_wrap=True)
+        grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        grid.add_column(no_wrap=True, justify="right")
+        max_link = max(1, width - 34)
+        for index, row in enumerate(rows, 1):
+            link = re.sub(r"^https?://", "", row["url"], flags=re.I)
+            shown_link = truncate_display(link, max_link)
+            if row["status"] == "ready":
+                status = Text(f"✓ {row['name']} · {row['count']} songs", style="#3fb950",
+                              no_wrap=True, overflow="ellipsis")
+            elif row["status"] == "checking":
+                status = Text("checking…", style="#8b8b8b", no_wrap=True)
+            elif row["status"] == "skipped":
+                status = Text("↷ already in list, skipped", style="#8b8b8b", no_wrap=True)
+            else:
+                status = Text("✗ not a valid link", style="#f85149", no_wrap=True)
+            grid.add_row(Text(str(index), style="#5a5a5a"), Text(shown_link.plain, style="#ff9f1a",
+                                                                no_wrap=True), status)
+        typing = Text(f"{len(rows) + 1} › ", style="#ff9f1a", no_wrap=True)
+        typing.append(truncate_display(buffer, max(1, width - cell_len(typing.plain) - 1)).plain,
+                      style="#e6e6e6")
+        typing.append("▏", style="#ff9f1a")
+        body.append(grid)
+        body.append(typing)
+        body.append(Text("─" * width, style="#333333", no_wrap=True))
+        ready = sum(row["status"] == "ready" for row in rows)
+        skipped = sum(row["status"] == "skipped" for row in rows)
+        invalid = sum(row["status"] == "invalid" for row in rows)
+        summary = Text(f"{ready} ready", style="#3fb950")
+        summary.append(f" · {skipped} skipped", style="#8b8b8b")
+        if invalid:
+            summary.append(f" · {invalid} invalid", style="#f85149")
+        body.append(summary)
+        return Group(panel_with_title("Add Music", "Paste links", body=Group(*body)),
+                     footer_hint("enter on empty line = done · esc cancel"))
+
+    def process_chunk(chunk):
+        nonlocal finished_input, cancelled
+        if chunk in ("\x1b",):
+            cancelled = True
+            return
+        if "\x03" in chunk:
+            cancelled = True
+            return
+        chunk = re.sub(r"\x1b\[[A-D]", "", chunk)
+        normalized = chunk.replace("\r\n", "\n").replace("\r", "\n")
+        if normalized == "\n":
+            with state["lock"]:
+                current = state["buffer"]
+                state["buffer"] = ""
+            if current.strip():
+                queue_line(current)
+            else:
+                finished_input = True
+            return
+        if "\n" in normalized:
+            parts = normalized.split("\n")
+            with state["lock"]:
+                current = state["buffer"]
+                state["buffer"] = ""
+            for index, part in enumerate(parts[:-1]):
+                current += part
+                if not current.strip():
+                    finished_input = True
+                    break
+                queue_line(current)
+                current = ""
+            with state["lock"]:
+                state["buffer"] = parts[-1] if not finished_input else ""
+            return
+        with state["lock"]:
+            for char in chunk:
+                if char in ("\x08", "\x7f"):
+                    state["buffer"] = state["buffer"][:-1]
+                elif char >= " ":
+                    state["buffer"] += char
+
+    try:
+        with Live(get_renderable=render, console=console, refresh_per_second=8,
+                  transient=False, vertical_overflow="crop"):
+            with TerminalKeyReader() as reader:
+                while not finished_input and not cancelled:
+                    update_finished()
+                    try:
+                        chunk = reader.read_chunk()
+                    except KeyboardInterrupt:
+                        cancelled = True
+                        break
+                    process_chunk(chunk)
+                if cancelled:
+                    for future in pending:
+                        future.cancel()
+                while pending:
+                    update_finished()
+                    time.sleep(0.04)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    if cancelled:
+        return None
+    update_finished()
+    with state["lock"]:
+        rows = [dict(row) for row in state["rows"]]
+    return [(row["url"], row["name"]) for row in rows if row["status"] == "ready"]
 
 
 def add_links(cfg):
-    options = [("Paste links", "paste"), ("Load from Playlists.txt", "load"),
-               ("Edit Playlists.txt", "edit"), ("‹ Back", "back")]
     while True:
         console.clear()
+        links_count = len(read_list(DATA / "playlists.txt"))
+        options = [("Paste links", "paste", "playlists or songs"),
+                   ("Load from Playlists.txt", "load", f"{links_count} links"),
+                   ("Edit Playlists.txt", "edit", "open in editor"),
+                   ("‹ Back", "back", "", "#5a5a5a")]
         try:
-            choice = ask("Add Music", options)
+            choice = select_menu(options, title="Add Music",
+                                 footer="↑↓ move · enter select · esc back")
         except Exception as e:
             menu_error(e)
             continue
@@ -3019,7 +3485,8 @@ def add_links(cfg):
                     if save is None:
                         return None
                     if save:
-                        save_named_links(playlist_links)
+                        save_named_links(playlist_links, preserve_original=True)
+                        continue
                 return [url for url, _ in added]
             if choice == "load":
                 ensure_data_dir()
@@ -3118,14 +3585,125 @@ def library_folder_menu(cfg):
 
 
 def settings(cfg):
+    descriptions = {
+        "format": "output file type. mp3 plays everywhere.",
+        "quality": "audio quality. Higher bitrates use more storage.",
+        "name_style": "filename pattern used for saved songs.",
+        "cover": "embed cover art in each audio file.",
+        "square": "crop embedded cover art to a square.",
+        "clean": "remove promotional phrases from song titles.",
+        "playlist_files": "create .m3u8 files for each playlist.",
+        "prune": "remove songs no longer present in a playlist.",
+        "skip_duplicate_songs": "avoid downloading songs already in the library.",
+        "jobs": "maximum number of simultaneous downloads.",
+        "rate_limit": "maximum download speed.",
+        "retries": "retry count for failed downloads.",
+        "cookies": "browser profile used for YouTube cookies.",
+        "library": "music folder used for downloads and playlists.",
+        "data": "folder containing settings, history, and saved links.",
+        "edit": "open the saved playlist links in your editor.",
+        "reset": "restore all settings except the library folder.",
+        "back": "return to the main menu.",
+    }
+
+    def value_for(key):
+        if key in ("library", "data"):
+            return str(cfg["out"] if key == "library" else DATA), "#8b8b8b"
+        if key == "rate_limit" and not cfg[key]:
+            return "unlimited", "#8b8b8b"
+        if key == "cookies" and not cfg[key]:
+            return "none", "#8b8b8b"
+        value = cfg.get(key, "")
+        if isinstance(value, bool):
+            return ("on", "#3fb950") if value else ("off", "#8b8b8b")
+        if key == "name_style":
+            value = STYLES.get(value, value)
+        return str(value), "#4dd0e1"
+
+    def get_rows():
+        rows = []
+        section_keys = {
+            "AUDIO": ("format", "quality", "cover", "square"),
+            "LIBRARY": ("name_style", "clean", "playlist_files", "prune",
+                        "skip_duplicate_songs"),
+            "DOWNLOADS": ("jobs", "rate_limit", "retries", "cookies"),
+        }
+        labels = dict(LABELS)
+        for heading, keys in section_keys.items():
+            rows.append((heading, None, "", "", False))
+            for key in keys:
+                value, style = value_for(key)
+                rows.append((labels[key], key, value, style, True))
+        rows.append(("FOLDERS", None, "", "", False))
+        rows.extend([
+            ("Library folder", "library",
+             truncate_display(value_for("library")[0], max(console.size.width - 50, 12)).plain,
+             "#8b8b8b", True),
+            ("Data folder", "data",
+             truncate_display(value_for("data")[0], max(console.size.width - 50, 12)).plain,
+             "#8b8b8b", True),
+            ("Edit Playlists.txt", "edit", "open in editor", "#8b8b8b", True),
+            ("Reset to defaults", "reset", "", "", True),
+            ("‹ Back", "back", "", "", True),
+        ])
+        return rows
+
+    def adjust(key, direction):
+        if key not in cfg:
+            return
+        step = -1 if direction == "left" else 1
+        value = cfg[key]
+        if isinstance(value, bool):
+            cfg[key] = not value
+        elif key in CHOICES:
+            choices = CHOICES[key]
+            current = choices.index(value) if value in choices else 0
+            cfg[key] = choices[(current + step) % len(choices)]
+        elif key == "retries":
+            cfg[key] = max(1, int(value) + step)
+        else:
+            return
+        save_cfg(cfg)
+
+    def enter_setting(key):
+        if key in cfg and (isinstance(cfg[key], bool) or key in CHOICES or key == "retries"):
+            if isinstance(cfg[key], bool):
+                cfg[key] = not cfg[key]
+                save_cfg(cfg)
+            return True
+        return False
+
     while True:
         console.clear()
-        console.print(f"[bold orange1]Settings[/]\n[dim]Data: {short_data_dir()}[/]\n")
-        items = [(f"{label:<22}{val(cfg, key)}", key) for key, label in LABELS]
-        items.extend([("Library folder", "library"), ("Data folder", "data"),
-                      ("Edit Playlists.txt", "edit"), ("Reset to defaults", "reset"), ("‹ Back", "back")])
+
+        def extra_content(selected):
+            if selected not in descriptions:
+                return None
+            description_labels = dict(LABELS)
+            description_labels.update({
+                "library": "Library folder", "data": "Data folder",
+                "edit": "Edit Playlists.txt", "reset": "Reset to defaults",
+                "back": "‹ Back",
+            })
+            label = description_labels.get(selected, selected.title())
+            text = Text(label, style="#e6e6e6")
+            text.append(f" · {descriptions[selected]}", style="#8b8b8b")
+            if selected in CHOICES:
+                text.append(" Options: ", style="#8b8b8b")
+                options = ([STYLES[item] for item in CHOICES[selected]]
+                           if selected == "name_style"
+                           else [str(item) for item in CHOICES[selected]])
+                text.append(" · ".join(options), style="#4dd0e1")
+            text.no_wrap = True
+            text.overflow = "ellipsis"
+            return Group(Text("─" * max(console.size.width - 8, 1), style="#333333"), text)
+
         try:
-            choice = ask("", items)
+            choice = select_menu(
+                get_rows, title="Settings", subtitle=f"Data: {DATA}",
+                footer="↑↓ move · ←→ change value · enter edit · esc back",
+                on_adjust=adjust, extra_content=extra_content, label_width=27,
+                on_enter=enter_setting, selected_badge_brackets=True)
         except Exception as e:
             menu_error(e)
             continue
@@ -3146,18 +3724,10 @@ def settings(cfg):
                 out = cfg["out"]
                 cfg.update(DEFAULTS)
                 cfg["out"] = out
-            elif isinstance(cfg[choice], bool):
-                cfg[choice] = not cfg[choice]
-            elif choice in CHOICES:
-                value = ask(dict(LABELS)[choice],
-                            [(str(STYLES.get(item, item)), item) for item in CHOICES[choice]] + [("‹ Back", "back")])
-                if value and value != "back":
-                    cfg[choice] = value
-            else:
+            elif choice in ("rate_limit", "cookies"):
                 value = questionary.text(dict(LABELS)[choice] + ":", default=str(cfg[choice])).ask()
                 if value is not None:
-                    cfg[choice] = (int(value) if value.isdigit() else cfg[choice]) \
-                        if choice == "retries" else value.strip()
+                    cfg[choice] = value.strip()
             if save:
                 save_cfg(cfg)
         except Exception as e:
@@ -3235,14 +3805,107 @@ def run_flow(cfg, with_review, extra_urls=None):
 
 
 def header(cfg, upd):
+    from rich.cells import cell_len
+
     lib = get_lib(cfg["out"])
-    console.print(Panel(f"[bold orange1]♪  ytmusic-sync[/]  v{VERSION}\n[dim]YouTube music + Local, always in sync[/]",
-                        border_style="orange1", expand=False))
-    console.print(f" {cfg['out']} · {len(lib.d['songs'])} songs · {size(lib.total_size())}\n"
-                  f" Last sync: {ago(lib.d['stats']['last_run'])} · Data: {short_data_dir()}")
-    if upd:
-        console.print(f" [yellow]⚠ yt-dlp update available ({upd[0]} → {upd[1]})[/]")
-    console.print()
+    width = max(console.size.width - 8, 1)
+    last_run = lib.d["stats"]["last_run"]
+    current_library = str(Path(cfg["out"]).expanduser().resolve())
+    recent = LAST_SYNC_RESULT if last_run and LAST_SYNC_RESULT and \
+        os.path.normcase(LAST_SYNC_RESULT["out"]) == os.path.normcase(current_library) else None
+    details = [
+        ("path", str(cfg["out"]), "#6b6b6b"),
+        ("last_label", "Last sync", "#8b8b8b"),
+        ("last_value", ago(last_run), "#e6e6e6"),
+    ]
+    if recent:
+        details.append(("result", f"✓ {recent['new']} new", "#3fb950"))
+        if recent["failed"]:
+            details.append(("result", f"✗ {recent['failed']} failed", "#f85149"))
+        details.append(("duration", f"{recent['elapsed']:.1f}s", "#8b8b8b"))
+
+    def line_width(chunks):
+        total = 0
+        has_text = False
+        for kind, text, _ in chunks:
+            if not text:
+                continue
+            if has_text:
+                total += cell_len(" " if kind == "last_value" else " · ")
+            total += cell_len(text)
+            has_text = True
+        return total
+
+    if line_width(details) > width:
+        other_width = line_width(details[1:])
+        details[0] = ("path", _middle_truncate(details[0][1], max(width - other_width - 3, 0)),
+                      details[0][2])
+    if line_width(details) > width and any(kind == "duration" for kind, _, _ in details):
+        details = [chunk for chunk in details if chunk[0] != "duration"]
+    if line_width(details) > width:
+        details = [chunk for chunk in details if chunk[0] != "result"]
+    line_one = Text()
+    has_text = False
+    for kind, value, style in details:
+        if not value:
+            continue
+        if has_text:
+            line_one.append(" " if kind == "last_value" else " · ", style="#8b8b8b")
+        line_one.append(value, style=style)
+        has_text = True
+    if cell_len(line_one.plain) > width:
+        line_one.truncate(width, overflow="crop")
+    line_one.no_wrap = True
+    line_one.overflow = "crop"
+
+    line_two = Text()
+    line_two.append(str(len(lib.d["songs"])), style="bold #4dd0e1")
+    line_two.append(" songs · ", style="#e6e6e6")
+    line_two.append(size(lib.total_size()), style="bold #4dd0e1")
+    line_two.append(" · ", style="#8b8b8b")
+    line_two.append(str(len(read_list(DATA / "playlists.txt"))), style="bold #4dd0e1")
+    line_two.append(" playlists", style="#e6e6e6")
+    line_two.no_wrap = True
+    line_two.overflow = "ellipsis"
+    body = [
+        Text("YouTube music + Local, always in sync", style="#8b8b8b", no_wrap=True),
+        Text("─" * width, style="#333333", no_wrap=True),
+        line_one,
+        line_two,
+    ]
+    panel = panel_with_title("♪ ytmusic-sync", f"v{VERSION}", "#f5a623",
+                             Group(*body), title_color="#f5a623")
+    console.print(panel)
+    return lib
+
+
+def _middle_truncate(value, width):
+    from rich.cells import cell_len, get_character_cell_size
+
+    value = str(value)
+    if cell_len(value) <= width:
+        return value
+    if width <= 0:
+        return ""
+    if width == 1:
+        return "…"
+    left_limit = (width - 1) // 2
+    right_limit = width - 1 - left_limit
+    left, used = [], 0
+    for char in value:
+        size = get_character_cell_size(char)
+        if used + size > left_limit:
+            break
+        left.append(char)
+        used += size
+    right, used = [], 0
+    for char in reversed(value[len(left):]):
+        size = get_character_cell_size(char)
+        if used + size > right_limit:
+            break
+        right.append(char)
+        used += size
+    return "".join(left) + "…" + "".join(reversed(right))
 
 
 def pick_library():
@@ -3257,20 +3920,24 @@ def interactive(cfg):
     while True:
         console.clear()
         upd = UPDATE_CHECKER.result if UPDATE_CHECKER and UPDATE_CHECKER.done.is_set() else None
-        header(cfg, upd)
+        lib = header(cfg, upd)
         report_update_timing()
         if TIMING_ENABLED and "startup timing printed" not in TIMINGS:
             print_timings()
             TIMINGS["startup timing printed"] = 1
-        first = not all_urls(cfg)
-        menu = [("Use defaults & start", "go"), ("Customize", "set"), ("Quit", "q")] if first else \
-               [("Update library", "upd"), ("Add Music", "add"), ("Settings", "set"), ("Stats", "stats")]
+        link_count = len(read_list(DATA / "playlists.txt"))
+        menu = [("Update library", "upd", f"scan {link_count} playlists"),
+                ("Add Music", "add", f"{link_count} links · {len(lib.d['songs'])} songs"),
+                ("Settings", "set",
+                 f"{cfg['format']} · {cfg['quality']} · {cfg['jobs']} parallel"),
+                ("Stats", "stats", "history · artists"),
+                ("Quit", "q", "", "#5a5a5a")]
         if upd:
-            menu.append((f"Update yt-dlp ({upd[0]} → {upd[1]})", "ytdlp"))
-        if not first:
-            menu.append(("Quit", "q"))
+            menu.insert(4, (f"Update yt-dlp ({upd[0]} → {upd[1]})", "ytdlp",
+                            "available", "#ff9f1a"))
         try:
-            k = ask("", menu)
+            k = select_menu(menu, footer="↑↓ move · enter select · q quit",
+                            blank_before=True)
         except Exception as e:
             menu_error(e)
             continue
@@ -3280,17 +3947,10 @@ def interactive(cfg):
             if k == "set":
                 cfg = settings(cfg)
             elif k == "stats":
-                show_stats(cfg)
-                pause()
+                show_stats(cfg, wait_for_key=True)
             elif k == "ytdlp":
                 upgrade_ytdlp()
                 pause()
-            elif k == "go":
-                links = all_urls(cfg)
-                if not links:
-                    links = add_links(cfg) or []
-                if links and run_flow(cfg, True, links) == "exit":
-                    return
             elif k == "add":
                 links = add_links(cfg)
                 if links and run_flow(cfg, True, links) == "exit":
