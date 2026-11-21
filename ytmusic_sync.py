@@ -862,11 +862,14 @@ class ScanCancelled(Exception):
 
 
 class ScanState:
-    def __init__(self, rows, local_ids, cache):
+    def __init__(self, rows, local_ids, cache, library_size=0):
         self.lock = threading.Lock()
         self.rows = rows
         self.local_ids = local_ids
         self.cache = cache
+        self.library_size = library_size
+        self.latest_new = {}
+        self.final_new_ids = None
         self.errors = []
         self.bad = 0
         self.started = time.monotonic()
@@ -889,6 +892,10 @@ class ScanState:
             row["items"] = list(items)
             row["read"] = len(items)
             row["total"] = total
+            for item in items:
+                vid = item["id"]
+                if vid not in self.local_ids and vid not in self.latest_new:
+                    self.latest_new[vid] = (time.monotonic(), dict(item), index)
 
     def fail(self, index, url, reason, elapsed):
         with self.lock:
@@ -913,6 +920,14 @@ class ScanState:
         if final_counts is not None:
             found, new, local = final_counts
         return rows, found, new, local, sum(row["status"] == "failed" for row in rows)
+
+    def latest_new_items(self):
+        with self.lock:
+            items = list(self.latest_new.values())
+            final_ids = self.final_new_ids
+        if final_ids is not None:
+            items = [item for item in items if item[1]["id"] in final_ids]
+        return sorted(items, key=lambda item: item[0], reverse=True)
 
     def render(self):
         return render_scan(self)
@@ -957,8 +972,7 @@ def _scan_bar(counts, width, colors):
     return bar
 
 
-def _scan_visible_rows(rows, height):
-    capacity = max(1, height - 12)
+def _scan_visible_rows(rows, capacity):
     active = [i for i, row in enumerate(rows) if row["status"] == "scanning"]
     queued = [i for i, row in enumerate(rows) if row["status"] == "queued"]
     finished = [i for i, row in enumerate(rows) if row["status"] in ("done", "failed")]
@@ -974,38 +988,7 @@ def _scan_visible_rows(rows, height):
         remaining -= min(len(queued), remaining)
         recent = sorted(finished, key=lambda i: rows[i].get("finished_at", 0), reverse=True)
         selected.extend(recent[:remaining])
-    return sorted(selected), hidden_queued
-
-
-def _scan_stats(found, new, local, failed, elapsed, eta, width):
-    from rich.cells import cell_len
-
-    fields = [
-        ("Tracks found", str(found), "#e6e6e6", "found"),
-        ("New", str(new), "#3fb950", "new"),
-        ("Already local", str(local), "#e6e6e6", "local"),
-        ("Failed", str(failed), "#f85149" if failed else "#e6e6e6", "failed"),
-        ("Elapsed", dur(elapsed), "#e6e6e6", "elapsed"),
-        ("ETA", eta, "#e6e6e6", "eta"),
-    ]
-
-    def make_line(active):
-        line = Text(no_wrap=True, overflow="crop")
-        for index, (label, value, color, _) in enumerate(active):
-            if index:
-                line.append("   ", style="#8b8b8b")
-            line.append(label + " ", style="#8b8b8b")
-            line.append(value, style=color)
-        return line
-
-    active = list(fields)
-    line = make_line(active)
-    for name in ("elapsed", "eta"):
-        if cell_len(line.plain) <= width:
-            break
-        active = [field for field in active if field[3] != name]
-        line = make_line(active)
-    return line
+    return selected, hidden_queued
 
 
 def render_scan(state):
@@ -1015,30 +998,43 @@ def render_scan(state):
 
     width, height = console.size.width, console.size.height
     inner_width = max(width - 6, 1)
-    rows, found, new, local, failed = state.counts()
+    rows, _, new, _, failed = state.counts()
     now = time.monotonic()
     elapsed = max(now - state.started, 0)
-    completed = sum(row["status"] in ("done", "failed") for row in rows)
+    successful = sum(row["status"] == "done" for row in rows)
+    completed = successful + failed
     active = sum(row["status"] == "scanning" for row in rows)
     queued = sum(row["status"] == "queued" for row in rows)
+
     header = Table.grid(expand=True, padding=(0, 0))
     header.add_column(ratio=1)
     header.add_column(no_wrap=True, justify="right")
     spinner = Spinner("dots", text=Text("Scanning playlists…", style="#3b9ae1"), style="#3fb950")
-    header.add_row(spinner, Text(f"{completed} / {len(rows)} · {active} scanning at once", style="#8b8b8b"))
-    bar = _scan_bar((completed, active, queued), inner_width,
-                    ("#3fb950", "#ff9f1a", "#333333"))
+    eta = "—"
+    remaining = max(len(rows) - completed, 0)
+    if completed >= 3 or elapsed >= 5:
+        completed_times = [max(row.get("elapsed", 0), 0.01)
+                           for row in rows if row["status"] in ("done", "failed")]
+        average = sum(completed_times) / len(completed_times) if completed_times else elapsed
+        eta = dur(average * remaining)
+    right_header = Text.assemble(
+        (str(completed), "#e6e6e6"), (" / ", "#8b8b8b"),
+        (str(len(rows)), "#e6e6e6"), (" · Elapsed ", "#8b8b8b"),
+        (dur(elapsed), "#e6e6e6"), (" · ETA ", "#8b8b8b"), (eta, "#ff9f1a"))
+    header.add_row(spinner, right_header)
+    failed_rows = failed
+    bar = _scan_bar((successful, failed_rows, active, queued), inner_width,
+                    ("#3fb950", "#f85149", "#ff9f1a", "#333333"))
 
-    visible, hidden_queued = _scan_visible_rows(rows, height)
-    show_time = width > 100
-    show_status = width > 72
+    narrow = width < 100
+    row_capacity = max(1, height - (17 if narrow else 10))
+    visible, hidden_queued = _scan_visible_rows(rows, row_capacity)
+    show_song_columns = width >= 70
     table = Table.grid(expand=True, padding=(0, 1))
     table.add_column(width=2, no_wrap=True)
     table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-    table.add_column(no_wrap=True, justify="right")
-    if show_status:
+    if show_song_columns:
         table.add_column(no_wrap=True, justify="right")
-    if show_time:
         table.add_column(no_wrap=True, justify="right")
     for index in visible:
         row = rows[index]
@@ -1047,55 +1043,89 @@ def render_scan(state):
                 "queued": ("○", "#8b8b8b"), "failed": ("✗", "#f85149")}[status]
         icon_text = Text(icon[0], style=icon[1])
         name_text = Text(row.get("name") or "playlist",
-                         style="#8b8b8b" if status == "queued" else None)
+                         style="#8b8b8b" if not row.get("title_known") or status == "queued" else None)
         count_text = Text()
         status_text = Text()
-        time_text = Text()
         if status == "done":
             count_text.append(f"{len(row['items'])} songs", style="#8b8b8b")
             if row.get("new_count", 0):
-                status_text.append(f"{row['new_count']} new", style="#3fb950")
-            else:
-                status_text.append("up to date", style="#8b8b8b")
-            if row.get("cached"):
-                if show_time:
-                    time_text.append("cached", style="#8b8b8b")
-                else:
-                    status_text.append(" · cached", style="#8b8b8b")
-            else:
-                time_text.append(f"{row.get('elapsed', 0):.1f}s", style="#8b8b8b")
+                status_text.append(f"+{row['new_count']} new", style="#3fb950")
         elif status == "scanning":
-            total = row.get("total")
-            count_text.append(f"{row['read']} / {total}" if total else "fetching…",
-                              style="#ff9f1a")
-            mini = _scan_bar((row["read"], max((total or row["read"] + 1) - row["read"], 0)),
-                             8, ("#ff9f1a", "#333333"))
-            status_text = mini
+            status_text.append("fetching…", style="#ff9f1a")
         elif status == "queued":
             status_text.append("queued", style="#8b8b8b")
         else:
             status_text.append(row.get("error", "unavailable"), style="#f85149")
-            status_text.append(" · retry", style="#8b8b8b")
         cells = [icon_text, name_text, count_text]
-        if show_status:
+        if show_song_columns:
             cells.append(status_text)
-        if show_time:
-            cells.append(time_text)
         table.add_row(*cells)
     if hidden_queued:
         table.add_row("", Text(f"+ {hidden_queued} more queued", style="#8b8b8b"),
                       *([Text("")] * (len(table.columns) - 2)))
 
-    eta = "—"
-    remaining = max(len(rows) - completed, 0)
-    if completed >= 3 or elapsed >= 5:
-        completed_times = [max(row.get("elapsed", 0), 0.01)
-                           for row in rows if row["status"] in ("done", "failed")]
-        average = sum(completed_times) / len(completed_times) if completed_times else elapsed
-        eta = dur(average * remaining)
-    stats = _scan_stats(found, new, local, failed, elapsed, eta, inner_width)
-    divider = Text("━" * inner_width, style="#333333", no_wrap=True, overflow="crop")
-    panel = Panel(Group(header, bar, table, divider, stats), expand=True, padding=(1, 2),
+    with state.lock:
+        library_size = state.library_size
+        final_new_ids = state.final_new_ids
+    new_ids = final_new_ids if final_new_ids is not None else {
+        item["id"] for _, item, _ in state.latest_new_items()}
+    if final_new_ids is not None:
+        playlists_with_new = sum(row.get("new_count", 0) > 0 for row in rows)
+    else:
+        playlists_with_new = sum(any(item["id"] in new_ids for item in row.get("items", []))
+                                 for row in rows)
+    latest = state.latest_new_items()
+    title_capacity = max(0, (row_capacity - 8) if not narrow
+                         else (height - 15 - len(table.rows)))
+    latest_slots = title_capacity
+    if len(latest) > latest_slots and latest_slots:
+        shown_latest = latest[:latest_slots - 1]
+        more_latest = len(latest) - len(shown_latest)
+    else:
+        shown_latest = latest[:latest_slots]
+        more_latest = 0
+
+    sidebar_width = inner_width if narrow else min(28, max(inner_width - 2, 1))
+    sidebar = Table.grid(expand=True, padding=(0, 0))
+    sidebar.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    sidebar.add_row(Text("New songs", style="#8b8b8b"))
+    new_line = Text()
+    new_line.append(str(new), style="bold #3fb950")
+    new_line.append(f" in {playlists_with_new} playlists", style="#8b8b8b")
+    sidebar.add_row(new_line)
+    sidebar.add_row(Text("─" * sidebar_width, style="#333333", no_wrap=True, overflow="crop"))
+    sidebar.add_row(Text("Library after sync", style="#8b8b8b"))
+    projected = library_size + new
+    library_line = Text()
+    library_line.append(str(library_size), style="#8b8b8b")
+    library_line.append(" → ", style="#8b8b8b")
+    library_line.append(str(projected), style="bold #e6e6e6")
+    library_line.append(f" +{new}", style="#3fb950")
+    library_line.append(" songs", style="#8b8b8b")
+    sidebar.add_row(library_line)
+    failed_line = Text()
+    failed_line.append(str(failed), style="bold #f85149" if failed else "#8b8b8b")
+    failed_line.append(" failed", style="#f85149" if failed else "#8b8b8b")
+    sidebar.add_row(failed_line)
+    sidebar.add_row(Text("─" * sidebar_width, style="#333333", no_wrap=True, overflow="crop"))
+    sidebar.add_row(Text("Latest new", style="#8b8b8b"))
+    for _, item, _ in shown_latest:
+        title = Text(item.get("title") or item["id"])
+        title.truncate(max(sidebar_width - 1, 1), overflow="ellipsis")
+        sidebar.add_row(title)
+    if more_latest:
+        sidebar.add_row(Text(f"+{more_latest} more", style="#8b8b8b"))
+
+    if narrow:
+        content = Group(header, bar, table, sidebar)
+    else:
+        columns = Table.grid(expand=True, padding=(0, 0))
+        columns.add_column(ratio=1)
+        columns.add_column(width=1, no_wrap=True)
+        columns.add_column(width=sidebar_width, no_wrap=True)
+        columns.add_row(table, Text("│", style="#333333"), sidebar)
+        content = Group(header, bar, columns)
+    panel = Panel(content, expand=True, padding=(1, 2),
                   border_style="#5a5a5a", box=box.ROUNDED)
     return Group(panel, Text("q cancel scan", style="#8b8b8b"))
 
@@ -1180,8 +1210,11 @@ def _extract_entries(ytdlp, url, row_index, state, stop_event, playlist_limit=No
         total = int(total) if total is not None else None
     except (TypeError, ValueError):
         total = None
-    state.set_status(row_index, "scanning",
-                     name=fsafe(info.get("title") or "playlist"), total=total)
+    title = first_text(info.get("title"), "")
+    if title:
+        state.set_status(row_index, "scanning", name=fsafe(title), title_known=True, total=total)
+    else:
+        state.set_status(row_index, "scanning", total=total)
     items, skipped = [], 0
     for entry in raw_entries:
         if stop_event.is_set():
@@ -1206,12 +1239,14 @@ def scan(cfg, urls):
     cache = jload(cache_path, {})
     if not isinstance(cache, dict):
         cache = {}
-    rows = [{"url": url, "playlist_id": pid, "status": "queued", "name": "playlist",
+    rows = [{"url": url, "playlist_id": pid, "status": "queued",
+             "name": (pid[:13] + ("…" if len(pid) > 13 else "")) if pid else url[:13],
+             "title_known": False,
              "items": [], "read": 0, "total": None, "cached": False, "error": "",
              "elapsed": 0, "new_count": 0}
             for url, pid in playlist_urls]
     local_ids = set(songs) | set(aliases)
-    state = ScanState(rows, local_ids, cache)
+    state = ScanState(rows, local_ids, cache, library_size=len(songs))
     stop_event = threading.Event()
     listener = ScanKeyListener(stop_event)
     thread_local = threading.local()
@@ -1262,8 +1297,10 @@ def scan(cfg, urls):
                               "dur": int(item.get("dur") or 0)} for item in cached_items]
                     name = fsafe(cached.get("name") or probe.get("title") or "playlist")
                     state.progress(index, items, len(items))
-                    state.set_status(index, "done", name=name, items=items, read=len(items),
-                                     total=len(items), cached=True, elapsed=time.monotonic() - started)
+                    new_count = sum(item["id"] not in state.local_ids for item in items)
+                    state.set_status(index, "done", name=name, title_known=True, items=items, read=len(items),
+                                     total=len(items), cached=True, elapsed=time.monotonic() - started,
+                                     new_count=new_count)
                     state.add_bad(int(cached.get("bad", 0)))
                     results[index] = {"playlist": {"name": name, "items": items},
                                       "single": None, "bad": int(cached.get("bad", 0)),
@@ -1274,13 +1311,15 @@ def scan(cfg, urls):
                 ytdlp, row["url"], index, state, stop_event)
             if stop_event.is_set():
                 return None
-            name = fsafe(info.get("title") or (items[0]["title"] if items else "playlist"))
             is_single = info.get("entries") is None
+            name = fsafe(info.get("title") or row["name"])
             if is_single:
                 name = items[0]["title"] if items else name
             elapsed = time.monotonic() - started
-            state.set_status(index, "done", name=name, items=items, read=len(items),
-                             total=len(items), cached=False, elapsed=elapsed)
+            new_count = sum(item["id"] not in state.local_ids for item in items)
+            state.set_status(index, "done", name=name,
+                             title_known=bool(info.get("title") or is_single), items=items, read=len(items),
+                             total=len(items), cached=False, elapsed=elapsed, new_count=new_count)
             if row["playlist_id"]:
                 record = {"ids": [item["id"] for item in items],
                           "count": int(info.get("playlist_count") or info.get("n_entries") or len(items) + skipped),
@@ -1393,13 +1432,14 @@ def scan(cfg, urls):
         else:
             canonical.setdefault(vid, entry)
     todo = [entry for vid, entry in canonical.items() if vid not in songs]
+    todo_ids = {entry["id"] for entry in todo}
     with lib.lock:
         lib.d["aliases"] = aliases
     found = len(canonical)
     new = len(todo)
-    todo_ids = {entry["id"] for entry in todo}
     with state.lock:
         state.final_counts = (found, new, found - new)
+        state.final_new_ids = todo_ids
         for row in state.rows:
             if row["status"] == "done":
                 row["new_count"] = len({canonical_id(item["id"], aliases) for item in row["items"]
@@ -1418,17 +1458,15 @@ def scan(cfg, urls):
 def print_scan_summary(plan):
     from rich.cells import cell_len
 
-    _, found, new, local, failed = plan["scan_state"].counts()
-    details = (f"Scanned {len(plan['scan_state'].rows)} playlists", f"{found} tracks",
-               f"{new} new", f"{local} already local", f"{failed} failed",
-               f"{plan['scan_elapsed']:.1f}s")
+    _, _, new, _, failed = plan["scan_state"].counts()
+    details = (f"Scanned {len(plan['scan_state'].rows)} playlists", f"{new} new",
+               f"{failed} failed", f"{plan['scan_elapsed']:.1f}s")
     separator = " · "
     if cell_len("✓ " + separator.join(details)) > console.size.width:
-        separator = " ·"
+        separator = "·"
     text = Text()
     text.append("✓", style="#3fb950")
     text.append(" " + separator.join(details))
-    console.print()
     console.print(text, no_wrap=True)
 
 
