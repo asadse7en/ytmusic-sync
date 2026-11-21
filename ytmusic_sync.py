@@ -1404,6 +1404,8 @@ def scan(cfg, urls):
         if not result:
             continue
         if result["playlist"]:
+            result["playlist"]["playlist_id"] = (
+                playlist_id(result["url"]) or result["url"])
             pls.append(result["playlist"])
         if result["single"]:
             singles.append(result["single"])
@@ -1687,11 +1689,17 @@ class St:
         self.lock, self.print_lock = threading.RLock(), threading.Lock()
         self.workers = {i: {"active": False} for i in range(jobs)}
         self.failures = []
+        self.track_results = []
+        self.successful_track_ids = set()
+        self.playlist_results = {}
 
-    def start(self, worker_id, index, e, playlist):
+    def start(self, worker_id, index, e, playlist_memberships):
         with self.lock:
+            memberships = dict(playlist_memberships or {})
             self.workers[worker_id] = dict(active=True, index=index, title=e["title"], artist="",
-                                           playlist=playlist, dl=0, total=0, speed=0, stage=0, retry="")
+                                           video_id=e["id"], playlist_memberships=memberships,
+                                           playlist=next(iter(memberships.values()), "Single track"),
+                                           dl=0, total=0, speed=0, stage=0, retry="")
 
     def set_track(self, worker_id, title, artist):
         with self.lock:
@@ -1733,17 +1741,40 @@ class St:
             state = self.workers[worker_id]
             title = state.get("title") or fallback_title
             artist = state.get("artist", "")
+            video_id = state.get("video_id")
+            memberships = state.get("playlist_memberships", {})
             if ok:
                 self.done += 1
                 self.bytes += song_size
+                if video_id:
+                    self.successful_track_ids.add(video_id)
+                result_key = "added"
             elif interrupted:
                 self.interrupted += 1
+                result_key = None
             else:
                 self.fail += 1
                 self.worker_fail += 1
+                result_key = "failed"
+            for playlist_id, playlist_name in memberships.items():
+                result = self.playlist_results.setdefault(
+                    playlist_id, {"name": playlist_name, "added": set(), "failed": set()})
+                if result_key:
+                    result[result_key].add(video_id)
+            self.track_results.append({
+                "video_id": video_id, "playlist_ids": tuple(memberships),
+                "status": "added" if ok else "interrupted" if interrupted else "failed",
+            })
             self.n += 1
             state["active"] = False
             return self.n, title
+
+    def record_skipped(self, video_id, playlist_memberships):
+        with self.lock:
+            memberships = dict(playlist_memberships or {})
+            self.track_results.append({
+                "video_id": video_id, "playlist_ids": tuple(memberships), "status": "skipped",
+            })
 
     def failure_record(self, worker_id, fallback_title, reason, video_id=None):
         with self.lock:
@@ -1754,7 +1785,8 @@ class St:
             if not video_id:
                 match = re.search(r"\[youtube\]\s*([A-Za-z0-9_-]{11})\s*:", str(raw_reason), re.I)
                 video_id = match.group(1) if match else ""
-            self.failures.append((title, artist, raw_reason, video_id))
+            playlist_ids = tuple(state.get("playlist_memberships", {}))
+            self.failures.append((title, artist, raw_reason, video_id, playlist_ids))
             return title, artist, raw_reason
 
     def render(self):
@@ -2280,7 +2312,7 @@ def download_worker(worker_id, work, cfg, out, lib, st, gate, stop_event, failed
                 return
             if not gate.acquire(stop_event):
                 return
-            st.start(worker_id, index, e, playlist_by_id.get(e["id"], "Single track"))
+            st.start(worker_id, index, e, playlist_by_id.get(e["id"], {}))
             t1, ok, song_size, note, cancelled, retries = time.time(), False, 0, "", False, 0
             index_retry = False
             held = True
@@ -2401,9 +2433,22 @@ def cleanup_partial_files(out, lib):
 def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
     global LAST_SYNC_RESULT
     out, lib, todo = plan["out"], plan["lib"], plan["todo"]
+    with lib.lock:
+        before_song_count = len(lib.d["songs"])
+    before_library_size = lib.total_size()
     jobs = max(1, min(6, int(cfg.get("jobs", 3))))
     worker_count = min(jobs, max(1, len(todo)))
     st = St(len(todo), todo, worker_count, initial_failures=len(plan["errs"]))
+    playlist_by_id = {}
+    for playlist in plan["pls"]:
+        playlist_key = playlist.get("playlist_id") or playlist["name"]
+        for item in playlist["items"]:
+            video_id = canonical_id(item["id"], plan["aliases"])
+            playlist_by_id.setdefault(video_id, {})[playlist_key] = playlist["name"]
+    todo_ids = {item["id"] for item in todo}
+    for video_id, memberships in playlist_by_id.items():
+        if video_id not in todo_ids:
+            st.record_skipped(video_id, memberships)
     failed, stopped = list(plan["errs"]), False
     with st.lock:
         st.failures.extend((title, "Unknown", reason) for title, reason in plan["errs"])
@@ -2564,10 +2609,6 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
     if todo:
         if not plain:
             console.clear()
-        playlist_by_id = {}
-        for playlist in plan["pls"]:
-            for item in playlist["items"]:
-                playlist_by_id.setdefault(item["id"], playlist["name"])
         work = queue.Queue()
         for index, e in enumerate(todo):
             work.put((index, e))
@@ -2654,7 +2695,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         songs, aliases = dict(lib.d["songs"]), dict(plan["aliases"])
         lib.d["aliases"] = aliases
         old_playlists = dict(lib.d["playlists"])
-    rows = []
+    playlist_rows = []
     for p in plan["pls"]:
         ids = [e["id"] for e in p["items"]]
         current = {canonical_id(i, aliases) for i in ids}
@@ -2663,11 +2704,24 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
             m3u(out, p["name"], ids, songs, aliases)
         with lib.lock:
             lib.d["playlists"][p["name"]] = ids
-        rows.append((p["name"], sum(1 for i in current if i in songs), len(current - old), len(old - current)))
+        playlist_key = p.get("playlist_id") or p["name"]
+        counts = st.playlist_results.get(
+            playlist_key, {"added": set(), "failed": set()})
+        playlist_rows.append({
+            "playlist_id": playlist_key,
+            "name": p["name"],
+            "songs": len(current),
+            "added": len(counts["added"]),
+            "failed": len(counts["failed"]),
+            "current_ids": current,
+            "old_ids": old,
+        })
 
+    pruned_ids = set()
     if cfg["prune"] and prune_ok and not stopped and not plan["errs"] and console.is_terminal:
         stale = [k for k in songs if k not in plan["unique"]]
         if stale and questionary.confirm(f"Delete {len(stale)} song(s) no longer in any playlist?", default=False).ask():
+            pruned_ids = set(stale)
             with lib.lock:
                 for k in stale:
                     song = lib.d["songs"].pop(k, {})
@@ -2676,6 +2730,8 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
                         (out / filename).unlink(missing_ok=True)
                 lib.d["aliases"] = {k: v for k, v in lib.d["aliases"].items() if v not in stale}
                 songs = dict(lib.d["songs"])
+    for row in playlist_rows:
+        row["removed"] = len((row["old_ids"] - row["current_ids"]) & pruned_ids)
 
     cleanup_partial_files(out, lib)
     (DATA / "inflight.json").unlink(missing_ok=True)
@@ -2693,6 +2749,10 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
         s["bytes"] += downloaded_bytes
         s["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         playlist_count = len(lib.d["playlists"])
+        after_song_count = len(lib.d["songs"])
+        all_time_downloads = s["downloads"]
+        all_time_runs = s["runs"]
+    after_library_size = lib.total_size()
     lib.save()
     ff = DATA / "failed.txt"
     with failed_lock:
@@ -2712,42 +2772,220 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
     else:
         ff.unlink(missing_ok=True)
 
-    summary_label = "Stopped · " if stopped else "Already up to date · " if not todo else "Done · "
-    summary = Text(summary_label,
-                   style="bold #ff9f1a" if stopped else "bold #3fb950")
-    summary.append(f"{downloads} done · {failures} failed · {size(downloaded_bytes)} · {dur(el)}",
-                   style="#ffffff")
-    if stopped:
-        summary.append(f" · Interrupted {interrupted} (will retry on next Update)", style="#8b8b8b")
-    console.print(summary)
-    if rows:
-        t = Table(border_style="#3a3a3a")
-        for c in ("Playlist", "Songs", "Added", "Removed"):
-            t.add_column(c, justify="left" if c == "Playlist" else "right")
-        for n, c, a, r in rows:
-            t.add_row(n, str(c), Text(f"+{a}", style="#22c55e"), Text(f"-{r}", style="#ef4444") if r else "-")
-        console.print(t)
-    if plan["bad"]:
-        console.print(f"[dim]{plan['bad']} private/deleted videos skipped[/]")
     if failed_rows:
-        console.print(f"[dim]Failure details saved to {ff}[/]")
         if sum(1 for _, _, reason in failed_rows if BLOCKED.search(reason)) >= 2:
-            console.print("[yellow]These errors usually mean yt-dlp is outdated.[/]")
             if interactive and console.is_terminal:
+                console.print("[yellow]These errors usually mean yt-dlp is outdated.[/]")
                 if questionary.confirm("Update yt-dlp now?", default=True).ask():
                     upgrade_ytdlp()
             else:
                 console.print("[dim]Run: ytsync --update-ytdlp[/]")
-    console.print(panel_with_title(
-        "Library", border_color="#3a3a3a",
-        body=Text(f"{len(songs)} songs · {size(lib.total_size())} · {playlist_count} playlists\n"
-                  f"All-time: {s['downloads']} downloads · {s['runs']} runs"),
-        padding=(0, 1), expand=None))
-    console.print("[dim]Run again anytime. Only new songs download.[/]")
     if signal_installed:
         signal.signal(signal.SIGINT, old_sigint)
         signal_installed = False
+    show_run_results(
+        cfg, plan, st, playlist_rows, failed_rows, downloaded_bytes, failures, el,
+        before_song_count, before_library_size, after_song_count, after_library_size,
+        playlist_count, all_time_downloads, all_time_runs, interactive)
     return stopped
+
+
+def show_run_results(cfg, plan, st, playlist_rows, failed_rows, downloaded_bytes,
+                     failures, elapsed, before_song_count, before_library_size,
+                     after_song_count, after_library_size, playlist_count,
+                     all_time_downloads, all_time_runs, interactive):
+    from collections import Counter
+    from rich.cells import cell_len
+
+    width = max(console.size.width, 1)
+    inner_width = max(width - 6, 1)
+    show_songs = width >= 70
+    show_removed = bool(cfg.get("prune"))
+    fixed_widths = ([5] if show_songs else []) + [5, 6] + ([7] if show_removed else [])
+    column_count = 1 + len(fixed_widths)
+    playlist_width = max(inner_width - 2 * column_count - sum(fixed_widths), 1)
+
+    table = Table(box=None, expand=True, show_header=False, padding=(0, 1))
+    table.add_column("Playlist", width=playlist_width, ratio=1, no_wrap=True, overflow="ellipsis")
+    column_widths = []
+    if show_songs:
+        column_widths.append(("Songs", 5))
+    column_widths.extend((("Added", 5), ("Failed", 6)))
+    if show_removed:
+        column_widths.append(("Removed", 7))
+    for label, column_width in column_widths:
+        table.add_column(label, width=column_width, justify="right",
+                         no_wrap=True, overflow="crop")
+
+    header = [Text("Playlist", style="#8b8b8b")]
+    if show_songs:
+        header.append(Text("Songs", style="#8b8b8b"))
+    header.extend((Text("Added", style="#8b8b8b"), Text("Failed", style="#8b8b8b")))
+    if show_removed:
+        header.append(Text("Removed", style="#8b8b8b"))
+    table.add_row(*header)
+    divider = [Text("─" * playlist_width, style="#333333")]
+    divider.extend(Text("─" * column_width, style="#333333")
+                   for _, column_width in column_widths)
+    table.add_row(*divider)
+
+    sorted_rows = sorted(
+        playlist_rows,
+        key=lambda row: (-row["added"], -row["failed"], -row["songs"],
+                         row["name"].casefold()))
+    unchanged = [row for row in sorted_rows
+                 if not row["added"] and not row["failed"] and not row.get("removed", 0)]
+    changed = [row for row in sorted_rows if row not in unchanged]
+    duplicate_count = plan.get("duplicate_count", 0)
+    skipped_count = plan.get("bad", 0)
+    extra_info = []
+    if duplicate_count:
+        extra_info.append(f"{duplicate_count} duplicates skipped")
+    if skipped_count:
+        extra_info.append(f"{skipped_count} private/deleted videos skipped")
+    row_budget = max(
+        console.size.height - 12 - (1 if failures else 0) - bool(extra_info), 0)
+    unchanged_line = bool(unchanged and row_budget)
+    changed_budget = max(row_budget - int(unchanged_line), 0)
+    if len(changed) > changed_budget:
+        visible_changed = max(changed_budget - 1, 0)
+    else:
+        visible_changed = len(changed)
+    visible_rows = changed[:visible_changed]
+
+    for row in visible_rows:
+        values = [Text(row["name"], no_wrap=True, overflow="ellipsis")]
+        if show_songs:
+            values.append(Text(str(row["songs"]), style="#8b8b8b"))
+        values.extend((
+            Text(f"+{row['added']}", style="#3fb950") if row["added"]
+            else Text("–", style="#5a5a5a"),
+            Text(str(row["failed"]), style="#f85149") if row["failed"]
+            else Text("–", style="#5a5a5a"),
+        ))
+        if show_removed:
+            values.append(Text(f"-{row.get('removed', 0)}", style="#f85149")
+                          if row.get("removed", 0) else Text("–", style="#5a5a5a"))
+        table.add_row(*values)
+
+    omitted = len(changed) - visible_changed
+    if omitted and changed_budget:
+        values = [Text(f"+ {omitted} more", style="#8b8b8b")]
+        values.extend(Text("") for _ in column_widths)
+        table.add_row(*values)
+    if unchanged_line:
+        values = [Text(f"+ {len(unchanged)} playlists unchanged", style="#8b8b8b")]
+        values.extend(Text("") for _ in column_widths)
+        table.add_row(*values)
+
+    summary = Text()
+    added_count = len(st.successful_track_ids)
+    summary.append(f"{added_count} added", style="bold #3fb950")
+    summary.append(" · ", style="#8b8b8b")
+    summary.append(f"{failures} failed" if failures else "0 failed",
+                   style="bold #f85149" if failures else "#8b8b8b")
+    summary.append(" · ", style="#8b8b8b")
+    summary.append(size(downloaded_bytes), style="#e6e6e6")
+    summary.append(" · ", style="#8b8b8b")
+    summary.append(dur(elapsed), style="#e6e6e6")
+    summary.no_wrap = True
+    summary.overflow = "ellipsis"
+    if cell_len(summary.plain) > inner_width:
+        summary.truncate(inner_width, overflow="ellipsis")
+
+    divider_line = Text("─" * inner_width, style="#333333",
+                        no_wrap=True, overflow="crop")
+    library_line = Text()
+    song_delta = after_song_count - before_song_count
+    library_line.append("Library  ", style="#8b8b8b")
+    library_line.append(str(before_song_count), style="#8b8b8b")
+    library_line.append(" → ", style="#8b8b8b")
+    library_line.append(str(after_song_count), style="bold #e6e6e6")
+    library_line.append(" songs ", style="#8b8b8b")
+    if song_delta > 0:
+        library_line.append(f"+{song_delta}", style="#3fb950")
+    elif song_delta < 0:
+        library_line.append(str(song_delta), style="#f85149")
+    else:
+        library_line.append("0", style="#8b8b8b")
+    library_line.append(" · ", style="#8b8b8b")
+    before_size_text = size(before_library_size)
+    after_size_text = size(after_library_size)
+    before_size_parts = before_size_text.rsplit(" ", 1)
+    after_size_parts = after_size_text.rsplit(" ", 1)
+    if len(before_size_parts) == 2 and len(after_size_parts) == 2 \
+            and before_size_parts[1] == after_size_parts[1]:
+        before_size_text = before_size_parts[0]
+    library_line.append(before_size_text, style="#8b8b8b")
+    library_line.append(" → ", style="#8b8b8b")
+    library_line.append(after_size_text, style="bold #e6e6e6")
+    library_line.append(" · ", style="#8b8b8b")
+    library_line.append(str(playlist_count), style="#e6e6e6")
+    library_line.append(" playlists", style="#8b8b8b")
+    library_line.no_wrap = True
+    library_line.overflow = "ellipsis"
+    if cell_len(library_line.plain) > inner_width:
+        library_line.truncate(inner_width, overflow="ellipsis")
+
+    all_time_line = Text.assemble(
+        ("All-time  ", "#8b8b8b"), (str(all_time_downloads), "#e6e6e6"),
+        (" downloads · ", "#8b8b8b"), (str(all_time_runs), "#e6e6e6"),
+        (" runs", "#8b8b8b"), no_wrap=True, overflow="ellipsis")
+    if cell_len(all_time_line.plain) > inner_width:
+        all_time_line.truncate(inner_width, overflow="ellipsis")
+
+    failure_line = None
+    if failures:
+        failure_line = Text(f"✗ {failures} failed", style="bold #f85149")
+        reason_counts = Counter(
+            short_failure_reason(reason) for _, _, reason in failed_rows
+            if short_failure_reason(reason))
+        common = reason_counts.most_common(1)
+        if common:
+            label, count = common[0]
+            failure_line.append(f" · most common: {label} ×{count}", style="#8b8b8b")
+        path_intro = " · details saved to "
+        path = str(DATA / "failed.txt")
+        path_budget = max(
+            inner_width - cell_len(failure_line.plain) - cell_len(path_intro) - 1, 1)
+        short_path = _middle_truncate(path, path_budget)
+        failure_line.append(path_intro, style="#8b8b8b")
+        failure_line.append(short_path, style="#6b6b6b")
+        failure_line.no_wrap = True
+        failure_line.overflow = "ellipsis"
+        if cell_len(failure_line.plain) > inner_width:
+            failure_line.truncate(inner_width, overflow="ellipsis")
+
+    note = Text("Run again anytime. Only new songs download.", style="#5a5a5a")
+    if failures:
+        note.append(" · f not needed here", style="#5a5a5a")
+    note.no_wrap = True
+    note.overflow = "ellipsis"
+    if cell_len(note.plain) > inner_width:
+        note.truncate(inner_width, overflow="ellipsis")
+
+    body = [summary, table, divider_line, library_line, all_time_line]
+    if extra_info:
+        info_line = Text(" · ".join(extra_info), style="#8b8b8b",
+                         no_wrap=True, overflow="ellipsis")
+        if cell_len(info_line.plain) > inner_width:
+            info_line.truncate(inner_width, overflow="ellipsis")
+        body.insert(-1, info_line)
+    if failure_line is not None:
+        body.append(failure_line)
+    body.append(note)
+    panel = panel_with_title("Done", "Update library", "#5a5a5a",
+                             Group(*body), padding=(1, 2))
+    if interactive and console.is_terminal:
+        console.clear()
+    console.print(Group(panel, footer_hint("enter back")))
+    if interactive and console.is_terminal:
+        try:
+            with TerminalKeyReader() as reader:
+                while reader.read_key() not in ("enter", "escape", "ctrl_c"):
+                    pass
+        except KeyboardInterrupt:
+            return
 
 
 def show_stats(cfg, wait_for_key=False):
@@ -3820,9 +4058,7 @@ def run_flow(cfg, with_review, extra_urls=None):
                 console.print(f"[bold]{len(plan['todo'])} new[/] · "
                               f"{len(plan['unique']) - len(plan['todo'])} in library\n")
             if choice == "start":
-                stopped = execute(cfg, plan, interactive=True, prune_ok=True)
-                if not stopped:
-                    pause()
+                execute(cfg, plan, interactive=True, prune_ok=True)
                 return "home"
             if choice == "edit":
                 cfg = settings(cfg)
