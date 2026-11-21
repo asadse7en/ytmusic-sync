@@ -511,9 +511,11 @@ def need_ffmpeg():
             return True
     except Exception as e:
         logging.debug("imageio-ffmpeg failed: %s", e)
-    console.print(Panel("ffmpeg not found and the bundled copy is unavailable.\n  Windows: winget install ffmpeg\n"
-                        "  macOS:   brew install ffmpeg\n  Linux:   sudo apt install ffmpeg",
-                        title="[red]Missing ffmpeg", border_style="red"))
+    console.print(panel_with_title(
+        "Missing ffmpeg", border_color="red",
+        body=Text("ffmpeg not found and the bundled copy is unavailable.\n  Windows: winget install ffmpeg\n"
+                  "  macOS:   brew install ffmpeg\n  Linux:   sudo apt install ffmpeg"),
+        padding=(0, 1), expand=None))
     return False
 
 
@@ -2736,9 +2738,11 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
                     upgrade_ytdlp()
             else:
                 console.print("[dim]Run: ytsync --update-ytdlp[/]")
-    console.print(Panel(f"{len(songs)} songs · {size(lib.total_size())} · {playlist_count} playlists\n"
-                        f"All-time: {s['downloads']} downloads · {s['runs']} runs", title="Library",
-                        border_style="#3a3a3a"))
+    console.print(panel_with_title(
+        "Library", border_color="#3a3a3a",
+        body=Text(f"{len(songs)} songs · {size(lib.total_size())} · {playlist_count} playlists\n"
+                  f"All-time: {s['downloads']} downloads · {s['runs']} runs"),
+        padding=(0, 1), expand=None))
     console.print("[dim]Run again anytime. Only new songs download.[/]")
     if signal_installed:
         signal.signal(signal.SIGINT, old_sigint)
@@ -2862,7 +2866,7 @@ def show_stats(cfg, wait_for_key=False):
         last_line.truncate(inner_width, overflow="crop")
     body.append(last_line)
     panel = panel_with_title("♪ Stats", "Library overview", "#f5a623",
-                             Group(*body), title_color="#f5a623")
+                             Group(*body), name_color="#f5a623")
     if wait_for_key:
         console.clear()
     console.print(Group(panel, footer_hint("enter or esc back")))
@@ -2885,14 +2889,36 @@ def ask(msg, choices):
 
 
 def panel_with_title(title, subtitle=None, border_color="#5a5a5a", body=None,
-                     title_color="#ff9f1a", padding=(1, 2),
-                     subtitle_color="#8b8b8b"):
+                     name_color="#ff9f1a", subtitle_color="#8b8b8b",
+                     padding=(1, 2), expand=True):
     from rich import box
-    title_text = Text(title, style=f"bold {title_color}") if title else None
-    if title_text is not None and subtitle:
-        title_text.append(f"  {subtitle}", style=subtitle_color)
-    return Panel(body if body is not None else Text(""), title=title_text,
-                 border_style=border_color, box=box.ROUNDED, padding=padding, expand=True)
+    from rich.cells import cell_len
+    from rich.style import Style
+
+    max_title_width = max(console.size.width - 6, 1)
+    name = str(title or "")
+    dim = str(subtitle or "")
+    if dim:
+        dim_width = max(max_title_width - cell_len(name) - 2, 1)
+        if cell_len(dim) > dim_width:
+            dim = truncate_display(dim, dim_width).plain
+    name_width = max(max_title_width - (cell_len(dim) + 2 if dim else 0), 0)
+    if cell_len(name) > name_width:
+        name = truncate_display(name, name_width).plain if name_width else ""
+
+    spans = [(name, Style(color=name_color, bold=True))]
+    if dim:
+        spans.extend((
+            ("  ", Style(color=subtitle_color, bold=False)),
+            (dim, Style(color=subtitle_color, bold=False)),
+        ))
+    title_text = Text.assemble(*spans)
+    title_text.no_wrap = True
+    title_text.overflow = "crop"
+    panel_title = title_text if name or dim else None
+    return Panel(body if body is not None else Text(""), title=panel_title,
+                 title_align="left", border_style=border_color, box=box.ROUNDED,
+                 padding=padding, expand=expand)
 
 
 def footer_hint(text):
@@ -3010,7 +3036,8 @@ def _selector_row(label, badge, badge_style, selected, width, label_width=None):
 def select_menu(items, title=None, subtitle=None, border_color="#5a5a5a",
                 footer="↑↓ move · enter select · esc back", on_adjust=None,
                 extra_content=None, label_width=None, blank_before=False,
-                on_enter=None, selected_badge_brackets=False):
+                on_enter=None, selected_badge_brackets=False,
+                title_name_color="#ff9f1a", title_subtitle_color="#8b8b8b"):
     def get_items():
         return list(items() if callable(items) else items)
 
@@ -3039,7 +3066,9 @@ def select_menu(items, title=None, subtitle=None, border_color="#5a5a5a",
                 rows.append(extra)
         body = Group(*rows)
         if title:
-            body = panel_with_title(title, subtitle, border_color, body)
+            body = panel_with_title(title, subtitle, border_color, body,
+                                    name_color=title_name_color,
+                                    subtitle_color=title_subtitle_color)
         return Group(body, footer_hint(footer))
 
     try:
@@ -3703,7 +3732,8 @@ def settings(cfg):
                 get_rows, title="Settings", subtitle=f"Data: {DATA}",
                 footer="↑↓ move · ←→ change value · enter edit · esc back",
                 on_adjust=adjust, extra_content=extra_content, label_width=27,
-                on_enter=enter_setting, selected_badge_brackets=True)
+                on_enter=enter_setting, selected_badge_brackets=True,
+                title_subtitle_color="#6b6b6b")
         except Exception as e:
             menu_error(e)
             continue
@@ -3756,7 +3786,8 @@ def review(cfg, plan):
         t.add_row("Problems", Text(f"{len(plan['errs'])} link(s) failed to load", style="#ef4444"))
     t.add_row("Duration", dur(total_duration))
     t.add_row("Estimate", f"~{size(estimated_bytes)}")
-    console.print(Panel(t, title="Ready", border_style="#22c55e", expand=False))
+    console.print(panel_with_title("Ready", border_color="#22c55e", body=t,
+                                   padding=(0, 1), expand=False))
     per_playlist = Table(title="Playlist counts", border_style="#3a3a3a")
     for column in ("Playlist", "Entries", "Unique songs", "Repeats", "Same-song skipped"):
         per_playlist.add_column(column, justify="left" if column == "Playlist" else "right")
@@ -3874,7 +3905,7 @@ def header(cfg, upd):
         line_two,
     ]
     panel = panel_with_title("♪ ytmusic-sync", f"v{VERSION}", "#f5a623",
-                             Group(*body), title_color="#f5a623")
+                             Group(*body), name_color="#f5a623")
     console.print(panel)
     return lib
 
