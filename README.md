@@ -75,7 +75,7 @@ In **Add Music > Paste links**, playlist links can be added to `Playlists.txt`; 
 | `ytsync --where` | Print the data folder and music library folder |
 | `ytsync --timing` | Print startup step timings |
 | `ytsync --update-ytdlp` | Upgrade yt-dlp |
-| `ytsync --demo` | Preview the 64-track progress dashboard with simulated downloads |
+| `ytsync --demo` | Preview the live playlist scan with simulated playlists |
 
 Options (flags apply to that run only; change defaults in Settings):
 
@@ -117,8 +117,9 @@ All app data is in one hidden folder in your home directory:
 - macOS: `~/.ytmusic-sync`
 - Linux: `~/.ytmusic-sync`
 
-It contains `config.json`, `playlists.txt`, `failed.txt`, `sync.log`, `cache.json`, and separate JSON library
-databases at `libs/<hash>.json` for each music folder. The music folder contains only songs and `.m3u8` files.
+It contains `config.json`, `playlists.txt`, `failed.txt`, `sync.log`, `cache.json`,
+`playlist-scan-cache.json`, and per-library JSON databases at `libs/<hash>.json`. The music folder contains
+only songs and `.m3u8` files.
 Run `ytsync --where` to print both the data folder and music folder. Use `-o FOLDER` or Settings > Library folder
 to switch libraries.
 

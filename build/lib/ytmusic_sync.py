@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """ytmusic-sync: YouTube playlists -> clean, tagged music library + .m3u8 playlists."""
 import argparse, contextlib, hashlib, json, logging, os, queue, re, shutil, subprocess, sys, threading, time, urllib.request
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 import unicodedata
 import signal
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 for _s in (sys.stdout, sys.stderr):
     with contextlib.suppress(Exception):
@@ -23,6 +23,8 @@ UPDATE_CHECKER = None
 _YT_DLP = None
 _POSTPROCESSOR_TYPES = None
 _ANSI_ENABLED = False
+SCAN_WORKERS = 5
+SCAN_CACHE = "playlist-scan-cache.json"
 
 FORMATS = ["mp3", "m4a", "opus", "flac", "wav", "aac"]
 QUALITIES = ["best", "320", "256", "192", "128"]
@@ -831,14 +833,530 @@ def canonical_id(vid, aliases):
     return vid
 
 
+def playlist_id(url):
+    query = parse_qs(urlparse(url).query)
+    return first_text(query.get("list"), "")
+
+
+def canonical_playlist_url(url):
+    url = normalize_music_url(url)
+    pid = playlist_id(url)
+    return f"https://www.youtube.com/playlist?{urlencode({'list': pid})}" if pid else url
+
+
+def dedupe_scan_urls(urls):
+    result, seen = [], set()
+    for url in urls:
+        normalized = canonical_playlist_url(url)
+        pid = playlist_id(normalized)
+        key = ("playlist", pid) if pid else ("url", normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((normalized, pid))
+    return result
+
+
+class ScanCancelled(Exception):
+    pass
+
+
+class ScanState:
+    def __init__(self, rows, local_ids, cache):
+        self.lock = threading.Lock()
+        self.rows = rows
+        self.local_ids = local_ids
+        self.cache = cache
+        self.errors = []
+        self.bad = 0
+        self.started = time.monotonic()
+        self.final_counts = None
+
+    def set_status(self, index, status, **values):
+        with self.lock:
+            row = self.rows[index]
+            row["status"] = status
+            row.update(values)
+            if status in ("done", "failed"):
+                row["finished_at"] = time.monotonic()
+
+    def start(self, index):
+        self.set_status(index, "scanning", started=time.monotonic())
+
+    def progress(self, index, items, total):
+        with self.lock:
+            row = self.rows[index]
+            row["items"] = list(items)
+            row["read"] = len(items)
+            row["total"] = total
+
+    def fail(self, index, url, reason, elapsed):
+        with self.lock:
+            row = self.rows[index]
+            row.update(status="failed", error=reason, elapsed=elapsed,
+                       finished_at=time.monotonic())
+            self.errors.append((url[:50], reason))
+
+    def add_bad(self, count):
+        with self.lock:
+            self.bad += count
+
+    def counts(self):
+        with self.lock:
+            rows = [dict(row) for row in self.rows]
+            final_counts = self.final_counts
+            local_ids = self.local_ids
+        found_ids = {item["id"] for row in rows for item in row.get("items", [])}
+        found = len(found_ids)
+        local = len(found_ids & local_ids)
+        new = found - local
+        if final_counts is not None:
+            found, new, local = final_counts
+        return rows, found, new, local, sum(row["status"] == "failed" for row in rows)
+
+    def render(self):
+        return render_scan(self)
+
+
+def _playlist_error(reason):
+    value = str(reason or "").lower()
+    if "private" in value or "members-only" in value:
+        return "private"
+    if "timeout" in value or "timed out" in value:
+        return "timeout"
+    if any(token in value for token in ("unavailable", "deleted", "not found", "http error 403")):
+        return "unavailable"
+    return short_failure_reason(reason).lower()[:24] or "unavailable"
+
+
+def _proportional_widths(counts, width):
+    if width <= 0:
+        return [0] * len(counts)
+    total = sum(max(count, 0) for count in counts)
+    if not total:
+        return [0] * len(counts)
+    raw = [max(count, 0) * width / total for count in counts]
+    widths = [int(value) for value in raw]
+    remainder = width - sum(widths)
+    for index in sorted(range(len(widths)), key=lambda i: raw[i] - widths[i], reverse=True)[:remainder]:
+        widths[index] += 1
+    for index, count in enumerate(counts):
+        if count > 0 and widths[index] == 0:
+            donor = max((i for i, size_ in enumerate(widths) if size_ > 1),
+                        key=lambda i: widths[i], default=None)
+            if donor is not None:
+                widths[donor] -= 1
+                widths[index] = 1
+    return widths
+
+
+def _scan_bar(counts, width, colors):
+    bar = Text()
+    for size_, color in zip(_proportional_widths(counts, width), colors):
+        bar.append("━" * size_, style=color)
+    return bar
+
+
+def _scan_visible_rows(rows, height):
+    capacity = max(1, height - 12)
+    active = [i for i, row in enumerate(rows) if row["status"] == "scanning"]
+    queued = [i for i, row in enumerate(rows) if row["status"] == "queued"]
+    finished = [i for i, row in enumerate(rows) if row["status"] in ("done", "failed")]
+    selected = list(active[:capacity])
+    remaining = max(capacity - len(selected), 0)
+    hidden_queued = 0
+    if len(queued) > remaining and remaining:
+        take = max(remaining - 1, 0)
+        selected.extend(queued[:take])
+        hidden_queued = len(queued) - take
+    else:
+        selected.extend(queued[:remaining])
+        remaining -= min(len(queued), remaining)
+        recent = sorted(finished, key=lambda i: rows[i].get("finished_at", 0), reverse=True)
+        selected.extend(recent[:remaining])
+    return sorted(selected), hidden_queued
+
+
+def _scan_stats(found, new, local, failed, elapsed, eta, width):
+    from rich.cells import cell_len
+
+    fields = [
+        ("Tracks found", str(found), "#e6e6e6", "found"),
+        ("New", str(new), "#3fb950", "new"),
+        ("Already local", str(local), "#e6e6e6", "local"),
+        ("Failed", str(failed), "#f85149" if failed else "#e6e6e6", "failed"),
+        ("Elapsed", dur(elapsed), "#e6e6e6", "elapsed"),
+        ("ETA", eta, "#e6e6e6", "eta"),
+    ]
+
+    def make_line(active):
+        line = Text(no_wrap=True, overflow="crop")
+        for index, (label, value, color, _) in enumerate(active):
+            if index:
+                line.append("   ", style="#8b8b8b")
+            line.append(label + " ", style="#8b8b8b")
+            line.append(value, style=color)
+        return line
+
+    active = list(fields)
+    line = make_line(active)
+    for name in ("elapsed", "eta"):
+        if cell_len(line.plain) <= width:
+            break
+        active = [field for field in active if field[3] != name]
+        line = make_line(active)
+    return line
+
+
+def render_scan(state):
+    from rich import box
+    from rich.console import Group
+    from rich.spinner import Spinner
+
+    width, height = console.size.width, console.size.height
+    inner_width = max(width - 6, 1)
+    rows, found, new, local, failed = state.counts()
+    now = time.monotonic()
+    elapsed = max(now - state.started, 0)
+    completed = sum(row["status"] in ("done", "failed") for row in rows)
+    active = sum(row["status"] == "scanning" for row in rows)
+    queued = sum(row["status"] == "queued" for row in rows)
+    header = Table.grid(expand=True, padding=(0, 0))
+    header.add_column(ratio=1)
+    header.add_column(no_wrap=True, justify="right")
+    spinner = Spinner("dots", text=Text("Scanning playlists…", style="#3b9ae1"), style="#3fb950")
+    header.add_row(spinner, Text(f"{completed} / {len(rows)} · {active} scanning at once", style="#8b8b8b"))
+    bar = _scan_bar((completed, active, queued), inner_width,
+                    ("#3fb950", "#ff9f1a", "#333333"))
+
+    visible, hidden_queued = _scan_visible_rows(rows, height)
+    show_time = width > 100
+    show_status = width > 72
+    table = Table.grid(expand=True, padding=(0, 1))
+    table.add_column(width=2, no_wrap=True)
+    table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column(no_wrap=True, justify="right")
+    if show_status:
+        table.add_column(no_wrap=True, justify="right")
+    if show_time:
+        table.add_column(no_wrap=True, justify="right")
+    for index in visible:
+        row = rows[index]
+        status = row["status"]
+        icon = {"done": ("✓", "#3fb950"), "scanning": ("●", "#ff9f1a"),
+                "queued": ("○", "#8b8b8b"), "failed": ("✗", "#f85149")}[status]
+        icon_text = Text(icon[0], style=icon[1])
+        name_text = Text(row.get("name") or "playlist",
+                         style="#8b8b8b" if status == "queued" else None)
+        count_text = Text()
+        status_text = Text()
+        time_text = Text()
+        if status == "done":
+            count_text.append(f"{len(row['items'])} songs", style="#8b8b8b")
+            if row.get("new_count", 0):
+                status_text.append(f"{row['new_count']} new", style="#3fb950")
+            else:
+                status_text.append("up to date", style="#8b8b8b")
+            if row.get("cached"):
+                if show_time:
+                    time_text.append("cached", style="#8b8b8b")
+                else:
+                    status_text.append(" · cached", style="#8b8b8b")
+            else:
+                time_text.append(f"{row.get('elapsed', 0):.1f}s", style="#8b8b8b")
+        elif status == "scanning":
+            total = row.get("total")
+            count_text.append(f"{row['read']} / {total}" if total else "fetching…",
+                              style="#ff9f1a")
+            mini = _scan_bar((row["read"], max((total or row["read"] + 1) - row["read"], 0)),
+                             8, ("#ff9f1a", "#333333"))
+            status_text = mini
+        elif status == "queued":
+            status_text.append("queued", style="#8b8b8b")
+        else:
+            status_text.append(row.get("error", "unavailable"), style="#f85149")
+            status_text.append(" · retry", style="#8b8b8b")
+        cells = [icon_text, name_text, count_text]
+        if show_status:
+            cells.append(status_text)
+        if show_time:
+            cells.append(time_text)
+        table.add_row(*cells)
+    if hidden_queued:
+        table.add_row("", Text(f"+ {hidden_queued} more queued", style="#8b8b8b"),
+                      *([Text("")] * (len(table.columns) - 2)))
+
+    eta = "—"
+    remaining = max(len(rows) - completed, 0)
+    if completed >= 3 or elapsed >= 5:
+        completed_times = [max(row.get("elapsed", 0), 0.01)
+                           for row in rows if row["status"] in ("done", "failed")]
+        average = sum(completed_times) / len(completed_times) if completed_times else elapsed
+        eta = dur(average * remaining)
+    stats = _scan_stats(found, new, local, failed, elapsed, eta, inner_width)
+    divider = Text("━" * inner_width, style="#333333", no_wrap=True, overflow="crop")
+    panel = Panel(Group(header, bar, table, divider, stats), expand=True, padding=(1, 2),
+                  border_style="#5a5a5a", box=box.ROUNDED)
+    return Group(panel, Text("q cancel scan", style="#8b8b8b"))
+
+
+class ScanKeyListener:
+    def __init__(self, stop_event):
+        self.stop_event = stop_event
+        self.done = threading.Event()
+        self.thread = None
+        self.old_terminal = None
+
+    def start(self):
+        if sys.stdin.isatty():
+            self.thread = threading.Thread(target=self._run, name="playlist-scan-keys", daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        self.done.set()
+        if self.thread:
+            self.thread.join(timeout=0.25)
+
+    def _run(self):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                while not self.done.is_set() and not self.stop_event.is_set():
+                    if not msvcrt.kbhit():
+                        time.sleep(0.05)
+                        continue
+                    key = msvcrt.getwch()
+                    if key.lower() == "q" or key == "\x03":
+                        self.stop_event.set()
+                        return
+            else:
+                import select
+                import termios
+                import tty
+                fd = sys.stdin.fileno()
+                self.old_terminal = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+                while not self.done.is_set() and not self.stop_event.is_set():
+                    ready, _, _ = select.select([fd], [], [], 0.1)
+                    if ready:
+                        key = os.read(fd, 1)
+                        if key.lower() == b"q" or key == b"\x03":
+                            self.stop_event.set()
+                            return
+        finally:
+            if self.old_terminal is not None:
+                import termios
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.old_terminal)
+                self.old_terminal = None
+
+
+def _flat_item(entry):
+    if not entry or not entry.get("id"):
+        return None
+    title = first_text(entry.get("title"), entry["id"])
+    if title in ("[Private video]", "[Deleted video]"):
+        return None
+    return {"id": entry["id"], "title": title, "dur": int(entry.get("duration") or 0)}
+
+
+def _extract_entries(ytdlp, url, row_index, state, stop_event, playlist_limit=None):
+    if playlist_limit is not None:
+        ytdlp.params["playlist_items"] = str(playlist_limit)
+    else:
+        ytdlp.params.pop("playlist_items", None)
+    try:
+        info = ytdlp.extract_info(url, download=False)
+    finally:
+        ytdlp.params.pop("playlist_items", None)
+    if not info:
+        raise ValueError("No playlist or song information found")
+    raw_entries = info.get("entries")
+    if raw_entries is None:
+        item = _flat_item(info)
+        return info, ([item] if item else []), 0
+
+    total = info.get("playlist_count") or info.get("n_entries")
+    try:
+        total = int(total) if total is not None else None
+    except (TypeError, ValueError):
+        total = None
+    state.set_status(row_index, "scanning",
+                     name=fsafe(info.get("title") or "playlist"), total=total)
+    items, skipped = [], 0
+    for entry in raw_entries:
+        if stop_event.is_set():
+            break
+        item = _flat_item(entry)
+        if item:
+            items.append(item)
+        else:
+            skipped += 1
+        state.progress(row_index, items, total)
+    return info, items, skipped
+
+
 def scan(cfg, urls):
     out = Path(cfg["out"])
-    lib, errs = get_lib(out), []
-    pls, singles, bad = resolve(urls, cfg, errs)
-    entries = [x for p in pls for x in p["items"]] + singles
+    lib = get_lib(out)
+    playlist_urls = dedupe_scan_urls(urls)
+    with lib.lock:
+        songs = dict(lib.d["songs"])
+        aliases = dict(lib.d["aliases"])
+    cache_path = DATA / SCAN_CACHE
+    cache = jload(cache_path, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    rows = [{"url": url, "playlist_id": pid, "status": "queued", "name": "playlist",
+             "items": [], "read": 0, "total": None, "cached": False, "error": "",
+             "elapsed": 0, "new_count": 0}
+            for url, pid in playlist_urls]
+    local_ids = set(songs) | set(aliases)
+    state = ScanState(rows, local_ids, cache)
+    stop_event = threading.Event()
+    listener = ScanKeyListener(stop_event)
+    thread_local = threading.local()
+    ytdlp_instances, ytdlp_lock = [], threading.Lock()
+    results = [None] * len(rows)
+
+    def worker_ytdlp():
+        if not hasattr(thread_local, "ytdlp"):
+            options = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist",
+                       "skip_download": True, "socket_timeout": 10, "retries": 2,
+                       "lazy_playlist": True, "logger": Quiet()}
+            if cfg.get("cookies"):
+                options["cookiesfrombrowser"] = (cfg["cookies"],)
+            thread_local.ytdlp = get_ytdlp().YoutubeDL(options)
+            with ytdlp_lock:
+                ytdlp_instances.append(thread_local.ytdlp)
+        return thread_local.ytdlp
+
+    def scan_one(index):
+        if stop_event.is_set():
+            return None
+        row = rows[index]
+        state.start(index)
+        started = time.monotonic()
+        try:
+            ytdlp = worker_ytdlp()
+            pid = row["playlist_id"]
+            if pid:
+                probe, first_items = _extract_entries(
+                    ytdlp, row["url"], index, state, stop_event, playlist_limit=1)[:2]
+                if stop_event.is_set():
+                    return None
+                probe_count = probe.get("playlist_count") or probe.get("n_entries")
+                cached = state.cache.get(pid)
+                first_id = first_items[0]["id"] if first_items else None
+                cache_time = cached.get("scanned_at", 0) if isinstance(cached, dict) else 0
+                cache_count = cached.get("count") if isinstance(cached, dict) else None
+                cache_ids = cached.get("ids", []) if isinstance(cached, dict) else []
+                fresh = isinstance(cache_time, (int, float)) and time.time() - cache_time < 86400
+                try:
+                    same_count = int(probe_count) == int(cache_count)
+                except (TypeError, ValueError):
+                    same_count = False
+                if fresh and same_count and first_id and cache_ids and first_id == cache_ids[0]:
+                    cached_items = cached.get("items") or [
+                        {"id": vid, "title": vid, "dur": 0} for vid in cache_ids]
+                    items = [{"id": item["id"], "title": item.get("title") or item["id"],
+                              "dur": int(item.get("dur") or 0)} for item in cached_items]
+                    name = fsafe(cached.get("name") or probe.get("title") or "playlist")
+                    state.progress(index, items, len(items))
+                    state.set_status(index, "done", name=name, items=items, read=len(items),
+                                     total=len(items), cached=True, elapsed=time.monotonic() - started)
+                    state.add_bad(int(cached.get("bad", 0)))
+                    results[index] = {"playlist": {"name": name, "items": items},
+                                      "single": None, "bad": int(cached.get("bad", 0)),
+                                      "url": row["url"], "cached": True}
+                    return results[index]
+
+            info, items, skipped = _extract_entries(
+                ytdlp, row["url"], index, state, stop_event)
+            if stop_event.is_set():
+                return None
+            name = fsafe(info.get("title") or (items[0]["title"] if items else "playlist"))
+            is_single = info.get("entries") is None
+            if is_single:
+                name = items[0]["title"] if items else name
+            elapsed = time.monotonic() - started
+            state.set_status(index, "done", name=name, items=items, read=len(items),
+                             total=len(items), cached=False, elapsed=elapsed)
+            if row["playlist_id"]:
+                record = {"ids": [item["id"] for item in items],
+                          "count": int(info.get("playlist_count") or info.get("n_entries") or len(items) + skipped),
+                          "scanned_at": time.time(), "name": name, "items": items, "bad": skipped}
+                with state.lock:
+                    state.cache[row["playlist_id"]] = record
+                    try:
+                        ensure_data_dir()
+                        aw(cache_path, json.dumps(state.cache, ensure_ascii=False))
+                    except OSError as exc:
+                        logging.warning("Could not save playlist scan cache: %s", exc)
+            state.add_bad(skipped)
+            result = {"playlist": None if is_single else {"name": name, "items": items},
+                      "single": items[0] if is_single and items else None, "bad": skipped,
+                      "url": row["url"], "cached": False}
+            results[index] = result
+            return result
+        except Exception as exc:
+            if stop_event.is_set():
+                return None
+            reason = _playlist_error(exc)
+            state.fail(index, row["url"], reason, time.monotonic() - started)
+            return None
+
+    executor = ThreadPoolExecutor(max_workers=SCAN_WORKERS, thread_name_prefix="playlist-scan")
+    futures = []
+    cancelled = False
+    try:
+        with Live(get_renderable=state.render, console=console, refresh_per_second=8,
+                  transient=False, vertical_overflow="crop"):
+            listener.start()
+            futures = [executor.submit(scan_one, index) for index in range(len(rows))]
+            pending = set(futures)
+            while pending:
+                if stop_event.is_set():
+                    cancelled = True
+                    for future in pending:
+                        future.cancel()
+                    break
+                completed, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    if not future.cancelled():
+                        future.result()
+    except KeyboardInterrupt:
+        cancelled = True
+        stop_event.set()
+        for future in futures:
+            future.cancel()
+    finally:
+        listener.stop()
+        if cancelled:
+            for future in futures:
+                future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        for ytdlp in ytdlp_instances:
+            close = getattr(ytdlp, "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    logging.exception("Could not close a playlist scan worker")
+    if cancelled:
+        raise ScanCancelled()
+
+    pls, singles = [], []
+    for result in results:
+        if not result:
+            continue
+        if result["playlist"]:
+            pls.append(result["playlist"])
+        if result["single"]:
+            singles.append(result["single"])
+    entries = [item for playlist in pls for item in playlist["items"]] + singles
     want = {}
-    for e in entries:
-        want.setdefault(e["id"], e)
+    for entry in entries:
+        want.setdefault(entry["id"], entry)
 
     with lib.lock:
         songs = dict(lib.d["songs"])
@@ -851,47 +1369,71 @@ def scan(cfg, urls):
 
     unique = {}
     skip_dupes = cfg.get("skip_duplicate_songs", True)
-    for vid, e in want.items():
+    for vid, entry in want.items():
         if vid in aliases:
             continue
-        key, seconds = song_key(e.get("title", "")), int(e.get("dur") or 0)
+        key, seconds = song_key(entry.get("title", "")), int(entry.get("dur") or 0)
         match = next((kept for old_seconds, kept in titles.get(key, [])
                       if skip_dupes and key and seconds > 0 and kept != vid and abs(seconds - old_seconds) <= 3), None)
         if match:
             aliases[vid] = match
             continue
-        unique[vid] = e
+        unique[vid] = entry
         if key and seconds > 0:
             titles.setdefault(key, []).append((seconds, vid))
 
     canonical = {}
-    for vid, e in want.items():
+    for vid, entry in want.items():
         kept = canonical_id(vid, aliases)
         if kept in unique:
             canonical.setdefault(kept, unique[kept])
         elif kept in songs:
-            canonical.setdefault(kept, {"id": kept, "title": songs[kept].get("title", e["title"]),
-                                        "dur": int(songs[kept].get("dur") or e.get("dur") or 0)})
+            canonical.setdefault(kept, {"id": kept, "title": songs[kept].get("title", entry["title"]),
+                                        "dur": int(songs[kept].get("dur") or entry.get("dur") or 0)})
         else:
-            canonical.setdefault(vid, e)
-    todo = [e for vid, e in canonical.items() if vid not in songs]
+            canonical.setdefault(vid, entry)
+    todo = [entry for vid, entry in canonical.items() if vid not in songs]
     with lib.lock:
         lib.d["aliases"] = aliases
-    return dict(out=out, lib=lib, pls=pls, singles=singles, bad=bad, errs=errs, want=want, unique=canonical,
+    found = len(canonical)
+    new = len(todo)
+    todo_ids = {entry["id"] for entry in todo}
+    with state.lock:
+        state.final_counts = (found, new, found - new)
+        for row in state.rows:
+            if row["status"] == "done":
+                row["new_count"] = len({canonical_id(item["id"], aliases) for item in row["items"]
+                                        if canonical_id(item["id"], aliases) in todo_ids})
+        bad_count = state.bad
+        errors = list(state.errors)
+    plan = dict(out=out, lib=lib, pls=pls, singles=singles, bad=bad_count, errs=errors, want=want, unique=canonical,
                 todo=todo, aliases=aliases, entries=len(entries), repeats=len(entries) - len(want),
-                duplicate_count=sum(1 for vid in want if vid in aliases))
+                duplicate_count=sum(1 for vid in want if vid in aliases),
+                cache_hits=sum(bool(result and result.get("cached")) for result in results),
+                scan_elapsed=time.monotonic() - state.started, scan_state=state)
+    print_scan_summary(plan)
+    return plan
+
+
+def print_scan_summary(plan):
+    from rich.cells import cell_len
+
+    _, found, new, local, failed = plan["scan_state"].counts()
+    details = (f"Scanned {len(plan['scan_state'].rows)} playlists", f"{found} tracks",
+               f"{new} new", f"{local} already local", f"{failed} failed",
+               f"{plan['scan_elapsed']:.1f}s")
+    separator = " · "
+    if cell_len("✓ " + separator.join(details)) > console.size.width:
+        separator = " ·"
+    text = Text()
+    text.append("✓", style="#3fb950")
+    text.append(" " + separator.join(details))
+    console.print()
+    console.print(text, no_wrap=True)
 
 
 # ---------- live dashboard ----------
 class StopRequested(Exception):
-    pass
-
-
-class FirstInterrupt(Exception):
-    pass
-
-
-class ForceInterrupt(Exception):
     pass
 
 
@@ -1238,15 +1780,16 @@ class St:
             blocks.append(Panel(Group(line1, line2), expand=True, padding=(0, 1),
                                 border_style="#6b4a12"))
 
-        blocks.append(Text(f"Failed: {failed} · press f to view failures, q to quit", style=grey))
+        blocks.append(Text(f"Failed: {failed} · press f to view failures", style=grey))
+        blocks.append(Text("Q = stop safely · Ctrl+C = force quit", style=grey))
         return Group(*blocks)
 
 
 class DashboardKeys:
-    def __init__(self, state, stop_event, gate, live=None, on_quit=None):
+    def __init__(self, state, stop_event, gate, live, quit_steps):
         self.state, self.stop_event, self.gate = state, stop_event, gate
         self.live = live
-        self.on_quit = on_quit
+        self.quit_steps = quit_steps
         self.quit_requested = threading.Event()
         self.quit_started_at = None
         self.quit_done = threading.Event()
@@ -1254,8 +1797,11 @@ class DashboardKeys:
         self.quit_screen_closed = threading.Event()
         self.quit_screen_closed.set()
         self.quit_status_lock = threading.Lock()
-        self.quit_status = {"downloads": "running", "converters": "pending",
-                            "saving": "pending", "cleaning": "pending"}
+        self.quit_status = {key: "pending" for key, _, _, _ in self.quit_steps}
+        self.quit_active = None
+        self.quit_elapsed = 0.0
+        self.quit_error = None
+        self.last_q_at = 0.0
         self.done = threading.Event()
         self.view_open = threading.Event()
         self.view_closed = threading.Event()
@@ -1266,6 +1812,7 @@ class DashboardKeys:
     def start(self):
         if not sys.stdin.isatty():
             return False
+        self._flush_input()
         self.thread = threading.Thread(target=self._run, name="dashboard-keys", daemon=True)
         self.thread.start()
         return True
@@ -1282,15 +1829,24 @@ class DashboardKeys:
     def _read_key(self):
         if os.name == "nt":
             import msvcrt
-            if not msvcrt.kbhit():
+            keys = []
+            while msvcrt.kbhit():
+                key = msvcrt.getwch()
+                if key in ("\x00", "\xe0"):
+                    if msvcrt.kbhit():
+                        msvcrt.getwch()
+                    continue
+                keys.append(key)
+            if not keys:
                 time.sleep(0.05)
                 return None
-            key = msvcrt.getwch()
-            if key in ("\x00", "\xe0"):
-                if msvcrt.kbhit():
-                    msvcrt.getwch()
+            keys = [key for key in keys if key != "\x03"]
+            if not keys:
                 return None
-            return key
+            for key in reversed(keys):
+                if key.lower() == "q":
+                    return "q"
+            return keys[-1]
         import select
         fd = sys.stdin.fileno()
         ready, _, _ = select.select([fd], [], [], 0.1)
@@ -1310,50 +1866,39 @@ class DashboardKeys:
             termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
 
     def request_quit(self):
-        if self.quit_started_at is None:
-            self.quit_started_at = time.monotonic()
+        if self.quit_requested.is_set():
+            return False
+        self.quit_started_at = time.monotonic()
         self.stop_event.set()
         self.gate.wake()
         self.quit_requested.set()
-
-    def set_quit_status(self, step, value):
-        with self.quit_status_lock:
-            self.quit_status[step] = value
+        return True
 
     def render_quit(self):
+        from rich import box
         from rich.spinner import Spinner
 
         with self.quit_status_lock:
             status = dict(self.quit_status)
-        steps = (
-            ("downloads", "Stopped downloads"),
-            ("converters", "Stopped converters"),
-            ("saving", "Saving state"),
-            ("cleaning", "Cleaning temp files"),
-        )
         lines = []
-        for key, label in steps:
+        for key, label, _, _ in self.quit_steps:
             value = status[key]
-            glyph, color = ("✓", "#22c55e") if value == "done" else \
-                ("✗", "#ef4444") if value == "failed" else \
-                ("●", "#ff9f1a") if value == "running" else ("○", "#8b8b8b")
-            lines.append(Text(f"{glyph} {label}", style=color))
-        return Group(
-            Spinner("dots", text=Text("Quitting…", style="bold #ff9f1a"), style="#ff9f1a"),
-            Text(f"Stopping {self.state.jobs} workers · saving progress", style="#8b8b8b"),
+            if value == "done":
+                lines.append(Text(f"✓ {label}", style="#3fb950"))
+            elif value == "active":
+                lines.append(Spinner("dots", text=Text(f"{label}", style="#ff9f1a"),
+                                     style="#ff9f1a"))
+            elif value == "failed":
+                lines.append(Text(f"✗ {label}", style="#f85149"))
+            else:
+                lines.append(Text(f"○ {label}", style="#8b8b8b"))
+        body = Group(
+            Text("Stopping safely", style="bold #ff9f1a"),
             *lines,
-            Text("Press q again to force quit now", style="#8b8b8b"),
+            Text(f"Elapsed {self.quit_elapsed:.1f}s", style="#8b8b8b"),
+            Text("Your finished songs are saved. Ctrl+C to exit now.", style="#8b8b8b"),
         )
-
-    def _force_quit(self):
-        terminate_child_processes(force=True)
-        self.restore_terminal_mode()
-        with contextlib.suppress(Exception):
-            console.show_cursor(True)
-            console.set_alt_screen(False)
-            console.clear()
-            console.file.flush()
-        os._exit(0)
+        return Panel(body, border_style="#5a5a5a", box=box.ROUNDED, padding=(1, 2))
 
     def restore_terminal_mode(self):
         if self.old_terminal is not None and os.name != "nt":
@@ -1370,20 +1915,51 @@ class DashboardKeys:
             with console.screen():
                 console.clear()
                 quit_live = Live(get_renderable=self.render_quit, console=console,
-                                 refresh_per_second=8, transient=True, screen=False,
+                                 refresh_per_second=10, transient=True, screen=False,
                                  vertical_overflow="crop")
                 with quit_live:
                     self.quit_screen_open.set()
-                    if self.on_quit:
-                        try:
-                            self.on_quit()
-                        except Exception:
-                            logging.exception("Could not start quit cleanup")
-                            self.quit_done.set()
-                    while not self.quit_done.is_set():
-                        key = self._read_key()
-                        if key is not None and key.lower() == "q":
-                            self._force_quit()
+                    for key, _, action, timeout in self.quit_steps:
+                        started = time.monotonic()
+                        completed = threading.Event()
+
+                        def run_action(action=action, completed=completed, key=key):
+                            try:
+                                if action:
+                                    action()
+                            except Exception:
+                                logging.exception("Safe-stop step failed")
+                                with self.quit_status_lock:
+                                    self.quit_status[key] = "failed"
+                                    self.quit_error = key
+                            finally:
+                                completed.set()
+
+                        with self.quit_status_lock:
+                            self.quit_status[key] = "active"
+                            self.quit_active = key
+                        threading.Thread(target=run_action, name=f"safe-stop-{key}",
+                                         daemon=True).start()
+                        timed_out = False
+                        while True:
+                            elapsed = time.monotonic() - started
+                            self.quit_elapsed = max(time.monotonic() - self.quit_started_at, 0)
+                            if completed.is_set() and elapsed >= 1.0:
+                                break
+                            if elapsed >= timeout:
+                                timed_out = not completed.is_set()
+                                break
+                            time.sleep(0.1)
+                        with self.quit_status_lock:
+                            if timed_out and self.quit_status[key] != "failed":
+                                self.quit_status[key] = "failed"
+                                self.quit_error = key
+                            elif self.quit_status[key] != "failed":
+                                self.quit_status[key] = "done"
+                            self.quit_active = None
+                    self.quit_elapsed = max(time.monotonic() - self.quit_started_at, 0)
+                    time.sleep(0.5)
+                    self.quit_done.set()
         finally:
             try:
                 self._flush_input()
@@ -1405,7 +1981,10 @@ class DashboardKeys:
                 console.print(build_failures_view(
                     self.state, console.size.width, console.size.height))
                 while not self.done.is_set() and not self.stop_event.is_set():
-                    if self._read_key() is not None:
+                    key = self._read_key()
+                    if key is not None:
+                        if key.lower() == "q":
+                            self.request_quit()
                         break
         finally:
             try:
@@ -1435,9 +2014,11 @@ class DashboardKeys:
                 if key.lower() == "f":
                     self._show_failures()
                 elif key.lower() == "q":
-                    self.request_quit()
-                    self._show_quit_screen()
-                    return
+                    now = time.monotonic()
+                    if (now - self.last_q_at >= 0.5 and self.request_quit()):
+                        self.last_q_at = now
+                        self._show_quit_screen()
+                        return
         except Exception:
             logging.exception("Dashboard key handling failed")
         finally:
@@ -1446,100 +2027,86 @@ class DashboardKeys:
 
 def run_demo():
     ensure_ui()
-    try:
-        import random
-    except ImportError:
-        random = __import__("random")
-    todo = [{"id": f"demo{i:07}", "title": f"Demo Track {i + 1}", "dur": 180}
-            for i in range(64)]
-    state = St(64, todo, 3)
-    stop_event, gate = threading.Event(), WorkerGate(3)
-    work = queue.Queue()
-    for index, item in enumerate(todo):
-        work.put((index, item))
+    import random
 
-    def demo_worker(worker_id):
-        while not stop_event.is_set():
-            try:
-                index, item = work.get_nowait()
-            except queue.Empty:
-                return
-            state.start(worker_id, index, item, "Demo")
-            state.set_track(worker_id, item["title"], "Demo Artist")
-            total = random.randint(2_000_000, 5_000_000)
-            downloaded = 0
-            for step in range(random.randint(8, 16)):
-                if stop_event.is_set():
-                    return
-                downloaded = min(total, downloaded + random.randint(total // 12, total // 6))
-                state.progress(worker_id, {"status": "downloading",
-                                           "downloaded_bytes": downloaded,
-                                           "total_bytes": total,
-                                           "speed": random.randint(300_000, 900_000)})
-                time.sleep(random.uniform(0.08, 0.16))
-            failed = random.random() < 0.08
-            if failed:
-                reason = "Video unavailable"
-                state.failure_record(worker_id, item["title"], reason, video_id=item["id"])
-                state.record(worker_id, False, item["title"], 0, 1.2, reason)
-            else:
-                state.record(worker_id, True, item["title"], total, 1.2, "")
-            state.finish_worker(worker_id)
-
+    playlist_count = 14
+    local_ids = {f"demo-{i}-track-{j}" for i in range(playlist_count) for j in range(12)}
+    rows = [{"url": f"demo:{i}", "playlist_id": f"demo-{i}", "status": "queued",
+             "name": f"Demo Playlist {i + 1}", "items": [], "read": 0, "total": None,
+             "cached": False, "error": "", "elapsed": 0, "new_count": 0}
+            for i in range(playlist_count)]
+    state = ScanState(rows, local_ids, {})
+    stop_event = threading.Event()
+    listener = ScanKeyListener(stop_event)
     console.clear()
-    live = Live(get_renderable=state.render, console=console, refresh_per_second=8,
-                transient=False, screen=True, vertical_overflow="crop")
-    executor, futures, demo_cleanup_thread = None, [], None
-    demo_cleanup_lock = threading.Lock()
 
-    def start_demo_cleanup():
-        nonlocal demo_cleanup_thread
-        with demo_cleanup_lock:
-            if demo_cleanup_thread is not None:
+    def demo_playlist(index):
+        if stop_event.is_set():
+            return
+        started = time.monotonic()
+        state.start(index)
+        if index == 0:
+            time.sleep(0.25)
+            items = [{"id": f"demo-0-track-{i}", "title": f"Demo Song {i + 1}", "dur": 180}
+                     for i in range(15)]
+            state.progress(index, items, len(items))
+            state.set_status(index, "done", items=items, read=len(items), total=len(items),
+                             cached=True, elapsed=time.monotonic() - started, new_count=3)
+            return
+        if index == 6:
+            time.sleep(random.uniform(0.25, 0.65))
+            state.set_status(index, "failed", error="unavailable", elapsed=time.monotonic() - started)
+            return
+        total = random.randint(18, 38)
+        items = []
+        for track in range(total):
+            if stop_event.is_set():
                 return
+            items.append({"id": f"demo-{index}-track-{track}",
+                          "title": f"Demo Song {track + 1}", "dur": 180})
+            state.progress(index, items, total)
+            time.sleep(random.uniform(0.015, 0.04))
+        new_count = sum(item["id"] not in local_ids for item in items)
+        state.set_status(index, "done", items=items, read=len(items), total=total,
+                         cached=False, elapsed=time.monotonic() - started, new_count=new_count)
 
-            def cleanup_demo():
-                if executor:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                pending = {future for future in futures if not future.done()}
-                if pending:
-                    wait(pending, timeout=3)
-                for step in ("downloads", "converters", "saving", "cleaning"):
-                    listeners.set_quit_status(step, "done")
-                listeners.quit_done.set()
-
-            demo_cleanup_thread = threading.Thread(
-                target=cleanup_demo, name="demo-quit-cleanup", daemon=True)
-            demo_cleanup_thread.start()
-
-    listeners = DashboardKeys(state, stop_event, gate, live, on_quit=start_demo_cleanup)
-    with live:
-        try:
-            executor = ThreadPoolExecutor(max_workers=3)
-            futures.extend(executor.submit(demo_worker, worker_id) for worker_id in range(3))
-            listeners.start()
+    executor = ThreadPoolExecutor(max_workers=SCAN_WORKERS, thread_name_prefix="playlist-scan-demo")
+    futures = []
+    started = time.monotonic()
+    cancelled = False
+    try:
+        with Live(get_renderable=state.render, console=console, refresh_per_second=8,
+                  transient=False, vertical_overflow="crop"):
+            listener.start()
+            futures = [executor.submit(demo_playlist, i) for i in range(playlist_count)]
             pending = set(futures)
             while pending:
-                if listeners.quit_requested.is_set():
+                if stop_event.is_set():
+                    cancelled = True
+                    for future in pending:
+                        future.cancel()
                     break
                 completed, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
                 for future in completed:
-                    if not future.cancelled():
-                        future.result()
-            if listeners.quit_requested.is_set():
-                start_demo_cleanup()
-                listeners.quit_done.wait(8)
-            else:
-                executor.shutdown(wait=True)
-        finally:
-            listeners.stop()
-    if listeners.quit_requested.is_set():
-        console.show_cursor(True)
-        console.print(f"Stopped · {state.done} done · {state.fail} failed · "
-                      f"{max(state.total - state.done - state.fail, 0)} left · demo")
-    else:
-        console.print(f"[bold #3fb950]Done[/] · {state.done} done · {state.fail} failed · "
-                      f"{size(state.bytes)} · {dur(time.time() - state.t0)}")
+                    future.result()
+    except KeyboardInterrupt:
+        cancelled = True
+        stop_event.set()
+        for future in futures:
+            future.cancel()
+    finally:
+        listener.stop()
+        if cancelled:
+            for future in futures:
+                future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+    if cancelled:
+        console.print(Text("Scan cancelled.", style="#8b8b8b"))
+        return
+    _, found, new, local, _ = state.counts()
+    with state.lock:
+        state.final_counts = (found, new, local)
+    print_scan_summary({"scan_state": state, "scan_elapsed": time.monotonic() - started})
 
 
 def dl_opts(cfg, out, st, worker_id, force_event=None, stop_event=None):
@@ -1667,7 +2234,11 @@ def download_worker(worker_id, work, cfg, out, lib, st, gate, stop_event, failed
                                   "dur": int((info.get("duration") if isinstance(info, dict) else None)
                                              or e.get("dur") or 0)}
                         song_size = fp.stat().st_size
+                        if stop_event.is_set() or force_event.is_set():
+                            raise StopRequested()
                         with lib.lock:
+                            if stop_event.is_set() or force_event.is_set():
+                                raise StopRequested()
                             lib.d["songs"][e["id"]] = record
                         ok, note = True, f"{size(song_size)}  {time.time() - t1:.1f}s"
                     except (StopRequested, KeyboardInterrupt) as ex:
@@ -1769,13 +2340,10 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
     executor = None
     futures = []
     key_listener = None
-    quit_cleanup_thread = None
-    quit_cleanup_done = threading.Event()
-    quit_cleanup_lock = threading.Lock()
-    quit_timed_out = False
     quit_handled = False
     quit_save_failed = [False]
-    quit_started_at = [None]
+    quit_saved = [False]
+    quit_save_lock = threading.Lock()
     forced_quit = threading.Event()
     forced_quit_lock = threading.Lock()
     live = contextlib.nullcontext() if plain else \
@@ -1783,40 +2351,39 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
              vertical_overflow="crop")
     live_obj = live if isinstance(live, Live) else None
     old_sigint, signal_installed = None, False
-    finalizing = [False]
     signal_stopped = False
 
-    def force_quit_now(message=None):
+    def force_quit_now():
         with forced_quit_lock:
             if forced_quit.is_set():
                 os._exit(0)
             forced_quit.set()
+        stop_event.set()
         force_event.set()
+        gate.wake()
+        if executor:
+            executor.shutdown(wait=False, cancel_futures=True)
         terminate_child_processes(force=True)
         if key_listener:
-            key_listener.quit_done.set()
-            key_listener.quit_screen_closed.wait(0.5)
             key_listener.restore_terminal_mode()
+        try:
+            save_quit_state()
+        except Exception:
+            logging.exception("Could not save library state during force quit")
+        try:
+            write_inflight_file()
+        except Exception:
+            logging.exception("Could not write inflight state during force quit")
         with contextlib.suppress(Exception):
             console.show_cursor(True)
             console.set_alt_screen(False)
             console.clear()
-            if message:
-                console.print(message)
+            console.print("Force quit")
             console.file.flush()
         os._exit(0)
 
     def handle_sigint(_signum, _frame):
-        if stop_event.is_set() or finalizing[0]:
-            force_event.set()
-            gate.wake()
-            force_quit_now()
-        quit_started_at[0] = time.monotonic()
-        stop_event.set()
-        gate.wake()
-        if key_listener:
-            key_listener.request_quit()
-        raise FirstInterrupt()
+        force_quit_now()
 
     def write_failed_file():
         ff = DATA / "failed.txt"
@@ -1838,38 +2405,19 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
             ff.unlink(missing_ok=True)
         return failed_rows
 
-    def hard_quit_watchdog(pending, started):
-        deadline = started + 8
-        while time.monotonic() < deadline and any(not future.done() for future in pending):
-            time.sleep(0.05)
-        if not any(not future.done() for future in pending):
-            return
-        force_quit_now("Forced quit")
+    def write_inflight_file():
+        with lib.lock:
+            saved_ids = set(lib.d["songs"])
+        interrupted = [item["id"] for item in todo if item["id"] not in saved_ids]
+        aw(DATA / "inflight.json", json.dumps({
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "video_ids": interrupted,
+        }, ensure_ascii=False))
 
-    def quit_cleanup():
-        pending = set()
-        try:
-            if key_listener:
-                key_listener.set_quit_status("downloads", "running")
-                key_listener.set_quit_status("converters", "running")
-            gate.wake()
-            if executor:
-                executor.shutdown(wait=False, cancel_futures=True)
-            worker_deadline = time.monotonic() + 3
-            terminate_child_processes(timeout=min(2, max(worker_deadline - time.monotonic(), 0)))
-            pending = {future for future in futures if not future.done()}
-            if pending:
-                wait(pending, timeout=max(worker_deadline - time.monotonic(), 0))
-                pending = {future for future in pending if not future.done()}
-            if pending:
-                force_event.set()
-                terminate_child_processes(force=True)
-                wait(pending, timeout=min(0.1, max(worker_deadline - time.monotonic(), 0)))
-
-            if key_listener:
-                key_listener.set_quit_status("downloads", "done")
-                key_listener.set_quit_status("converters", "done")
-                key_listener.set_quit_status("saving", "running")
+    def save_quit_state():
+        with quit_save_lock:
+            if quit_saved[0]:
+                return
             with st.lock:
                 downloads = st.done
                 downloaded_bytes = st.bytes
@@ -1892,55 +2440,52 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
                     m3u(out, playlist["name"], [item["id"] for item in playlist["items"]], songs, aliases)
             lib.save()
             write_failed_file()
-            if key_listener:
-                key_listener.set_quit_status("saving", "done")
-                key_listener.set_quit_status("cleaning", "running")
-            cleanup_partial_files(out, lib)
-            if key_listener:
-                key_listener.set_quit_status("cleaning", "done")
-        except Exception:
-            logging.exception("Quit cleanup failed")
-            quit_save_failed[0] = True
-            if key_listener:
-                key_listener.set_quit_status("saving", "failed")
-        finally:
-            quit_cleanup_done.set()
-            if key_listener:
-                key_listener.quit_done.set()
-            if pending:
-                started = (key_listener.quit_started_at
-                           if key_listener and key_listener.quit_started_at is not None
-                           else quit_started_at[0] or time.monotonic())
-                threading.Thread(target=hard_quit_watchdog, args=(set(pending), started),
-                                 name="quit-timeout", daemon=True).start()
+            quit_saved[0] = True
 
-    def start_quit_cleanup():
-        nonlocal quit_cleanup_thread
-        with quit_cleanup_lock:
-            if quit_cleanup_thread is not None:
-                return
-            quit_cleanup_thread = threading.Thread(
-                target=quit_cleanup, name="quit-cleanup", daemon=True)
-            quit_cleanup_thread.start()
+    def hard_quit_watchdog(pending, started):
+        deadline = started + 8
+        while time.monotonic() < deadline and any(not future.done() for future in pending):
+            time.sleep(0.05)
+        if not any(not future.done() for future in pending):
+            return
+        force_quit_now()
+
+    def cancel_downloads():
+        stop_event.set()
+        gate.wake()
+        if executor:
+            executor.shutdown(wait=False, cancel_futures=True)
+        terminate_child_processes(timeout=2)
+
+    def finish_conversions():
+        pending = {future for future in futures if not future.done()}
+        if pending:
+            wait(pending, timeout=3)
+            pending = {future for future in pending if not future.done()}
+        if pending:
+            force_event.set()
+            terminate_child_processes(force=True)
+            wait(pending, timeout=0.1)
+            threading.Thread(target=hard_quit_watchdog,
+                             args=(set(pending), time.monotonic()),
+                             name="quit-timeout", daemon=True).start()
+
+    def save_library_and_playlists():
+        try:
+            save_quit_state()
+        except Exception:
+            quit_save_failed[0] = True
+            raise
+
+    def clean_stop_files():
+        cleanup_partial_files(out, lib)
+        (DATA / "inflight.json").unlink(missing_ok=True)
 
     def finish_quit():
-        nonlocal quit_timed_out
         if key_listener and key_listener.thread is None:
             key_listener.start()
-        if key_listener is None or key_listener.thread is None:
-            start_quit_cleanup()
-        started = (key_listener.quit_started_at
-                   if key_listener and key_listener.quit_started_at is not None
-                   else quit_started_at[0] or time.monotonic())
-        deadline = started + 8
-        while not quit_cleanup_done.wait(0.05):
-            if not quit_cleanup_thread and time.monotonic() - started > 0.2:
-                start_quit_cleanup()
-            if time.monotonic() >= deadline:
-                quit_timed_out = True
-                if key_listener:
-                    key_listener.quit_done.set()
-                break
+        if key_listener:
+            key_listener.quit_done.wait()
 
     if todo:
         if not plain:
@@ -1956,7 +2501,13 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
             try:
                 executor = ThreadPoolExecutor(max_workers=worker_count)
                 key_listener = DashboardKeys(
-                    st, stop_event, gate, live_obj, on_quit=start_quit_cleanup) if not plain else None
+                    st, stop_event, gate, live_obj,
+                    quit_steps=[
+                        ("downloads", "Cancelling downloads", cancel_downloads, 10),
+                        ("converters", "Finishing conversions", finish_conversions, 3),
+                        ("saving", "Saving library and playlists", save_library_and_playlists, 10),
+                        ("cleaning", "Cleaning up temp files", clean_stop_files, 10),
+                    ]) if not plain else None
                 if key_listener:
                     key_listener.start()
                 if threading.current_thread() is threading.main_thread():
@@ -1983,26 +2534,10 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
                 if key_listener and key_listener.quit_requested.is_set() and not quit_handled:
                     stopped = quit_handled = signal_stopped = True
                     finish_quit()
-            except FirstInterrupt:
-                stopped = True
-                signal_stopped = True
-                quit_handled = True
-                if key_listener:
-                    key_listener.request_quit()
-                finish_quit()
             except KeyboardInterrupt:
                 stopped = True
                 signal_stopped = True
-                stop_event.set()
-                quit_handled = True
-                if key_listener:
-                    key_listener.request_quit()
-                finish_quit()
-            except ForceInterrupt:
-                stopped = quit_handled = signal_stopped = True
-                force_event.set()
-                terminate_child_processes(force=True)
-                finish_quit()
+                force_quit_now()
             except BaseException:
                 stop_event.set()
                 force_event.set()
@@ -2023,22 +2558,21 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
                 executor.shutdown(wait=True)
 
     if quit_handled:
-        finalizing[0] = True
         if signal_installed:
             signal.signal(signal.SIGINT, old_sigint)
             signal_installed = False
-        if quit_timed_out:
-            force_quit_now("Forced quit")
         with st.lock:
             downloads, failures = st.done, st.fail
             left = max(st.total - st.done - st.worker_fail, 0)
+        stop_warning = (f" · {key_listener.quit_error} step failed or timed out"
+                        if key_listener.quit_error else "")
         console.show_cursor(True)
         console.print(
-            f"Stopped · {downloads} done · {failures} failed · {left} left · "
-            f"{'progress save failed' if quit_save_failed[0] else 'progress saved'}")
+            f"Stopped in {max(time.monotonic() - (key_listener.quit_started_at or time.monotonic()), 0):.1f} s · "
+            f"{downloads} done · {failures} failed · {left} left · "
+            f"{'progress save failed' if quit_save_failed[0] else 'progress saved'}{stop_warning}")
         raise SystemExit(0)
 
-    finalizing[0] = True
     with lib.lock:
         songs, aliases = dict(lib.d["songs"]), dict(plan["aliases"])
         lib.d["aliases"] = aliases
@@ -2067,6 +2601,7 @@ def execute(cfg, plan, compact=False, interactive=False, prune_ok=False):
                 songs = dict(lib.d["songs"])
 
     cleanup_partial_files(out, lib)
+    (DATA / "inflight.json").unlink(missing_ok=True)
     el = time.time() - st.t0
     with st.lock:
         downloads, downloaded_bytes, failures = st.done, st.bytes, st.fail
@@ -2645,6 +3180,8 @@ def run_flow(cfg, with_review, extra_urls=None):
                 cfg = settings(cfg)
                 continue
             return "exit" if choice == "exit" else "home"
+        except ScanCancelled:
+            return "home"
         except Exception as e:
             menu_error(e)
             return "home"
@@ -2766,7 +3303,7 @@ def main():
     g.add_argument("--jobs", type=int, choices=range(1, 7), help="parallel downloads (1-6, default 3)")
     g = ap.add_argument_group("other")
     g.add_argument("--compact", action="store_true", help="one line per song instead of the dashboard")
-    g.add_argument("--demo", action="store_true", help="show a simulated 64-track progress dashboard")
+    g.add_argument("--demo", action="store_true", help="preview the live playlist scan dashboard")
     g.add_argument("--where", action="store_true", help="print the data folder and music library folder, then exit")
     g.add_argument("--timing", action="store_true", help="print startup step timings")
     g.add_argument("--update-ytdlp", action="store_true", help="upgrade yt-dlp and exit")
@@ -2881,6 +3418,10 @@ def main():
         if a.timing:
             print_timings()
         return 0
+    except ScanCancelled:
+        if console is not None:
+            console.print("\n[yellow]Scan cancelled.[/]")
+        return 130
     except KeyboardInterrupt:
         if console is not None:
             console.print("\n[yellow]Cancelled.[/]")
