@@ -862,11 +862,14 @@ class ScanCancelled(Exception):
 
 
 class ScanState:
-    def __init__(self, rows, local_ids, cache):
+    def __init__(self, rows, local_ids, cache, library_size=0):
         self.lock = threading.Lock()
         self.rows = rows
         self.local_ids = local_ids
         self.cache = cache
+        self.library_size = library_size
+        self.latest_new = {}
+        self.final_new_ids = None
         self.errors = []
         self.bad = 0
         self.started = time.monotonic()
@@ -889,6 +892,10 @@ class ScanState:
             row["items"] = list(items)
             row["read"] = len(items)
             row["total"] = total
+            for item in items:
+                vid = item["id"]
+                if vid not in self.local_ids and vid not in self.latest_new:
+                    self.latest_new[vid] = (time.monotonic(), dict(item), index)
 
     def fail(self, index, url, reason, elapsed):
         with self.lock:
@@ -913,6 +920,14 @@ class ScanState:
         if final_counts is not None:
             found, new, local = final_counts
         return rows, found, new, local, sum(row["status"] == "failed" for row in rows)
+
+    def latest_new_items(self):
+        with self.lock:
+            items = list(self.latest_new.values())
+            final_ids = self.final_new_ids
+        if final_ids is not None:
+            items = [item for item in items if item[1]["id"] in final_ids]
+        return sorted(items, key=lambda item: item[0], reverse=True)
 
     def render(self):
         return render_scan(self)
@@ -957,8 +972,7 @@ def _scan_bar(counts, width, colors):
     return bar
 
 
-def _scan_visible_rows(rows, height):
-    capacity = max(1, height - 12)
+def _scan_visible_rows(rows, capacity):
     active = [i for i, row in enumerate(rows) if row["status"] == "scanning"]
     queued = [i for i, row in enumerate(rows) if row["status"] == "queued"]
     finished = [i for i, row in enumerate(rows) if row["status"] in ("done", "failed")]
@@ -974,38 +988,7 @@ def _scan_visible_rows(rows, height):
         remaining -= min(len(queued), remaining)
         recent = sorted(finished, key=lambda i: rows[i].get("finished_at", 0), reverse=True)
         selected.extend(recent[:remaining])
-    return sorted(selected), hidden_queued
-
-
-def _scan_stats(found, new, local, failed, elapsed, eta, width):
-    from rich.cells import cell_len
-
-    fields = [
-        ("Tracks found", str(found), "#e6e6e6", "found"),
-        ("New", str(new), "#3fb950", "new"),
-        ("Already local", str(local), "#e6e6e6", "local"),
-        ("Failed", str(failed), "#f85149" if failed else "#e6e6e6", "failed"),
-        ("Elapsed", dur(elapsed), "#e6e6e6", "elapsed"),
-        ("ETA", eta, "#e6e6e6", "eta"),
-    ]
-
-    def make_line(active):
-        line = Text(no_wrap=True, overflow="crop")
-        for index, (label, value, color, _) in enumerate(active):
-            if index:
-                line.append("   ", style="#8b8b8b")
-            line.append(label + " ", style="#8b8b8b")
-            line.append(value, style=color)
-        return line
-
-    active = list(fields)
-    line = make_line(active)
-    for name in ("elapsed", "eta"):
-        if cell_len(line.plain) <= width:
-            break
-        active = [field for field in active if field[3] != name]
-        line = make_line(active)
-    return line
+    return selected, hidden_queued
 
 
 def render_scan(state):
@@ -1015,30 +998,43 @@ def render_scan(state):
 
     width, height = console.size.width, console.size.height
     inner_width = max(width - 6, 1)
-    rows, found, new, local, failed = state.counts()
+    rows, _, new, _, failed = state.counts()
     now = time.monotonic()
     elapsed = max(now - state.started, 0)
-    completed = sum(row["status"] in ("done", "failed") for row in rows)
+    successful = sum(row["status"] == "done" for row in rows)
+    completed = successful + failed
     active = sum(row["status"] == "scanning" for row in rows)
     queued = sum(row["status"] == "queued" for row in rows)
+
     header = Table.grid(expand=True, padding=(0, 0))
     header.add_column(ratio=1)
     header.add_column(no_wrap=True, justify="right")
     spinner = Spinner("dots", text=Text("Scanning playlists…", style="#3b9ae1"), style="#3fb950")
-    header.add_row(spinner, Text(f"{completed} / {len(rows)} · {active} scanning at once", style="#8b8b8b"))
-    bar = _scan_bar((completed, active, queued), inner_width,
-                    ("#3fb950", "#ff9f1a", "#333333"))
+    eta = "—"
+    remaining = max(len(rows) - completed, 0)
+    if completed >= 3 or elapsed >= 5:
+        completed_times = [max(row.get("elapsed", 0), 0.01)
+                           for row in rows if row["status"] in ("done", "failed")]
+        average = sum(completed_times) / len(completed_times) if completed_times else elapsed
+        eta = dur(average * remaining)
+    right_header = Text.assemble(
+        (str(completed), "#e6e6e6"), (" / ", "#8b8b8b"),
+        (str(len(rows)), "#e6e6e6"), (" · Elapsed ", "#8b8b8b"),
+        (dur(elapsed), "#e6e6e6"), (" · ETA ", "#8b8b8b"), (eta, "#ff9f1a"))
+    header.add_row(spinner, right_header)
+    failed_rows = failed
+    bar = _scan_bar((successful, failed_rows, active, queued), inner_width,
+                    ("#3fb950", "#f85149", "#ff9f1a", "#333333"))
 
-    visible, hidden_queued = _scan_visible_rows(rows, height)
-    show_time = width > 100
-    show_status = width > 72
+    narrow = width < 100
+    row_capacity = max(1, height - (17 if narrow else 10))
+    visible, hidden_queued = _scan_visible_rows(rows, row_capacity)
+    show_song_columns = width >= 70
     table = Table.grid(expand=True, padding=(0, 1))
     table.add_column(width=2, no_wrap=True)
     table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-    table.add_column(no_wrap=True, justify="right")
-    if show_status:
+    if show_song_columns:
         table.add_column(no_wrap=True, justify="right")
-    if show_time:
         table.add_column(no_wrap=True, justify="right")
     for index in visible:
         row = rows[index]
@@ -1047,55 +1043,98 @@ def render_scan(state):
                 "queued": ("○", "#8b8b8b"), "failed": ("✗", "#f85149")}[status]
         icon_text = Text(icon[0], style=icon[1])
         name_text = Text(row.get("name") or "playlist",
-                         style="#8b8b8b" if status == "queued" else None)
+                         style="#8b8b8b" if not row.get("title_known") or status == "queued" else None)
         count_text = Text()
         status_text = Text()
-        time_text = Text()
         if status == "done":
             count_text.append(f"{len(row['items'])} songs", style="#8b8b8b")
             if row.get("new_count", 0):
-                status_text.append(f"{row['new_count']} new", style="#3fb950")
-            else:
-                status_text.append("up to date", style="#8b8b8b")
-            if row.get("cached"):
-                if show_time:
-                    time_text.append("cached", style="#8b8b8b")
-                else:
-                    status_text.append(" · cached", style="#8b8b8b")
-            else:
-                time_text.append(f"{row.get('elapsed', 0):.1f}s", style="#8b8b8b")
+                status_text.append(f"+{row['new_count']} new", style="#3fb950")
         elif status == "scanning":
-            total = row.get("total")
-            count_text.append(f"{row['read']} / {total}" if total else "fetching…",
-                              style="#ff9f1a")
-            mini = _scan_bar((row["read"], max((total or row["read"] + 1) - row["read"], 0)),
-                             8, ("#ff9f1a", "#333333"))
-            status_text = mini
+            status_text.append("fetching…", style="#ff9f1a")
         elif status == "queued":
             status_text.append("queued", style="#8b8b8b")
         else:
             status_text.append(row.get("error", "unavailable"), style="#f85149")
-            status_text.append(" · retry", style="#8b8b8b")
         cells = [icon_text, name_text, count_text]
-        if show_status:
+        if show_song_columns:
             cells.append(status_text)
-        if show_time:
-            cells.append(time_text)
         table.add_row(*cells)
     if hidden_queued:
         table.add_row("", Text(f"+ {hidden_queued} more queued", style="#8b8b8b"),
                       *([Text("")] * (len(table.columns) - 2)))
 
-    eta = "—"
-    remaining = max(len(rows) - completed, 0)
-    if completed >= 3 or elapsed >= 5:
-        completed_times = [max(row.get("elapsed", 0), 0.01)
-                           for row in rows if row["status"] in ("done", "failed")]
-        average = sum(completed_times) / len(completed_times) if completed_times else elapsed
-        eta = dur(average * remaining)
-    stats = _scan_stats(found, new, local, failed, elapsed, eta, inner_width)
-    divider = Text("━" * inner_width, style="#333333", no_wrap=True, overflow="crop")
-    panel = Panel(Group(header, bar, table, divider, stats), expand=True, padding=(1, 2),
+    with state.lock:
+        library_size = state.library_size
+        final_new_ids = state.final_new_ids
+    new_ids = final_new_ids if final_new_ids is not None else {
+        item["id"] for _, item, _ in state.latest_new_items()}
+    if final_new_ids is not None:
+        playlists_with_new = sum(row.get("new_count", 0) > 0 for row in rows)
+    else:
+        playlists_with_new = sum(any(item["id"] in new_ids for item in row.get("items", []))
+                                 for row in rows)
+    latest = state.latest_new_items()
+    playlist_row_count = len(table.rows)
+    fixed_sidebar_rows = 8
+    area_height = max(playlist_row_count, fixed_sidebar_rows)
+    title_slots = (area_height - fixed_sidebar_rows
+                   if playlist_row_count >= fixed_sidebar_rows else 0)
+    if len(latest) > title_slots and title_slots:
+        shown_latest = latest[:title_slots - 1]
+        more_latest = len(latest) - len(shown_latest)
+    else:
+        shown_latest = latest[:title_slots]
+        more_latest = 0
+    if title_slots == 0 and latest:
+        more_latest = len(latest)
+    area_height = max(area_height, fixed_sidebar_rows + (1 if more_latest else 0))
+    while len(table.rows) < area_height:
+        table.add_row(*([Text("")] * len(table.columns)))
+
+    sidebar_width = inner_width if narrow else min(28, max(inner_width - 2, 1))
+    sidebar = Table.grid(expand=True, padding=(0, 0))
+    sidebar.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    sidebar.add_row(Text("New songs", style="#8b8b8b"))
+    new_line = Text()
+    new_line.append(str(new), style="bold #3fb950")
+    new_line.append(f" in {playlists_with_new} playlists", style="#8b8b8b")
+    sidebar.add_row(new_line)
+    sidebar.add_row(Text("─" * sidebar_width, style="#333333", no_wrap=True, overflow="crop"))
+    sidebar.add_row(Text("Library after sync", style="#8b8b8b"))
+    projected = library_size + new
+    library_line = Text()
+    library_line.append(str(library_size), style="#8b8b8b")
+    library_line.append(" → ", style="#8b8b8b")
+    library_line.append(str(projected), style="bold #e6e6e6")
+    library_line.append(f" +{new}", style="#3fb950")
+    library_line.append(" songs", style="#8b8b8b")
+    sidebar.add_row(library_line)
+    failed_line = Text()
+    failed_line.append(str(failed), style="bold #f85149" if failed else "#8b8b8b")
+    failed_line.append(" failed", style="#f85149" if failed else "#8b8b8b")
+    sidebar.add_row(failed_line)
+    sidebar.add_row(Text("─" * sidebar_width, style="#333333", no_wrap=True, overflow="crop"))
+    sidebar.add_row(Text("Found", style="#8b8b8b"))
+    for _, item, _ in shown_latest:
+        title = Text(item.get("title") or item["id"])
+        title.truncate(max(sidebar_width - 1, 1), overflow="ellipsis")
+        sidebar.add_row(title)
+    if more_latest:
+        sidebar.add_row(Text(f"+{more_latest} more", style="#8b8b8b"))
+    while len(sidebar.rows) < area_height:
+        sidebar.add_row(Text(""))
+
+    if narrow:
+        content = Group(header, bar, table, sidebar)
+    else:
+        columns = Table.grid(expand=True, padding=(0, 0))
+        columns.add_column(ratio=1)
+        columns.add_column(width=1, no_wrap=True)
+        columns.add_column(width=sidebar_width, no_wrap=True)
+        columns.add_row(table, Text("│", style="#333333"), sidebar)
+        content = Group(header, bar, columns)
+    panel = Panel(content, expand=True, padding=(1, 2),
                   border_style="#5a5a5a", box=box.ROUNDED)
     return Group(panel, Text("q cancel scan", style="#8b8b8b"))
 
@@ -1180,8 +1219,11 @@ def _extract_entries(ytdlp, url, row_index, state, stop_event, playlist_limit=No
         total = int(total) if total is not None else None
     except (TypeError, ValueError):
         total = None
-    state.set_status(row_index, "scanning",
-                     name=fsafe(info.get("title") or "playlist"), total=total)
+    title = first_text(info.get("title"), "")
+    if title:
+        state.set_status(row_index, "scanning", name=fsafe(title), title_known=True, total=total)
+    else:
+        state.set_status(row_index, "scanning", total=total)
     items, skipped = [], 0
     for entry in raw_entries:
         if stop_event.is_set():
@@ -1206,12 +1248,14 @@ def scan(cfg, urls):
     cache = jload(cache_path, {})
     if not isinstance(cache, dict):
         cache = {}
-    rows = [{"url": url, "playlist_id": pid, "status": "queued", "name": "playlist",
+    rows = [{"url": url, "playlist_id": pid, "status": "queued",
+             "name": (pid[:13] + ("…" if len(pid) > 13 else "")) if pid else url[:13],
+             "title_known": False,
              "items": [], "read": 0, "total": None, "cached": False, "error": "",
              "elapsed": 0, "new_count": 0}
             for url, pid in playlist_urls]
     local_ids = set(songs) | set(aliases)
-    state = ScanState(rows, local_ids, cache)
+    state = ScanState(rows, local_ids, cache, library_size=len(songs))
     stop_event = threading.Event()
     listener = ScanKeyListener(stop_event)
     thread_local = threading.local()
@@ -1262,8 +1306,10 @@ def scan(cfg, urls):
                               "dur": int(item.get("dur") or 0)} for item in cached_items]
                     name = fsafe(cached.get("name") or probe.get("title") or "playlist")
                     state.progress(index, items, len(items))
-                    state.set_status(index, "done", name=name, items=items, read=len(items),
-                                     total=len(items), cached=True, elapsed=time.monotonic() - started)
+                    new_count = sum(item["id"] not in state.local_ids for item in items)
+                    state.set_status(index, "done", name=name, title_known=True, items=items, read=len(items),
+                                     total=len(items), cached=True, elapsed=time.monotonic() - started,
+                                     new_count=new_count)
                     state.add_bad(int(cached.get("bad", 0)))
                     results[index] = {"playlist": {"name": name, "items": items},
                                       "single": None, "bad": int(cached.get("bad", 0)),
@@ -1274,13 +1320,15 @@ def scan(cfg, urls):
                 ytdlp, row["url"], index, state, stop_event)
             if stop_event.is_set():
                 return None
-            name = fsafe(info.get("title") or (items[0]["title"] if items else "playlist"))
             is_single = info.get("entries") is None
+            name = fsafe(info.get("title") or row["name"])
             if is_single:
                 name = items[0]["title"] if items else name
             elapsed = time.monotonic() - started
-            state.set_status(index, "done", name=name, items=items, read=len(items),
-                             total=len(items), cached=False, elapsed=elapsed)
+            new_count = sum(item["id"] not in state.local_ids for item in items)
+            state.set_status(index, "done", name=name,
+                             title_known=bool(info.get("title") or is_single), items=items, read=len(items),
+                             total=len(items), cached=False, elapsed=elapsed, new_count=new_count)
             if row["playlist_id"]:
                 record = {"ids": [item["id"] for item in items],
                           "count": int(info.get("playlist_count") or info.get("n_entries") or len(items) + skipped),
@@ -1393,13 +1441,14 @@ def scan(cfg, urls):
         else:
             canonical.setdefault(vid, entry)
     todo = [entry for vid, entry in canonical.items() if vid not in songs]
+    todo_ids = {entry["id"] for entry in todo}
     with lib.lock:
         lib.d["aliases"] = aliases
     found = len(canonical)
     new = len(todo)
-    todo_ids = {entry["id"] for entry in todo}
     with state.lock:
         state.final_counts = (found, new, found - new)
+        state.final_new_ids = todo_ids
         for row in state.rows:
             if row["status"] == "done":
                 row["new_count"] = len({canonical_id(item["id"], aliases) for item in row["items"]
@@ -1418,17 +1467,15 @@ def scan(cfg, urls):
 def print_scan_summary(plan):
     from rich.cells import cell_len
 
-    _, found, new, local, failed = plan["scan_state"].counts()
-    details = (f"Scanned {len(plan['scan_state'].rows)} playlists", f"{found} tracks",
-               f"{new} new", f"{local} already local", f"{failed} failed",
-               f"{plan['scan_elapsed']:.1f}s")
+    _, _, new, _, failed = plan["scan_state"].counts()
+    details = (f"Scanned {len(plan['scan_state'].rows)} playlists", f"{new} new",
+               f"{failed} failed", f"{plan['scan_elapsed']:.1f}s")
     separator = " · "
     if cell_len("✓ " + separator.join(details)) > console.size.width:
-        separator = " ·"
+        separator = "·"
     text = Text()
     text.append("✓", style="#3fb950")
     text.append(" " + separator.join(details))
-    console.print()
     console.print(text, no_wrap=True)
 
 
@@ -2696,6 +2743,95 @@ def ask(msg, choices):
         return None
 
 
+MENU_STAY = object()
+MENU_ARROW_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left",
+                   "H": "up", "P": "down", "M": "right", "K": "left"}
+
+
+@contextlib.contextmanager
+def menu_terminal_mode():
+    saved = None
+    fd = None
+    termios = None
+    try:
+        if os.name != "nt":
+            import termios as _termios
+            import tty
+            termios = _termios
+            fd = sys.stdin.fileno()
+            saved = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        yield
+    finally:
+        try:
+            if saved is not None and termios is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        finally:
+            if console is not None:
+                with contextlib.suppress(Exception):
+                    console.show_cursor(True)
+
+
+def _arrow_from_sequence(value):
+    if not value:
+        return "esc"
+    return MENU_ARROW_KEYS.get(value[-1], "esc")
+
+
+def read_menu_key():
+    with menu_terminal_mode():
+        if os.name == "nt":
+            import msvcrt
+            key = msvcrt.getwch()
+            if key in ("\x00", "\xe0"):
+                return MENU_ARROW_KEYS.get(msvcrt.getwch(), "unknown")
+            if key == "\x1b":
+                sequence = ""
+                while msvcrt.kbhit() and len(sequence) < 3:
+                    sequence += msvcrt.getwch()
+                if sequence:
+                    return _arrow_from_sequence(sequence)
+                return "esc"
+        else:
+            import select
+            fd = sys.stdin.fileno()
+            key = os.read(fd, 1)
+            if key == b"\x1b":
+                sequence = b""
+                if select.select([fd], [], [], 0.04)[0]:
+                    sequence += os.read(fd, 1)
+                    if sequence in (b"[", b"O") and select.select([fd], [], [], 0.04)[0]:
+                        sequence += os.read(fd, 1)
+                if sequence.startswith((b"[", b"O")):
+                    return _arrow_from_sequence(sequence.decode("ascii", "ignore"))
+                return "esc"
+            key = key.decode("utf-8", "ignore")
+        if key in ("\r", "\n"):
+            return "enter"
+        if key in ("\x03", "\x04"):
+            return "ctrl+c"
+        if key == "\x1b":
+            return "esc"
+        if key:
+            return key.lower()
+        return "unknown"
+
+
+def key_screen_loop(render, handle_key):
+    try:
+        while True:
+            console.clear()
+            console.print(render())
+            result = handle_key(read_menu_key())
+            if result is not MENU_STAY:
+                return result
+    except KeyboardInterrupt:
+        return "ctrl+c"
+    finally:
+        with contextlib.suppress(Exception):
+            console.show_cursor(True)
+
+
 def pause():
     try:
         console.input("[dim]Press Enter to continue...[/]")
@@ -3070,51 +3206,256 @@ def library_folder_menu(cfg):
             menu_error(e)
 
 
+SETTING_SECTIONS = [
+    ("Audio", [
+        ("format", "Format", "choice", "output file type, mp3 plays everywhere"),
+        ("quality", "Quality", "choice", "audio bitrate, best uses the highest available"),
+        ("cover", "Cover art", "bool", "embed the thumbnail in each file"),
+        ("square", "Square cover", "bool", "crop the cover art to a square"),
+    ]),
+    ("Library", [
+        ("name_style", "Filename style", "choice", "how song files are named"),
+        ("clean", "Clean titles", "bool", "remove Official Video and similar tags"),
+        ("playlist_files", "Playlist .m3u8 files", "bool", "create a playlist file for each link"),
+        ("prune", "Prune removed songs", "bool", "delete local songs no longer in a playlist"),
+        ("skip_duplicate_songs", "Skip duplicate songs", "bool", "don't download a song you already have"),
+    ]),
+    ("Downloads", [
+        ("jobs", "Parallel downloads", "number", "how many songs download at once"),
+        ("rate_limit", "Speed limit", "text", "cap download speed, unlimited by default"),
+        ("retries", "Retries", "number", "attempts before a download is marked failed"),
+        ("cookies", "Browser cookies", "text", "use your browser login for restricted videos"),
+    ]),
+    ("Folders", [
+        ("library", "Library folder", "library", "where your music is saved"),
+        ("data", "Data folder", "data", "where settings and caches are stored"),
+        ("edit", "Edit Playlists.txt", "action", "open your playlist links to edit"),
+    ]),
+]
+
+
+def setting_value(cfg, key):
+    if key == "library":
+        return cfg.get("out") or "none", "path"
+    if key == "data":
+        return str(DATA), "path"
+    if key == "edit":
+        return "", "action"
+    value = cfg[key]
+    if isinstance(value, bool):
+        return ("on" if value else "off"), ("on" if value else "off")
+    if key == "name_style":
+        return STYLES[value], "choice"
+    if key == "rate_limit":
+        return (str(value) if value else "unlimited"), ("text" if value else "empty")
+    if key == "cookies":
+        return (str(value) if value else "none"), ("text" if value else "empty")
+    if key in ("format", "quality"):
+        return str(value), "choice"
+    if isinstance(value, (int, float)):
+        return str(value), "number"
+    return str(value), "text"
+
+
+def render_settings(cfg, category_index, category_cursor, selected_row, focus_right, narrow):
+    from rich import box
+    from rich.console import Group
+
+    category_name, setting_rows = SETTING_SECTIONS[category_index]
+    row_table = Table.grid(expand=True, padding=(0, 1))
+    row_table.add_column(width=2, no_wrap=True)
+    row_table.add_column(width=20, no_wrap=True, overflow="ellipsis")
+    row_table.add_column(ratio=1, no_wrap=True, justify="right", overflow="ellipsis")
+    for index, (key, label, kind, _) in enumerate(setting_rows):
+        selected = index == selected_row and focus_right
+        marker = Text("» " if selected else "  ", style="bold #ff9f1a" if selected else None)
+        name = Text(label, style="bold #ff9f1a" if selected else "#e6e6e6")
+        value, value_type = setting_value(cfg, key)
+        if selected and kind != "action":
+            value = f"‹ {value} ›" if terminal_columns() >= 60 else value
+            value_style = "bold #ff9f1a"
+        else:
+            value_style = {"on": "#3fb950", "off": "#8b8b8b", "number": "#4dd0e1",
+                           "choice": "#4dd0e1", "text": "#4dd0e1", "empty": "#8b8b8b",
+                           "path": "#8b8b8b", "action": "#8b8b8b"}[value_type]
+        row_table.add_row(marker, name, Text(value, style=value_style, no_wrap=True, overflow="ellipsis"))
+
+    note = setting_rows[selected_row]
+    description = Text.assemble((note[1], "#e6e6e6"), (" · ", "#8b8b8b"),
+                                (note[3], "#8b8b8b"), no_wrap=True, overflow="ellipsis")
+    right_panel = Panel(
+        Group(Text(category_name, style="#8b8b8b"), row_table,
+              Text("─" * max(1, terminal_columns() - (8 if not narrow else 4)),
+                   style="#333333", no_wrap=True, overflow="crop"),
+              description),
+        border_style="#5a5a5a", box=box.ROUNDED, padding=(0, 1), expand=True)
+
+    if narrow:
+        tab_name = category_name if category_cursor < 4 else ("Reset" if category_cursor == 4 else "‹ Back")
+        category_tab = Text(f"‹ {tab_name} ›", style="bold #ff9f1a", no_wrap=True)
+        panes = Group(category_tab, right_panel)
+    else:
+        left_rows = Table.grid(expand=True, padding=(0, 1))
+        left_rows.add_column(width=2, no_wrap=True)
+        left_rows.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        for index, (name, _) in enumerate(SETTING_SECTIONS):
+            focused = index == category_cursor
+            left_rows.add_row(Text("» " if focused else "  ",
+                                   style="bold #ff9f1a" if focused else None),
+                              Text(name, style="bold #ff9f1a" if focused else "#e6e6e6"))
+        left_rows.add_row("", Text(""))
+        for index, label in ((4, "Reset"), (5, "‹ Back")):
+            focused = index == category_cursor
+            left_rows.add_row(Text("» " if focused else "  ",
+                                   style="bold #ff9f1a" if focused else None),
+                              Text(label, style="#8b8b8b"))
+        left_panel = Panel(left_rows, width=20, border_style="#333333",
+                           box=box.ROUNDED, padding=(0, 1), expand=False)
+        pane_table = Table.grid(expand=True, padding=(0, 0))
+        pane_table.add_column(width=20, no_wrap=True)
+        pane_table.add_column(width=2, no_wrap=True)
+        pane_table.add_column(ratio=1)
+        pane_table.add_row(left_panel, Text(""), right_panel)
+        panes = pane_table
+
+    guide = Text("↑↓ move  ·  ←→ change value  ·  enter edit  ·  esc back",
+                 style="#5a5a5a", no_wrap=True, overflow="ellipsis")
+    return Group(Text("Settings", style="bold #ff9f1a"), Text(""), panes, guide)
+
+
 def settings(cfg):
-    while True:
-        console.clear()
-        console.print(f"[bold orange1]Settings[/]\n[dim]Data: {short_data_dir()}[/]\n")
-        items = [(f"{label:<22}{val(cfg, key)}", key) for key, label in LABELS]
-        items.extend([("Library folder", "library"), ("Data folder", "data"),
-                      ("Edit Playlists.txt", "edit"), ("Reset to defaults", "reset"), ("‹ Back", "back")])
-        try:
-            choice = ask("", items)
-        except Exception as e:
-            menu_error(e)
-            continue
-        if choice in (None, "back"):
+    category_index, category_cursor, selected_row = 0, 0, 0
+    focus_right = False
+    narrow = terminal_columns() < 80
+
+    def save_current_setting(key):
+        save_cfg(cfg)
+        return key
+
+    def handle_category_action(index):
+        nonlocal cfg
+        if index == 4:
+            try:
+                if questionary.confirm("Reset settings to defaults?", default=False).ask():
+                    out = cfg["out"]
+                    cfg.update(DEFAULTS)
+                    cfg["out"] = out
+                    save_cfg(cfg)
+            except KeyboardInterrupt:
+                return "ctrl+c"
+            return MENU_STAY
+        if index == 5:
             return cfg
-        try:
-            save = True
-            if choice == "library":
-                cfg = library_folder_menu(cfg)
-                save = False
-            elif choice == "data":
-                data_folder_menu()
-                save = False
-            elif choice == "edit":
-                open_playlists()
-                save = False
-            elif choice == "reset":
-                out = cfg["out"]
-                cfg.update(DEFAULTS)
-                cfg["out"] = out
-            elif isinstance(cfg[choice], bool):
-                cfg[choice] = not cfg[choice]
-            elif choice in CHOICES:
-                value = ask(dict(LABELS)[choice],
-                            [(str(STYLES.get(item, item)), item) for item in CHOICES[choice]] + [("‹ Back", "back")])
-                if value and value != "back":
-                    cfg[choice] = value
-            else:
-                value = questionary.text(dict(LABELS)[choice] + ":", default=str(cfg[choice])).ask()
-                if value is not None:
-                    cfg[choice] = (int(value) if value.isdigit() else cfg[choice]) \
-                        if choice == "retries" else value.strip()
-            if save:
-                save_cfg(cfg)
-        except Exception as e:
-            menu_error(e)
+        return None
+
+    def cycle_setting(setting, direction):
+        key, _, kind, _ = setting
+        if kind == "bool":
+            cfg[key] = not cfg[key]
+        elif kind == "choice":
+            choices = CHOICES[key]
+            current = choices.index(cfg[key]) if cfg[key] in choices else 0
+            cfg[key] = choices[(current + direction) % len(choices)]
+        elif key == "jobs":
+            cfg[key] = min(6, max(1, int(cfg[key]) + direction))
+        elif key == "retries":
+            cfg[key] = min(10, max(1, int(cfg[key]) + direction))
+        else:
+            return False
+        save_current_setting(key)
+        return True
+
+    def activate_setting(setting):
+        nonlocal cfg
+        key, label, kind, _ = setting
+        if kind == "bool":
+            cfg[key] = not cfg[key]
+            save_current_setting(key)
+        elif kind == "text":
+            try:
+                value = questionary.text(label + ":", default=str(cfg[key] or "")).ask()
+            except KeyboardInterrupt:
+                return "ctrl+c"
+            if value is not None:
+                cfg[key] = value.strip()
+                save_current_setting(key)
+        elif kind == "library":
+            try:
+                value = questionary.text("Music folder:", default=cfg["out"]).ask()
+            except KeyboardInterrupt:
+                return "ctrl+c"
+            if value and value.strip():
+                new_path = Path(value.strip()).expanduser().resolve()
+                if new_path != Path(cfg["out"]).expanduser().resolve():
+                    with console.status("[cyan]Loading library..."):
+                        new_path = ensure_lib(new_path)
+                        cfg = load_cfg(new_path)
+                        get_lib(new_path)
+                        save_cfg(cfg)
+        elif kind == "data":
+            data_folder_menu()
+        elif kind == "action":
+            open_playlists()
+        return MENU_STAY
+
+    def render():
+        return render_settings(cfg, category_index, category_cursor, selected_row, focus_right, narrow)
+
+    def handle(key):
+        nonlocal category_index, category_cursor, selected_row, focus_right, cfg
+        if key in ("ctrl+c", "q"):
+            return cfg
+        if key == "esc":
+            if focus_right:
+                focus_right = False
+                return MENU_STAY
+            return cfg
+
+        if narrow:
+            if not focus_right:
+                if key in ("left", "right"):
+                    category_cursor = (category_cursor + (-1 if key == "left" else 1)) % 4
+                    category_index, selected_row = category_cursor, 0
+                elif key in ("up", "down"):
+                    category_cursor = min(5, max(0, category_cursor + (1 if key == "down" else -1)))
+                    if category_cursor < 4:
+                        category_index, selected_row = category_cursor, 0
+                elif key == "enter":
+                    action = handle_category_action(category_cursor)
+                    if action is not None:
+                        return action
+                    focus_right = True
+                return MENU_STAY
+        elif not focus_right:
+            if key in ("up", "down"):
+                category_cursor = min(5, max(0, category_cursor + (1 if key == "down" else -1)))
+                if category_cursor < 4:
+                    category_index, selected_row = category_cursor, 0
+            elif key in ("right", "enter"):
+                action = handle_category_action(category_cursor)
+                if action is not None:
+                    return action
+                focus_right = True
+            return MENU_STAY
+
+        setting_rows = SETTING_SECTIONS[category_index][1]
+        if key in ("up", "down"):
+            selected_row = (selected_row + (1 if key == "down" else -1)) % len(setting_rows)
+        elif key == "left":
+            if not cycle_setting(setting_rows[selected_row], -1):
+                focus_right = False
+        elif key == "right":
+            cycle_setting(setting_rows[selected_row], 1)
+        elif key == "enter":
+            action = activate_setting(setting_rows[selected_row])
+            if action == "ctrl+c":
+                return cfg
+        return MENU_STAY
+
+    while True:
+        result = key_screen_loop(render, handle)
+        if result is cfg or result == "ctrl+c":
+            return cfg
 
 
 def review(cfg, plan):
@@ -3198,6 +3539,65 @@ def header(cfg, upd):
     console.print()
 
 
+def render_main_menu(cfg, selected):
+    from rich import box
+    from rich.console import Group
+
+    lib = get_lib(cfg["out"])
+    cards = [
+        ("Songs", str(len(lib.d["songs"])), "#4dd0e1"),
+        ("Size", size(lib.total_size()), "#4dd0e1"),
+        ("Playlists", str(len(all_urls(cfg))), "#4dd0e1"),
+        ("Last sync", ago(lib.d["stats"]["last_run"]), "#e6e6e6"),
+    ]
+    header_text = Group(
+        Text.assemble(("♪  ytmusic-sync", "bold #f5a623"),
+                      (f"  v{VERSION}", "#e6e6e6")),
+        Text("YouTube music + Local, always in sync", style="#8b8b8b"))
+    header_panel = Panel(header_text, border_style="#f5a623", box=box.ROUNDED,
+                         padding=(0, 1), expand=False)
+
+    card_grid = Table.grid(expand=True, padding=(0, 1))
+    if terminal_columns() < 70:
+        card_grid.add_column(ratio=1)
+        card_grid.add_column(ratio=1)
+        rendered_cards = [
+            Panel(Group(Text(label, style="#8b8b8b"),
+                        Text(value, style=f"bold {color}", no_wrap=True, overflow="ellipsis")),
+                  border_style="#333333", box=box.ROUNDED, padding=(0, 1), expand=True)
+            for label, value, color in cards
+        ]
+        card_grid.add_row(rendered_cards[0], rendered_cards[1])
+        card_grid.add_row(rendered_cards[2], rendered_cards[3])
+    else:
+        for _ in cards:
+            card_grid.add_column(ratio=1)
+        rendered_cards = [
+            Panel(Group(Text(label, style="#8b8b8b"),
+                        Text(value, style=f"bold {color}", no_wrap=True, overflow="ellipsis")),
+                  border_style="#333333", box=box.ROUNDED, padding=(0, 1), expand=True)
+            for label, value, color in cards
+        ]
+        card_grid.add_row(*rendered_cards)
+
+    path_line = Text(f"{cfg['out']} · Data: {short_data_dir()}",
+                     style="#8b8b8b", no_wrap=True, overflow="ellipsis")
+    menu = Table.grid(expand=True, padding=(0, 0))
+    menu.add_column(width=2, no_wrap=True)
+    menu.add_column(width=3, no_wrap=True)
+    menu.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    labels = ("Update library", "Add Music", "Settings", "Stats", "Quit")
+    for index, label in enumerate(labels):
+        active = index == selected
+        menu.add_row(Text("» " if active else "  ",
+                          style="bold #ff9f1a" if active else None),
+                     Text(str(index + 1) if index < 4 else "q", style="#8b8b8b"),
+                     Text(label, style="bold #ff9f1a" if active else "#e6e6e6"))
+    guide = Text("↑↓ move  ·  enter select  ·  q quit",
+                 style="#5a5a5a", no_wrap=True, overflow="ellipsis")
+    return Group(header_panel, card_grid, path_line, Text(""), menu, guide)
+
+
 def pick_library():
     console.print(Panel("[bold orange1]Welcome![/]\nWhere should your music library live?\n"
                         "[dim]Songs and .m3u8 playlists go here; app data is stored in ~/.ytmusic-sync.[/]",
@@ -3207,51 +3607,50 @@ def pick_library():
 
 
 def interactive(cfg):
-    while True:
-        console.clear()
-        upd = UPDATE_CHECKER.result if UPDATE_CHECKER and UPDATE_CHECKER.done.is_set() else None
-        header(cfg, upd)
-        report_update_timing()
-        if TIMING_ENABLED and "startup timing printed" not in TIMINGS:
-            print_timings()
-            TIMINGS["startup timing printed"] = 1
-        first = not all_urls(cfg)
-        menu = [("Use defaults & start", "go"), ("Customize", "set"), ("Quit", "q")] if first else \
-               [("Update library", "upd"), ("Add Music", "add"), ("Settings", "set"), ("Stats", "stats")]
-        if upd:
-            menu.append((f"Update yt-dlp ({upd[0]} → {upd[1]})", "ytdlp"))
-        if not first:
-            menu.append(("Quit", "q"))
+    selected = 0
+    if TIMING_ENABLED and "startup timing printed" not in TIMINGS:
+        print_timings()
+        TIMINGS["startup timing printed"] = 1
+
+    def handle(key):
+        nonlocal cfg, selected
+        if key in ("q", "ctrl+c"):
+            return "quit"
+        if key in ("up", "down"):
+            selected = (selected + (1 if key == "down" else -1)) % 5
+            return MENU_STAY
+        if key in ("1", "2", "3", "4"):
+            selected = int(key) - 1
+        elif key == "enter":
+            pass
+        else:
+            return MENU_STAY
+
         try:
-            k = ask("", menu)
-        except Exception as e:
-            menu_error(e)
-            continue
-        if k in (None, "q"):
-            return
-        try:
-            if k == "set":
-                cfg = settings(cfg)
-            elif k == "stats":
-                show_stats(cfg)
-                pause()
-            elif k == "ytdlp":
-                upgrade_ytdlp()
-                pause()
-            elif k == "go":
-                links = all_urls(cfg)
-                if not links:
-                    links = add_links(cfg) or []
-                if links and run_flow(cfg, True, links) == "exit":
-                    return
-            elif k == "add":
+            if selected == 0:
+                if run_flow(cfg, False) == "exit":
+                    return "quit"
+            elif selected == 1:
                 links = add_links(cfg)
                 if links and run_flow(cfg, True, links) == "exit":
-                    return
-            elif k == "upd" and run_flow(cfg, False) == "exit":
-                return
+                    return "quit"
+            elif selected == 2:
+                cfg = settings(cfg)
+            elif selected == 3:
+                show_stats(cfg)
+                pause()
+            else:
+                return "quit"
         except Exception as e:
             menu_error(e)
+            pause()
+        return MENU_STAY
+
+    while True:
+        report_update_timing()
+        result = key_screen_loop(lambda: render_main_menu(cfg, selected), handle)
+        if result in ("quit", "ctrl+c"):
+            return
 
 
 # ---------- command line ----------

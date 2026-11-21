@@ -1075,15 +1075,22 @@ def render_scan(state):
         playlists_with_new = sum(any(item["id"] in new_ids for item in row.get("items", []))
                                  for row in rows)
     latest = state.latest_new_items()
-    title_capacity = max(0, (row_capacity - 8) if not narrow
-                         else (height - 15 - len(table.rows)))
-    latest_slots = title_capacity
-    if len(latest) > latest_slots and latest_slots:
-        shown_latest = latest[:latest_slots - 1]
+    playlist_row_count = len(table.rows)
+    fixed_sidebar_rows = 8
+    area_height = max(playlist_row_count, fixed_sidebar_rows)
+    title_slots = (area_height - fixed_sidebar_rows
+                   if playlist_row_count >= fixed_sidebar_rows else 0)
+    if len(latest) > title_slots and title_slots:
+        shown_latest = latest[:title_slots - 1]
         more_latest = len(latest) - len(shown_latest)
     else:
-        shown_latest = latest[:latest_slots]
+        shown_latest = latest[:title_slots]
         more_latest = 0
+    if title_slots == 0 and latest:
+        more_latest = len(latest)
+    area_height = max(area_height, fixed_sidebar_rows + (1 if more_latest else 0))
+    while len(table.rows) < area_height:
+        table.add_row(*([Text("")] * len(table.columns)))
 
     sidebar_width = inner_width if narrow else min(28, max(inner_width - 2, 1))
     sidebar = Table.grid(expand=True, padding=(0, 0))
@@ -1108,13 +1115,15 @@ def render_scan(state):
     failed_line.append(" failed", style="#f85149" if failed else "#8b8b8b")
     sidebar.add_row(failed_line)
     sidebar.add_row(Text("─" * sidebar_width, style="#333333", no_wrap=True, overflow="crop"))
-    sidebar.add_row(Text("Latest new", style="#8b8b8b"))
+    sidebar.add_row(Text("Found", style="#8b8b8b"))
     for _, item, _ in shown_latest:
         title = Text(item.get("title") or item["id"])
         title.truncate(max(sidebar_width - 1, 1), overflow="ellipsis")
         sidebar.add_row(title)
     if more_latest:
         sidebar.add_row(Text(f"+{more_latest} more", style="#8b8b8b"))
+    while len(sidebar.rows) < area_height:
+        sidebar.add_row(Text(""))
 
     if narrow:
         content = Group(header, bar, table, sidebar)
