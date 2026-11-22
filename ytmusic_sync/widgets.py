@@ -310,7 +310,14 @@ def _secondary(item: SelectItem) -> RenderableType | None:
     return None
 
 
-def _content(item: SelectItem, selected: bool, label_width: int, content_width: int) -> Text:
+def _content(
+    item: SelectItem,
+    selected: bool,
+    label_width: int,
+    content_width: int,
+    *,
+    selected_background: bool = True,
+) -> Text:
     label_width = min(max(0, label_width), content_width)
     label = truncate(item.label, label_width)
     label_padding = max(0, label_width - cell_len(label))
@@ -325,7 +332,7 @@ def _content(item: SelectItem, selected: bool, label_width: int, content_width: 
     label_color = DIMMER if dimmed else (ACCENT if selected else TEXT)
     desc_color = DIMMER if dimmed or not selected else DIM
     hotkey_color = DIMMER if dimmed or not selected else ACCENT
-    bgcolor = SEL_FILL if selected else None
+    bgcolor = SEL_FILL if selected and selected_background else None
     result = Text()
     result.append(label, style=Style(color=label_color, bold=selected and not dimmed, bgcolor=bgcolor))
     result.append(" " * label_padding, style=Style(color=label_color, bold=selected and not dimmed, bgcolor=bgcolor))
@@ -387,10 +394,15 @@ class _SelectRenderable:
             )
             row = Text()
             row.append("▌", style=Style(color=bar_color))
-            fill_style = Style(bgcolor=SEL_FILL) if selected else Style()
-            row.append(" ", style=fill_style)
-            row.append_text(_content(item, selected, self.label_width, content_width))
-            row.append(" ", style=fill_style)
+            row.append(" ")
+            row.append_text(_content(
+                item,
+                selected,
+                self.label_width,
+                content_width,
+                selected_background=False,
+            ))
+            row.append(" ")
             row.append("│", style=Style(color=edge_color))
             yield row
             yield Text.assemble(

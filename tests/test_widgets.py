@@ -1,15 +1,19 @@
+import io
 import random
 import unittest
 from datetime import datetime
 
 from rich.cells import cell_len
+from rich.console import Console
 
 from ytmusic_sync.widgets import (
+    SelectItem,
     clock_12h,
     fmt_duration,
     fmt_size,
     fmt_speed,
     middle_truncate,
+    render_select,
     segmented_bar,
     truncate,
 )
@@ -74,6 +78,26 @@ class WidgetTests(unittest.TestCase):
         noon = datetime(2024, 1, 1, 12, 0).timestamp()
         self.assertEqual(clock_12h(midnight), "12:00 AM")
         self.assertEqual(clock_12h(noon), "12:00 PM")
+
+    def test_boxed_selection_has_transparent_fill_and_bounded_rail(self):
+        width = 40
+        console = Console(width=width, height=60, file=io.StringIO(), color_system="truecolor")
+        rendered = render_select(
+            [SelectItem("Selected", "Description"), SelectItem("Unselected", "Other")],
+            selected=0,
+            variant="boxed",
+            width=width,
+        )
+        lines = console.render_lines(rendered, console.options.update(width=width), pad=False)
+
+        self.assertEqual(len(lines), 6)
+        for line in lines[:3]:
+            self.assertTrue(all(segment.style.bgcolor is None for segment in line))
+            rail = next(segment for segment in line if segment.text.startswith("▌"))
+            self.assertEqual(rail.style.color.name, "#ff9f1a")
+        for line in lines[3:]:
+            rail = next(segment for segment in line if segment.text.startswith("▌"))
+            self.assertEqual(rail.style.color.name, "#2f2f2f")
 
 
 if __name__ == "__main__":
