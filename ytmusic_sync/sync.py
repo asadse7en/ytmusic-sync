@@ -267,4 +267,6 @@ def _write_failed_file(failures: list[Failure]) -> None:
         return
     clean = lambda text: " ".join(str(text).split())
     config.atomic_write(config.FAILED_FILE, "\n".join(
-        f"{clean(f.title)}\t{clean(f.artist)}\t{clean(f.reason)}" for f in failures) + "\n")
+        f"{clean(f.title)}\t{clean(f.artist)}\t{clean(f.reason)}\t"
+        f"{clean(f'https://www.youtube.com/watch?v={f.id}' if f.id else '')}"
+        for f in failures) + "\n")
