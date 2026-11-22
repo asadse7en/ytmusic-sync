@@ -299,6 +299,7 @@ class SelectItem:
     enabled: bool = True
     dim: bool = False
     desc_color: str | None = None
+    desc_align: str = "left"
 
 
 def _secondary(item: SelectItem) -> RenderableType | None:
@@ -327,7 +328,8 @@ def _content(
     prefix_width = rest_width - hotkey_width
     desc_width = max(0, prefix_width - (1 if hotkey and prefix_width else 0))
     desc = truncate(item.desc, desc_width)
-    prefix = desc + " " * max(0, prefix_width - cell_len(desc))
+    padding = " " * max(0, prefix_width - cell_len(desc))
+    prefix = padding + desc if item.desc_align == "right" else desc + padding
     dimmed = item.dim or not item.enabled
     label_color = DIMMER if dimmed else (ACCENT if selected else TEXT)
     desc_color = DIMMER if dimmed else (ACCENT if selected else (item.desc_color or DIM))

@@ -7,6 +7,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from rich.cells import cell_len
 from rich.console import Group
 from rich.style import Style
 from rich.text import Text
@@ -581,11 +582,16 @@ def settings_menu(settings: Settings) -> None:
                 index += 1
 
         key, label = rows[selected]
-        description = Text()
-        description.append(label, style=Style(color=TEXT))
-        description.append(" · ", style=Style(color=DIM))
-        description.append(truncate(SETTING_DESCRIPTIONS[key], max(0, width - len(label) - 3)),
-                           style=Style(color=DIM))
+        description_text = SETTING_DESCRIPTIONS[key]
+        available = max(0, width - cell_len(label))
+        if cell_len(description_text) > available:
+            description_text = truncate(description_text, available)
+        gap = max(0, width - cell_len(label) - cell_len(description_text))
+        description = Text.assemble(
+            Text(label, style=Style(color=TEXT)),
+            " " * gap,
+            Text(description_text, style=Style(color=DIM)),
+        )
         content.extend((divider(width), description))
         panel = panel_with_title(
             Group(*content),
@@ -644,7 +650,7 @@ def _settings_row(label: str, value: str, color: str, selected: bool, width: int
                   *, dim_label: bool = False):
     display_value = f"‹ {value} ›" if selected and value else value
     return render_select(
-        [SelectItem(label=label, desc=display_value, desc_color=color, dim=dim_label)],
+        [SelectItem(label=label, desc=display_value, desc_color=color, desc_align="right", dim=dim_label)],
         0 if selected else -1,
         variant="compact",
         label_width=24,
