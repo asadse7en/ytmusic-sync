@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from . import links
 from .library import Library
 from .scanner import ScanResult, ScannedPlaylist
 from .tags import song_key
@@ -77,9 +78,10 @@ def make_plan(lib: Library, scan: ScanResult, skip_duplicates: bool = True) -> P
 
     playlist_memberships: dict[str, set[str]] = {}
     for playlist in scan.playlists:
+        playlist_id = links.playlist_id(playlist.url) or playlist.url
         for item in playlist.items:
             canonical = lib.canonical(item["id"])
-            playlist_memberships.setdefault(canonical, set()).add(playlist.url)
+            playlist_memberships.setdefault(canonical, set()).add(playlist_id)
 
     for entry in todo:
         entry["playlist_ids"] = tuple(sorted(playlist_memberships.get(entry["id"], ())))

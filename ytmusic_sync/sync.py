@@ -167,7 +167,8 @@ def _finish_run(settings: config.Settings, plan: Plan, result: RunResult, starte
                 stopping=None, live=None, prune_ok: bool = False) -> list[dict]:
     lib = plan.lib
     previous_playlists = {
-        playlist.url: {lib.canonical(vid) for vid in lib.playlists.get(playlist.name, [])}
+        (links.playlist_id(playlist.url) or playlist.url):
+        {lib.canonical(vid) for vid in lib.playlists.get(playlist.name, [])}
         for playlist in plan.playlists
     }
     _write_playlists(settings, plan)
@@ -208,15 +209,16 @@ def _finish_run(settings: config.Settings, plan: Plan, result: RunResult, starte
 
     rows = []
     for playlist in plan.playlists:
+        playlist_id = links.playlist_id(playlist.url) or playlist.url
         ids = [e["id"] for e in playlist.items]
         canonical = {lib.canonical(i) for i in ids}
         rows.append({
-            "id": playlist.url,
+            "id": playlist_id,
             "name": playlist.name,
             "songs": len(canonical & lib.songs.keys()),
-            "added": added.get(playlist.url, 0),
-            "failed": failed.get(playlist.url, 0),
-            "removed": removed.get(playlist.url, 0),
+            "added": added.get(playlist_id, 0),
+            "failed": failed.get(playlist_id, 0),
+            "removed": removed.get(playlist_id, 0),
         })
     return rows
 

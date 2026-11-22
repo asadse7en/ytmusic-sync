@@ -635,6 +635,8 @@ class StoppingView:
         from rich.table import Table
 
         states, elapsed = self.progress.snapshot()
+        spinner = ("⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠋", "⠙")
+        frame = spinner[int(elapsed * 8) % len(spinner)]
         labels = (
             "Cancelling downloads",
             "Finishing conversions",
@@ -646,7 +648,7 @@ class StoppingView:
             if state == "done":
                 mark, color = "✓", GREEN
             elif state == "running":
-                mark, color = "⠹", ACCENT
+                mark, color = frame, ACCENT
             else:
                 mark, color = "○", DIMMER
             lines.append(Text(f"{mark} {label}", style=Style(color=color)))
