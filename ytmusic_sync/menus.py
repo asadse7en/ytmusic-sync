@@ -461,7 +461,7 @@ def paste_links(settings: Settings) -> None:
         panel = panel_with_title(Group(*body), "Add Music", dim="Paste links", border=BORDER)
         return Group(panel, footer_hint("enter on empty line = done · esc cancel"))
 
-    with Live(view(), console=out, auto_refresh=False) as live:
+    with Live(view(), console=out, auto_refresh=False, screen=True) as live:
         while True:
             if update_previews():
                 live.update(view(), refresh=True)
@@ -585,7 +585,7 @@ def settings_menu(settings: Settings) -> None:
         )
         return Group(panel, footer_hint("↑↓ move · ←→ change value · enter edit · esc back"))
 
-    with Live(view(), console=out, auto_refresh=False) as live:
+    with Live(view(), console=out, auto_refresh=False, screen=True) as live:
         while True:
             key = read_key()
             if key == "up":

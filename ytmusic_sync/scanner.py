@@ -228,7 +228,8 @@ def scan_links(urls: list[str], settings: Settings, progress=None) -> ScanResult
 
             from . import ui
 
-            with Live(ui.ScanPanel(result.progress), console=ui.console(), refresh_per_second=8, transient=True):
+            with Live(ui.ScanPanel(result.progress), console=ui.console(), refresh_per_second=8,
+                      transient=True, screen=True):
                 run_workers()
         else:
             run_workers()

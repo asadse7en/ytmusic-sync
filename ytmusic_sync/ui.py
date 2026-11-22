@@ -454,6 +454,7 @@ def print_scan_summary(snapshot: dict) -> None:
     line.truncate(out.width, overflow="crop")
     line.no_wrap = True
     line.overflow = "crop"
+    out.clear()
     out.print(line)
 
 
@@ -884,6 +885,7 @@ def song_line(ok: bool, count: int, total: int, title: str, note: str) -> Text:
 def print_plan(plan, dry_run: bool = False) -> None:
     """Short pre-download overview (also used by the review screen)."""
     out = console()
+    out.clear()
     scan = plan.scan
     summary = Text()
     summary.append(str(len(plan.wanted)), style=Style(color=TEXT, bold=True))
@@ -1001,17 +1003,23 @@ def print_run_summary(
         dim="Update library",
         border=BORDER,
     )
-    out.print(Group(
+    result_view = Group(
         panel,
         footer_hint("enter back · f failures" if result.failures else "enter back"),
-    ))
+    )
     if wait_for_key:
-        while True:
-            key = keys.read_key()
-            if key == "f" and result.failures:
-                show_failures(result.failures)
-            elif key in ("enter", "esc", "ctrl-c"):
-                break
+        with out.screen():
+            out.clear()
+            out.print(result_view)
+            while True:
+                key = keys.read_key()
+                if key == "f" and result.failures:
+                    show_failures(result.failures)
+                elif key in ("enter", "esc", "ctrl-c"):
+                    break
+    else:
+        out.clear()
+        out.print(result_view)
 
 
 def _playlist_results_table(
@@ -1294,10 +1302,11 @@ def print_stats(lib: Library, *, interactive: bool = False) -> None:
         )
 
     if not interactive:
+        out.clear()
         out.print(view())
         return
 
-    with Live(view(), console=out, auto_refresh=False, transient=True) as live:
+    with Live(view(), console=out, auto_refresh=False, transient=True, screen=True) as live:
         while True:
             key = keys.read_key()
             if key in ("enter", "esc", "ctrl-c"):

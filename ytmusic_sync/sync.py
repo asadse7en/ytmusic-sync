@@ -8,16 +8,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from rich.style import Style
-from rich.text import Text
-
 from . import config, links, ui, ytdlp
 from .downloader import Failure, TrackResult, run_downloads
 from .library import open_library
 from .planner import Plan, make_plan
 from .progress import Tracker
 from .scanner import scan_links
-from .theme import CYAN
 from .widgets import confirm_boxes
 
 
@@ -50,14 +46,9 @@ def setup_logging() -> None:
 
 def prepare(settings: config.Settings, urls: list[str]) -> Plan:
     """Open the library, scan the links and work out what is new."""
-    out = ui.console()
-    with out.status(Text("Loading library...", style=Style(color=CYAN))):
-        lib = open_library(settings.out_path)
-        lib.refresh_files()
-    with out.status(Text("Scanning links...", style=Style(color=CYAN))) as status:
-        scan = scan_links(urls, settings,
-                          progress=lambda done, total: status.update(
-                              Text(f"Scanning links... {done}/{total}", style=Style(color=CYAN))))
+    lib = open_library(settings.out_path)
+    lib.refresh_files()
+    scan = scan_links(urls, settings, progress=lambda *_: None)
     return make_plan(lib, scan, settings.skip_duplicate_songs)
 
 
@@ -104,7 +95,8 @@ def execute(settings: config.Settings, plan: Plan, *, compact: bool = False, pru
         else:
             from rich.live import Live
 
-            with Live(ui.Dashboard(tracker), console=out, refresh_per_second=8, transient=True) as live:
+            with Live(ui.Dashboard(tracker), console=out, refresh_per_second=8,
+                      transient=True, screen=True) as live:
                 stopping = {"progress": None}
 
                 def show_stopping() -> None:

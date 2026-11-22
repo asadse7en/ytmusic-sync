@@ -450,7 +450,7 @@ def run_select(
         return None
     selected = start if 0 <= start < len(items) and items[start].enabled else enabled[0]
     console = get_console()
-    with Live(view_factory(selected), console=console, auto_refresh=False) as live:
+    with Live(view_factory(selected), console=console, auto_refresh=False, screen=True) as live:
         while True:
             key = keys.read_key()
             if key is None:
@@ -531,7 +531,8 @@ def confirm_boxes(message: RenderableType, title: str | None = None, default: bo
     """Ask for confirmation using two side-by-side bordered choices."""
     console = get_console()
     yes = default
-    with Live(_confirm_view(message, title, yes, console), console=console, auto_refresh=False) as live:
+    with Live(_confirm_view(message, title, yes, console), console=console, auto_refresh=False,
+              screen=True) as live:
         while True:
             key = keys.read_key()
             if key is None:
