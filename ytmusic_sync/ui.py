@@ -608,6 +608,11 @@ def _failure_url(failure) -> tuple[str, str]:
         display = display[4:]
     if display.startswith("youtu.be/"):
         display = "youtube.com/watch?v=" + display.split("/", 1)[1].split("?", 1)[0]
+    elif "youtube.com/watch?" in display:
+        query = display.split("?", 1)[1]
+        video_id = next((part[2:] for part in query.split("&") if part.startswith("v=")), "")
+        if video_id:
+            display = "youtube.com/watch?v=" + video_id
     return url, display
 
 
@@ -1066,8 +1071,11 @@ def _stats_sync_line(stats: dict) -> Text:
     if not stamp or stamp == "never":
         return Text("Last sync never", style=Style(color=DIM))
 
+    relative = time_ago(str(stamp))
+    if relative == "never":
+        return Text("Last sync never", style=Style(color=DIM))
     line = Text("Last sync ", style=Style(color=DIM))
-    line.append(time_ago(str(stamp)), style=Style(color=TEXT))
+    line.append(relative, style=Style(color=TEXT))
     details = []
     new_count = _stat_count(stats.get("new"))
     failed_count = _stat_count(stats.get("failed"))
