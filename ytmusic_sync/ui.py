@@ -15,8 +15,8 @@ from . import __version__, config, keys, ytdlp
 from .library import Library, open_library, time_ago
 from .progress import Tracker
 from .theme import (
-    ACCENT, BLUE, BORDER, BOX_BORDER, BRAND, CYAN, DARK_ORANGE, DIM, DIMMER, DIVIDER, GREEN, LINK,
-    LINK_DIM, PATH, RED, TEXT, TRACK, WORKER_BORDER, get_console,
+    ACCENT, ARTIST_COLORS, BAR_OFF, BLUE, BORDER, BOX_BORDER, BRAND, CYAN, DARK_ORANGE, DIM, DIMMER,
+    DIVIDER, GREEN, LINK, LINK_DIM, PATH, PLAYLIST_COLORS, RED, TEXT, TRACK, WORKER_BORDER, get_console,
 )
 from .widgets import (
     SelectItem,
@@ -1188,181 +1188,161 @@ def _stat_count(value) -> int:
         return 0
 
 
-def _stats_playlist_rows(lib: Library) -> list[dict]:
-    saved = lib.stats.get("last_playlists")
-    if isinstance(saved, list):
-        source = saved
-    else:
-        source = [
-            {
-                "name": name,
-                "songs": len({lib.canonical(value) for value in ids
-                              if lib.canonical(value) in lib.songs}),
-                "new": 0,
-                "failed": 0,
-            }
-            for name, ids in lib.playlists.items()
-        ]
-    rows = []
-    for item in source:
-        if not isinstance(item, dict):
-            continue
-        rows.append({
-            "name": str(item.get("name") or item.get("id") or "Unknown playlist"),
-            "songs": _stat_count(item.get("songs")),
-            "new": _stat_count(item.get("new", item.get("added", 0))),
-            "failed": _stat_count(item.get("failed")),
-        })
-    return sorted(rows, key=lambda row: -row["songs"])
+def _stat_tiles(lib: Library):
+    from rich.table import Table
+
+    width = max(1, console().width - 6)
+    columns = 4 if console().width >= 80 else 2
+    tile_width = max(4, (width - 2 * (columns - 1)) // columns)
+    seconds = sum(_stat_count(song.get("dur")) for song in lib.songs.values())
+    hours, minutes = divmod(seconds // 60, 60)
+    playtime = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+    metrics = (
+        ("Songs", str(len(lib.songs))),
+        ("Size", fmt_size(lib.total_size())),
+        ("Playtime", playtime),
+        ("Playlists", str(len(lib.playlists))),
+    )
+    grid = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
+    for _ in range(columns):
+        grid.add_column(ratio=1)
+    for start in range(0, len(metrics), columns):
+        grid.add_row(*(tile(label, value, tile_width) for label, value in metrics[start:start + columns]))
+    return grid
 
 
-def _stats_sync_line(stats: dict) -> Text:
+def _sync_line(lib: Library, width: int) -> Text:
+    stats = lib.stats
     stamp = stats.get("last_run")
-    if not stamp or stamp == "never":
-        return Text("Last sync never", style=Style(color=DIM))
-
-    relative = time_ago(str(stamp))
-    if relative == "never":
-        return Text("Last sync never", style=Style(color=DIM))
+    relative = time_ago(str(stamp)) if stamp and stamp != "never" else "never"
     line = Text("Last sync ", style=Style(color=DIM))
-    line.append(relative, style=Style(color=TEXT))
-    details = []
-    new_count = _stat_count(stats.get("new"))
-    failed_count = _stat_count(stats.get("failed"))
-    try:
-        elapsed = float(stats.get("duration_seconds") or 0)
-    except (TypeError, ValueError):
-        elapsed = 0
-    if new_count:
-        details.append(("+", f"{new_count} new", GREEN))
-    if failed_count:
-        details.append(("", f"{failed_count} failed", RED))
-    if elapsed > 0:
-        details.append(("", f"{elapsed:.1f}s", DIM))
-    for sign, value, color in details:
+    line.append(relative, style=Style(color=TEXT, bold=True))
+
+    def separator():
         line.append(" · ", style=Style(color=DIM))
-        line.append(f"{sign}{value}", style=Style(color=color))
+
+    separator()
+    line.append(f"+{_stat_count(stats.get('new'))}", style=Style(color=GREEN, bold=True))
+    line.append(" new", style=Style(color=DIM))
+    failed = _stat_count(stats.get("failed"))
+    if failed:
+        separator()
+        line.append(str(failed), style=Style(color=RED, bold=True))
+        line.append(" failed", style=Style(color=DIM))
+    try:
+        duration = float(stats.get("duration_seconds"))
+    except (TypeError, ValueError):
+        duration = None
+    if duration is not None and duration >= 0:
+        separator()
+        line.append(f"{duration:.1f}s", style=Style(color=TEXT, bold=True))
+    separator()
+    line.append(str(_stat_count(stats.get("runs"))), style=Style(color=TEXT, bold=True))
+    line.append(" runs", style=Style(color=DIM))
+    separator()
+    line.append(str(_stat_count(stats.get("downloads"))), style=Style(color=TEXT, bold=True))
+    line.append(" downloads", style=Style(color=DIM))
     line.no_wrap = True
     line.overflow = "crop"
+    if cell_len(line.plain) > width:
+        line.truncate(width, overflow="crop")
     return line
 
 
-def _playlist_stats_panel(row: dict, rank: int, selected: bool, width: int):
-    songs = Text()
-    songs.append(str(row["songs"]), style=Style(
-        color=ACCENT if rank < 3 else TEXT,
-        bold=True,
-    ))
-    songs.append(" songs", style=Style(color=DIM))
+def _share_column(title: str, items: list[tuple[str, int]], colors: list[str], total: int, width: int):
+    from rich.table import Table
 
-    status = Text()
-    parts = []
-    if row["new"]:
-        parts.append((f"+{row['new']} new", GREEN))
-    if row["failed"]:
-        parts.append((f"✗ {row['failed']} failed", RED))
-    if not parts:
-        status.append("no changes", style=Style(color=DIMMER))
-    else:
-        for index, (label, color) in enumerate(parts):
-            if index:
-                status.append(" · ", style=Style(color=DIM))
-            status.append(label, style=Style(color=color))
-    status.no_wrap = True
-    status.overflow = "ellipsis"
+    heading = Table.grid(expand=True, padding=0, pad_edge=False)
+    heading.add_column(ratio=1)
+    heading.add_column(justify="right")
+    heading.add_row(
+        Text(title, style=Style(color=ACCENT, bold=True)),
+        Text("share of library", style=Style(color=DIMMER)),
+    )
+    content = [heading]
+    if not items:
+        content.append(Text("Nothing to show yet", style=Style(color=DIM)))
+        return Group(*content)
 
-    border = ACCENT if selected else DARK_ORANGE if rank < 3 else BOX_BORDER
-    title = Text(
-        truncate(row["name"], max(1, width - 4)),
-        style=Style(color=TEXT, bold=rank < 3),
-    )
-    return panel_with_title(
-        Group(songs, status),
-        name=title,
-        border=border,
-        padding=(0, 1),
-    )
+    if total > 0:
+        parts = [(count, colors[index]) for index, (_, count) in enumerate(items)]
+        remainder = max(0, total - sum(count for _, count in items))
+        parts.append((remainder, BAR_OFF))
+        content.append(segmented_bar(width, parts, total))
+
+    for index, (name, count) in enumerate(items):
+        count_text = str(count)
+        name_width = max(0, width - 2 - cell_len(count_text) - 1)
+        shown_name = truncate(name, name_width)
+        row = Text()
+        row.append("● ", style=Style(color=colors[index]))
+        row.append(shown_name, style=Style(color=TEXT))
+        gap = max(1, width - cell_len(row.plain) - cell_len(count_text))
+        row.append(" " * gap)
+        row.append(count_text, style=Style(color=TEXT, bold=True))
+        row.no_wrap = True
+        row.overflow = "crop"
+        content.append(row)
+    return Group(*content)
 
 
 def print_stats(lib: Library, *, interactive: bool = False) -> None:
-    from math import ceil
     from rich.live import Live
     from rich.table import Table
 
     out = console()
-    stats = lib.stats
-    rows = _stats_playlist_rows(lib)
+    playlist_items = []
+    for name, ids in lib.playlists.items():
+        canonical_ids = {lib.canonical(vid) for vid in ids}
+        count = sum(vid in lib.songs for vid in canonical_ids)
+        playlist_items.append((str(name), count))
+    playlist_items.sort(key=lambda item: -item[1])
+    rows = playlist_items
+    playlist_items = playlist_items[:5]
+
+    artist_counts = Counter()
+    for song in lib.songs.values():
+        artist = str(song.get("artist") or "").strip()
+        if not artist:
+            continue
+        primary = artist.split(",", 1)[0].split(" & ", 1)[0].strip()
+        if primary and primary.casefold() != "unknown":
+            artist_counts[primary] += 1
+    artist_items = artist_counts.most_common(5)
     selected = 0
 
     def view():
         width = max(1, out.width)
         inner_width = max(1, width - 6)
-        metric_columns = 4 if width >= 80 else 2
-        tile_width = max(4, (inner_width - 2 * (metric_columns - 1)) // metric_columns)
-        metrics = [
-            ("Songs", str(len(lib.songs))),
-            ("Size", fmt_size(lib.total_size())),
-            ("Downloads", str(_stat_count(stats.get("downloads")))),
-            ("Runs", str(_stat_count(stats.get("runs")))),
-        ]
-        metric_grid = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
-        for _ in range(metric_columns):
-            metric_grid.add_column(ratio=1)
-        for start in range(0, len(metrics), metric_columns):
-            metric_grid.add_row(*(
-                tile(label, value, tile_width)
-                for label, value in metrics[start:start + metric_columns]
-            ))
+        if width >= 90:
+            column_width = max(1, (inner_width - 2) // 2)
+            columns = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
+            columns.add_column(ratio=1)
+            columns.add_column(ratio=1)
+            columns.add_row(
+                _share_column("Top playlists", playlist_items, PLAYLIST_COLORS, len(lib.songs), column_width),
+                _share_column("Top artists", artist_items, ARTIST_COLORS, len(lib.songs), column_width),
+            )
+            shares = columns
+        else:
+            shares = Group(
+                _share_column("Top playlists", playlist_items, PLAYLIST_COLORS, len(lib.songs), inner_width),
+                _share_column("Top artists", artist_items, ARTIST_COLORS, len(lib.songs), inner_width),
+            )
 
-        columns = 3 if width >= 100 else 2 if width >= 60 else 1
-        card_width = max(8, (inner_width - 2 * (columns - 1)) // columns)
-        total_rows = ceil(len(rows) / columns) if rows else 0
-        tile_rows = ceil(len(metrics) / metric_columns)
-        max_visible_rows = max(
-            1,
-            (out.height - 4 - 1 - tile_rows * 4 - 2 - 1) // 4,
+        body = Group(
+            _stat_tiles(lib),
+            _sync_line(lib, inner_width),
+            shares,
         )
-        visible_rows = min(total_rows, max_visible_rows) if total_rows else 0
-        selected_row = selected // columns if rows else 0
-        start_row = max(0, min(selected_row - visible_rows + 1, total_rows - visible_rows))
-        start_index = start_row * columns
-        end_index = min(len(rows), start_index + visible_rows * columns)
-        grid = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
-        for _ in range(columns):
-            grid.add_column(ratio=1)
-        visible = rows[start_index:end_index]
-        for offset in range(0, len(visible), columns):
-            items = visible[offset:offset + columns]
-            rendered = [
-                _playlist_stats_panel(
-                    item,
-                    start_index + offset + index,
-                    start_index + offset + index == selected,
-                    card_width,
-                )
-                for index, item in enumerate(items)
-            ]
-            rendered.extend(Text("") for _ in range(columns - len(rendered)))
-            grid.add_row(*rendered)
-
-        body = [
-            metric_grid,
-            _stats_sync_line(stats),
-            Text("Playlists", style=Style(color=BRAND, bold=True)),
-        ]
-        if rows:
-            body.append(grid)
-            hidden = len(rows) - len(visible)
-            if hidden:
-                body.append(Text(f"+ {hidden} more", style=Style(color=DIMMER)))
         return Group(
             panel_with_title(
-                Group(*body),
+                body,
                 name="♪ Stats",
-                dim="Library overview",
+                dim=middle_truncate(str(lib.out), max(1, width - 17)),
                 border=BRAND,
             ),
-            footer_hint("↑↓←→ move · enter or esc back"),
+            footer_hint("↑↓ scroll · enter or esc back"),
         )
 
     if not interactive:

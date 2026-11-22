@@ -29,6 +29,8 @@ TEXT = "#e6e6e6"
 DIM = "#8b8b8b"
 DIMMER = "#5a5a5a"
 PATH = "#6b6b6b"
+PLAYLIST_COLORS = ["#ff9f1a", "#2dd4bf", "#3b9ae1", "#a78bfa", "#f472b6"]
+ARTIST_COLORS = ["#facc15", "#fb7185", "#4ade80", "#60a5fa", "#c084fc"]
 
 _console: Console | None = None
 _terminal_initialized = False
