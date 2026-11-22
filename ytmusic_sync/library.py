@@ -135,6 +135,19 @@ class Library:
                 pass
         return total
 
+    def recount(self) -> tuple[int, int]:
+        """Reconcile the in-memory song records with files on disk and return fresh totals."""
+        files = self.refresh_files()
+        with self.lock:
+            previous_songs = self.songs.copy()
+            previous_aliases = self.aliases.copy()
+            self._drop_missing(files)
+            if self.songs != previous_songs or self.aliases != previous_aliases:
+                self._dirty = True
+            songs = len(self.songs)
+            size = sum(files.get(song.get("file"), 0) for song in self.songs.values())
+        return songs, size
+
     def remove_songs(self, vids) -> int:
         removed = 0
         with self.lock:

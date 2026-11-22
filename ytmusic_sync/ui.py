@@ -1,6 +1,9 @@
 """Terminal output: live dashboard, summaries, stats. Rich is imported lazily."""
 from __future__ import annotations
 
+import threading
+import time
+from collections import Counter
 from datetime import datetime
 
 from rich.cells import cell_len
@@ -22,6 +25,7 @@ from .widgets import (
     fmt_size,
     fmt_speed,
     footer_hint,
+    middle_truncate,
     panel_with_title,
     segmented_bar,
     sparkline,
@@ -608,6 +612,66 @@ class Dashboard:
         yield build_download_view(self.tracker, options.max_width, console.height)
 
 
+class StoppingProgress:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.started = time.monotonic()
+        self.steps = ["running", "pending", "pending", "pending"]
+
+    def set_step(self, index: int, state: str) -> None:
+        with self.lock:
+            self.steps[index] = state
+
+    def snapshot(self) -> tuple[list[str], float]:
+        with self.lock:
+            return list(self.steps), max(0.0, time.monotonic() - self.started)
+
+
+class StoppingView:
+    def __init__(self, progress: StoppingProgress):
+        self.progress = progress
+
+    def __rich_console__(self, console, options):
+        from rich.table import Table
+
+        states, elapsed = self.progress.snapshot()
+        labels = (
+            "Cancelling downloads",
+            "Finishing conversions",
+            "Saving library and playlists",
+            "Cleaning up temp files",
+        )
+        lines = []
+        for label, state in zip(labels, states):
+            if state == "done":
+                mark, color = "✓", GREEN
+            elif state == "running":
+                mark, color = "⠹", ACCENT
+            else:
+                mark, color = "○", DIMMER
+            lines.append(Text(f"{mark} {label}", style=Style(color=color)))
+
+        finished = sum(state == "done" for state in states)
+        bar = segmented_bar(max(1, options.max_width - 6), [(finished, ACCENT)], len(states))
+        timing = Table.grid(expand=True, padding=(0, 0))
+        timing.add_column(ratio=1, no_wrap=True)
+        timing.add_column(justify="right", no_wrap=True)
+        message = Text("Your finished songs are saved.", style=Style(color=DIM))
+        elapsed_text = Text()
+        elapsed_text.append("Elapsed ", style=Style(color=DIM))
+        elapsed_text.append(f"{elapsed:.1f}s", style=Style(color=TEXT))
+        timing.add_row(message, elapsed_text)
+
+        yield Group(
+            panel_with_title(
+                Group(*lines, bar, timing),
+                name="Stopping safely",
+                border=BORDER,
+            ),
+            footer_hint("Ctrl+C exit now"),
+        )
+
+
 def song_line(ok: bool, count: int, total: int, title: str, note: str) -> str:
     mark = "[green]✓[/]" if ok else "[red]✗[/]"
     return f"{mark} {count}/{total} {title[:50]}  [dim]{note}[/]"
@@ -637,37 +701,185 @@ def print_plan(plan, dry_run: bool = False) -> None:
         out.print(f"\n[yellow]Dry run: {len(plan.todo)} new, nothing downloaded.[/]")
 
 
-def print_run_summary(result, lib: Library, playlist_rows: list[tuple], size_before: int) -> None:
+def print_run_summary(
+    result,
+    lib: Library,
+    playlist_rows: list[dict],
+    playlist_count: int,
+    *,
+    show_removed: bool,
+    wait_for_key: bool = False,
+) -> None:
+    out = console()
+    width = max(1, out.width)
+    content_width = max(1, width - 6)
+    summary = Text()
+    summary.append(f"{result.new} added", style=Style(color=GREEN, bold=True))
+    summary.append(" · ", style=Style(color=DIM))
+    if result.failures:
+        summary.append(f"{len(result.failures)} failed", style=Style(color=RED, bold=True))
+    else:
+        summary.append("0 failed", style=Style(color=DIM))
+    summary.append(" · ", style=Style(color=DIM))
+    summary.append(fmt_size(result.bytes), style=Style(color=TEXT))
+    summary.append(" · ", style=Style(color=DIM))
+    summary.append(clock(result.elapsed), style=Style(color=TEXT))
+    summary.no_wrap = True
+    summary.overflow = "crop"
+
+    body = [summary]
+    if result.duplicates_skipped:
+        body.append(Text(f"{result.duplicates_skipped} duplicates skipped", style=Style(color=DIM)))
+    body.append(_playlist_results_table(
+        playlist_rows,
+        width,
+        out.height,
+        show_removed,
+        duplicate_line=bool(result.duplicates_skipped),
+        failure_line=bool(result.failures),
+    ))
+
+    library_line = Text("Library  ", style=Style(color=DIM))
+    library_line.append(str(result.songs_before), style=Style(color=DIM))
+    library_line.append(" → ", style=Style(color=DIM))
+    library_line.append(str(result.songs_after), style=Style(color=TEXT, bold=True))
+    library_line.append(" songs ", style=Style(color=DIM))
+    song_delta = result.songs_after - result.songs_before
+    library_line.append(f"{song_delta:+d}", style=Style(color=GREEN if song_delta >= 0 else RED))
+    library_line.append(" · ", style=Style(color=DIM))
+    library_line.append(fmt_size(result.size_before), style=Style(color=DIM))
+    library_line.append(" → ", style=Style(color=DIM))
+    library_line.append(fmt_size(result.size_after), style=Style(color=TEXT))
+    library_line.append(" · ", style=Style(color=DIM))
+    library_line.append(str(playlist_count), style=Style(color=TEXT))
+    library_line.append(" playlists", style=Style(color=DIM))
+    library_line.no_wrap = True
+    library_line.overflow = "crop"
+    body.append(library_line)
+
+    all_time = Text("All-time ", style=Style(color=DIM))
+    all_time.append(str(lib.stats["downloads"]), style=Style(color=TEXT))
+    all_time.append(" downloads · ", style=Style(color=DIM))
+    all_time.append(str(lib.stats["runs"]), style=Style(color=TEXT))
+    all_time.append(" runs", style=Style(color=DIM))
+    body.append(all_time)
+
+    if result.failures:
+        body.append(_failure_summary(result.failures, content_width))
+    body.append(Text("Run again anytime. Only new songs download.", style=Style(color=DIMMER)))
+
+    panel = panel_with_title(
+        Group(*body),
+        name="Done",
+        dim="Update library",
+        border=BORDER,
+    )
+    out.print(Group(panel, footer_hint("enter back")))
+    if wait_for_key:
+        from .keys import read_key
+
+        key = read_key()
+        while key not in ("enter", "esc"):
+            key = read_key()
+
+
+def _playlist_results_table(
+    rows: list[dict],
+    width: int,
+    height: int,
+    show_removed: bool,
+    *,
+    duplicate_line: bool,
+    failure_line: bool,
+):
     from rich.table import Table
 
-    out = console()
-    head = f"[bold {GOOD}]✓ {result.new} new[/]"
-    if result.failures:
-        head += f"  [bold {BAD}]✗ {len(result.failures)} failed[/]"
-    if result.stopped:
-        head += "  [yellow]stopped early (progress saved)[/]"
-    after = lib.total_size()
-    body = [head,
-            f"[dim]{human_size(result.bytes)} downloaded in {clock(result.elapsed)}[/]",
-            f"[dim]Library: {len(lib.songs)} songs · {human_size(after)} "
-            f"({'+' if after >= size_before else '-'}{human_size(abs(after - size_before))})[/]"]
-    out.print(panel_with_title("\n".join(body), "Done", border=ACCENT, name_color=ACCENT, padding=(0, 1)))
+    ordered = sorted(rows, key=lambda row: (-row["added"], -row["failed"], -row["songs"]))
+    unchanged = [
+        row for row in ordered
+        if row["added"] == 0 and row["failed"] == 0
+        and (not show_removed or row["removed"] == 0)
+    ]
+    display_rows = [
+        row for row in ordered if row not in unchanged
+    ]
+    if unchanged:
+        display_rows.append({"type": "unchanged", "count": len(unchanged)})
 
-    if playlist_rows:
-        table = Table(box=None, pad_edge=False, show_header=True, header_style=DIM)
-        table.add_column("Playlist")
-        table.add_column("Songs", justify="right")
-        table.add_column("New", justify="right")
-        for name, songs, added in playlist_rows:
-            table.add_row(name, str(songs), f"+{added}" if added else "·")
-        out.print(table)
+    column_widths = ([7] if width >= 70 else []) + [6, 6] + ([8] if show_removed else [])
+    column_count = 1 + len(column_widths)
+    inner_width = max(1, width - 6)
+    name_width = max(1, inner_width - sum(column_widths) - column_count * 2)
 
-    if result.failures:
-        out.print("\n[bold]Failed[/]")
-        for failure in result.failures[:10]:
-            out.print(f"  [red]✗[/] {failure.title[:50]}  [dim]{failure.reason}[/]")
-        if len(result.failures) > 10:
-            out.print(f"  [dim]… and {len(result.failures) - 10} more (see failed.txt)[/]")
+    fixed_rows = 12 + int(duplicate_line) + int(failure_line)
+    capacity = max(1, height - fixed_rows)
+    if len(display_rows) > capacity:
+        visible = display_rows[:max(0, capacity - 1)]
+        hidden = display_rows[len(visible):]
+        hidden_count = sum(row.get("count", 1) if row.get("type") == "unchanged" else 1
+                           for row in hidden)
+        display_rows = visible + [{"type": "more", "count": hidden_count}]
+
+    table = Table(box=None, pad_edge=False, show_header=False, expand=True, padding=(0, 1))
+    table.add_column("Playlist", ratio=1, no_wrap=True)
+    if width >= 70:
+        table.add_column("Songs", width=7, justify="right", no_wrap=True)
+    table.add_column("Added", width=6, justify="right", no_wrap=True)
+    table.add_column("Failed", width=6, justify="right", no_wrap=True)
+    if show_removed:
+        table.add_column("Removed", width=8, justify="right", no_wrap=True)
+
+    headers = [Text("Playlist", style=Style(color=DIM))]
+    if width >= 70:
+        headers.append(Text("Songs", style=Style(color=DIM)))
+    headers.extend((Text("Added", style=Style(color=DIM)), Text("Failed", style=Style(color=DIM))))
+    if show_removed:
+        headers.append(Text("Removed", style=Style(color=DIM)))
+    table.add_row(*headers)
+    separators = [Text("─" * name_width, style=Style(color=DIVIDER))]
+    separators.extend(Text("─" * column, style=Style(color=DIVIDER)) for column in column_widths)
+    table.add_row(*separators)
+
+    for row in display_rows:
+        kind = row.get("type")
+        if kind in ("unchanged", "more"):
+            label = (f"+ {row['count']} playlists unchanged" if kind == "unchanged"
+                     else f"+ {row['count']} more")
+            blank_cells = [Text("") for _ in column_widths]
+            table.add_row(Text(label, style=Style(color=DIM)), *blank_cells)
+            continue
+
+        values = [Text(truncate(row["name"], name_width), style=Style(color=TEXT))]
+        if width >= 70:
+            values.append(Text(str(row["songs"]), style=Style(color=DIM)))
+        values.append(Text(f"+{row['added']}" if row["added"] else "–",
+                           style=Style(color=GREEN if row["added"] else DIM)))
+        values.append(Text(str(row["failed"]) if row["failed"] else "–",
+                           style=Style(color=RED if row["failed"] else DIM)))
+        if show_removed:
+            values.append(Text(str(row["removed"]) if row["removed"] else "–",
+                               style=Style(color=CYAN if row["removed"] else DIM)))
+        table.add_row(*values)
+    return table
+
+
+def _failure_summary(failures, width: int) -> Text:
+    reasons = Counter(failure.reason for failure in failures if failure.reason)
+    common = reasons.most_common(1)
+    prefix = Text(f"✗ {len(failures)} failed", style=Style(color=RED))
+    common_text = f" · most common: {common[0][0]} ×{common[0][1]}" if common else ""
+    location = " · details saved to "
+    path_width = max(0, width - cell_len(prefix) - cell_len(common_text) - cell_len(location))
+    path = middle_truncate(str(config.FAILED_FILE), path_width)
+    line = Text()
+    line.append_text(prefix)
+    if common_text:
+        line.append(common_text, style=Style(color=DIM))
+    line.append(location, style=Style(color=DIM))
+    line.append(path, style=Style(color=DIM))
+    line.no_wrap = True
+    line.overflow = "crop"
+    return line
 
 
 def print_stats(lib: Library) -> None:
