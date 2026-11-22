@@ -246,8 +246,8 @@ class ScanPanel:
 
 
 def _visible_scan_rows(playlists: list[dict], limit: int) -> tuple[list[tuple[dict, str]], int]:
-    terminal = [(index, row) for index, row in enumerate(playlists)
-                if row["state"] in ("finished", "failed")]
+    failures = [(index, row) for index, row in enumerate(playlists) if row["state"] == "failed"]
+    finished = [(index, row) for index, row in enumerate(playlists) if row["state"] == "finished"]
     active = [(index, row) for index, row in enumerate(playlists) if row["state"] == "fetching"]
     queued = [(index, row) for index, row in enumerate(playlists) if row["state"] == "queued"]
     if len(playlists) <= limit:
@@ -257,7 +257,7 @@ def _visible_scan_rows(playlists: list[dict], limit: int) -> tuple[list[tuple[di
     if len(queued) > room:
         if room == 0:
             selected = active[:limit]
-            return [(row, "") for _, row in selected], len(queued)
+            return [(row, "") for _, row in selected], 0
         show_queued = max(0, room - 1)
         selected = sorted(active + queued[:show_queued], key=lambda item: item[0])
         return [(row, "") for _, row in selected], len(queued) - show_queued
@@ -265,7 +265,11 @@ def _visible_scan_rows(playlists: list[dict], limit: int) -> tuple[list[tuple[di
     selected = active + queued
     terminal_room = max(0, limit - len(selected))
     if terminal_room:
-        selected.extend(terminal[-terminal_room:])
+        visible_failures = failures[-terminal_room:]
+        selected.extend(visible_failures)
+        terminal_room -= len(visible_failures)
+    if terminal_room:
+        selected.extend(finished[-terminal_room:])
     selected.sort(key=lambda item: item[0])
     return [(row, "") for _, row in selected], 0
 
@@ -328,6 +332,7 @@ def _scan_summary(snapshot: dict, width: int, height: int):
     def append_line(text: Text) -> None:
         bordered = Text("│ ", style=Style(color=DIVIDER))
         bordered.append_text(text)
+        bordered.truncate(width, overflow="ellipsis")
         lines.append(bordered)
 
     def label(text: str) -> Text:

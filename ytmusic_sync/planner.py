@@ -71,4 +71,24 @@ def make_plan(lib: Library, scan: ScanResult, skip_duplicates: bool = True) -> P
 
         todo = [e for vid, e in wanted.items() if vid not in lib.songs]
         duplicates = sum(1 for vid in unique if vid in lib.aliases)
-    return Plan(lib, scan, wanted, todo, len(entries), duplicates)
+    plan = Plan(lib, scan, wanted, todo, len(entries), duplicates)
+    if scan.progress is not None:
+        new_ids = {entry["id"] for entry in plan.todo}
+        playlist_new = {}
+        for playlist in scan.playlists:
+            playlist_new[playlist.url] = len({
+                lib.canonical(item["id"]) for item in playlist.items
+                if lib.canonical(item["id"]) in new_ids
+            })
+        library_before = len(lib.songs)
+        scan.progress.update_plan(
+            len(plan.todo),
+            playlist_new,
+            library_before,
+            library_before + len(plan.todo),
+            [entry["title"] for entry in plan.todo],
+        )
+        from . import ui
+
+        ui.print_scan_summary(scan.progress.snapshot())
+    return plan
