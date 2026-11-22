@@ -34,6 +34,18 @@ class Failure:
     title: str
     artist: str
     reason: str
+    id: str = ""
+    playlist_ids: tuple[str, ...] = ()
+
+
+@dataclass
+class TrackResult:
+    id: str
+    title: str
+    playlist_ids: tuple[str, ...]
+    status: str
+    bytes: int = 0
+    reason: str = ""
 
 
 def watch_url(vid: str) -> str:
@@ -123,7 +135,8 @@ def _postprocessor_classes():
 
 
 def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: Tracker,
-                  stop: threading.Event, on_result=None) -> list[Failure]:
+                  stop: threading.Event, on_result=None,
+                  track_results: list[TrackResult] | None = None, on_stopping=None) -> list[Failure]:
     """Download `todo` with settings.jobs workers. Returns the failures.
 
     `stop` is checked inside every yt-dlp hook, so setting it aborts running downloads quickly.
@@ -134,6 +147,7 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
     tracker.set_queue([entry["title"] for entry in todo])
     failures: list[Failure] = []
     failures_lock = threading.Lock()
+    track_results_lock = threading.Lock()
     jobs = max(1, min(settings.jobs, len(todo)))
     interactive_dashboard = on_result is None
 
@@ -156,7 +170,10 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
                     entry = work.get_nowait()
                 except queue.Empty:
                     return
-                _download_one(ydl, entry, slot, lib, settings, tracker, stop, failures, failures_lock, on_result)
+                _download_one(
+                    ydl, entry, slot, lib, settings, tracker, stop, failures, failures_lock, on_result,
+                    track_results, track_results_lock,
+                )
 
     with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="dl") as pool:
         futures = [pool.submit(worker, slot) for slot in range(jobs)]
@@ -168,7 +185,10 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
 
                 key = read_key(timeout=0)
                 if key == "q":
-                    stop.set()
+                    if not stop.is_set():
+                        stop.set()
+                        if on_stopping is not None:
+                            on_stopping()
                 elif key == "f":
                     with failures_lock:
                         current_failures = list(failures)
@@ -190,8 +210,10 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
     return failures
 
 
-def _download_one(ydl, entry, slot, lib, settings, tracker, stop, failures, failures_lock, on_result):
+def _download_one(ydl, entry, slot, lib, settings, tracker, stop, failures, failures_lock, on_result,
+                  track_results, track_results_lock):
     vid, started = entry["id"], time.time()
+    playlist_ids = tuple(entry.get("playlist_ids", ()))
     tracker.start(slot, entry["title"])
     attempt = 0
     while True:
@@ -202,11 +224,7 @@ def _download_one(ydl, entry, slot, lib, settings, tracker, stop, failures, fail
             lib.add_song(vid, {"file": file.name, "artist": first_text(info.get("artist"), "Unknown"),
                                "title": first_text(info.get("title"), entry["title"]),
                                "dur": int(info.get("duration") or entry["dur"] or 0)})
-            tracker.finish(slot, True, size)
             lib.save()
-            if on_result:
-                on_result(True, entry["title"], f"{size / 1048576:.1f} MB  {time.time() - started:.1f}s")
-            return
         except Cancelled:
             tracker.finish(slot, False)
             return
@@ -224,12 +242,32 @@ def _download_one(ydl, entry, slot, lib, settings, tracker, stop, failures, fail
                 continue
             reason = short_error(exc)
             log.exception("Download failed for %s", vid)
+            failure = Failure(entry["title"], tracker.artist(slot) or "Unknown", reason, vid, playlist_ids)
             with failures_lock:
-                failures.append(Failure(entry["title"], tracker.artist(slot) or "Unknown", reason))
+                failures.append(failure)
+            _record_track_result(
+                track_results, track_results_lock,
+                TrackResult(vid, entry["title"], playlist_ids, "failed", reason=reason),
+            )
             tracker.finish(slot, False)
             if on_result:
                 on_result(False, entry["title"], reason)
             return
+        tracker.finish(slot, True, size)
+        _record_track_result(
+            track_results, track_results_lock,
+            TrackResult(vid, entry["title"], playlist_ids, "done", bytes=size),
+        )
+        if on_result:
+            on_result(True, entry["title"], f"{size / 1048576:.1f} MB  {time.time() - started:.1f}s")
+        return
+
+
+def _record_track_result(results: list[TrackResult] | None, lock: threading.Lock,
+                         result: TrackResult) -> None:
+    if results is not None:
+        with lock:
+            results.append(result)
 
 
 def _output_file(info: dict, lib: Library, vid: str, settings: Settings) -> Path:

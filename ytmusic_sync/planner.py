@@ -18,6 +18,7 @@ class Plan:
     todo: list = field(default_factory=list)        # entries not in the library yet
     entries: int = 0                                # songs across all links, counting repeats
     duplicates: int = 0                             # video IDs mapped onto an existing/earlier song
+    skipped: list[dict] = field(default_factory=list)
 
     @property
     def playlists(self) -> list[ScannedPlaylist]:
@@ -69,9 +70,23 @@ def make_plan(lib: Library, scan: ScanResult, skip_duplicates: bool = True) -> P
             else:
                 wanted.setdefault(vid, entry)
 
-        todo = [e for vid, e in wanted.items() if vid not in lib.songs]
+        todo = [dict(e) for vid, e in wanted.items() if vid not in lib.songs]
         duplicates = sum(1 for vid in unique if vid in lib.aliases)
-    plan = Plan(lib, scan, wanted, todo, len(entries), duplicates)
+        skipped = [dict(id=vid, title=e.get("title", ""), playlist_ids=())
+                   for vid, e in wanted.items() if vid in lib.songs]
+
+    playlist_memberships: dict[str, set[str]] = {}
+    for playlist in scan.playlists:
+        for item in playlist.items:
+            canonical = lib.canonical(item["id"])
+            playlist_memberships.setdefault(canonical, set()).add(playlist.url)
+
+    for entry in todo:
+        entry["playlist_ids"] = tuple(sorted(playlist_memberships.get(entry["id"], ())))
+    for entry in skipped:
+        entry["playlist_ids"] = tuple(sorted(playlist_memberships.get(entry["id"], ())))
+
+    plan = Plan(lib, scan, wanted, todo, len(entries), duplicates, skipped)
     if scan.progress is not None:
         new_ids = {entry["id"] for entry in plan.todo}
         playlist_new = {}
