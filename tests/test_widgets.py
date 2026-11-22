@@ -5,9 +5,11 @@ from datetime import datetime
 
 from rich.cells import cell_len
 from rich.console import Console
+from rich.text import Text
 
 from ytmusic_sync.widgets import (
     SelectItem,
+    _confirm_view,
     clock_12h,
     fmt_duration,
     fmt_size,
@@ -91,13 +93,37 @@ class WidgetTests(unittest.TestCase):
         lines = console.render_lines(rendered, console.options.update(width=width), pad=False)
 
         self.assertEqual(len(lines), 6)
-        for line in lines[:3]:
-            self.assertTrue(all(segment.style.bgcolor is None for segment in line))
-            rail = next(segment for segment in line if segment.text.startswith("▌"))
+        for line, glyph in zip(lines[:3], ("▖", "▌", "▘")):
+            rail = next(segment for segment in line if segment.text.startswith(glyph))
             self.assertEqual(rail.style.color.name, "#ff9f1a")
-        for line in lines[3:]:
-            rail = next(segment for segment in line if segment.text.startswith("▌"))
+            self.assertIsNone(rail.style.bgcolor)
+            self.assertTrue(all(
+                segment.style.bgcolor is not None
+                for segment in line if segment is not rail
+            ))
+        for line, glyph in zip(lines[3:], ("▖", "▌", "▘")):
+            rail = next(segment for segment in line if segment.text.startswith(glyph))
             self.assertEqual(rail.style.color.name, "#2f2f2f")
+            self.assertTrue(all(segment.style.bgcolor is None for segment in line))
+
+    def test_boxed_selector_stays_boxed_on_short_terminals(self):
+        console = Console(width=40, height=12, file=io.StringIO())
+        items = [SelectItem("One", "First"), SelectItem("Two", "Second")]
+        boxed = render_select(items, 0, "boxed", width=40)
+        compact = render_select(items, 0, "compact", width=40)
+        self.assertEqual(len(console.render_lines(boxed, console.options, pad=False)), 6)
+        self.assertEqual(len(console.render_lines(compact, console.options, pad=False)), 2)
+
+    def test_confirmation_footer_is_outside_and_title_accepts_styled_text(self):
+        console = Console(width=80, height=24, file=io.StringIO(), record=True, force_terminal=True)
+        title = Text()
+        title.append("Add Music", style="bold #ff9f1a")
+        title.append("  Paste links", style="#8b8b8b")
+        rendered = _confirm_view("Add these 3 playlist links to Playlists.txt?", title, True, console)
+        console.print(rendered)
+        lines = [line for line in console.export_text(styles=False).splitlines() if line]
+        self.assertIn("Add Music  Paste links", "\n".join(lines))
+        self.assertIn("←→ choose · enter confirm · y / n", lines[-1])
 
 
 if __name__ == "__main__":

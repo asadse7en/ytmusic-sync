@@ -82,11 +82,12 @@ def pick(message: str, items: list[tuple[str, object]], back: bool = True):
     title = truncate(message, max(1, out.width - 12))
 
     def view_factory(selected: int):
-        body = Group(
+        panel = panel_with_title(
             render_select(choices, selected, variant="boxed"),
-            footer_hint("↑↓ move · enter select · esc back"),
+            name=title,
+            border=BORDER,
         )
-        return panel_with_title(body, name=title, border=BORDER)
+        return Group(panel, footer_hint("↑↓ move · enter select · esc back"))
 
     selected = run_select(view_factory, choices, variant="boxed")
     if selected is None:
@@ -263,11 +264,12 @@ def add_music(settings: Settings) -> None:
         ]
 
         def view_factory(selected: int):
-            content = Group(
+            panel = panel_with_title(
                 render_select(items, selected, variant="boxed"),
-                footer_hint("↑↓ move · enter select · esc back"),
+                name="Add Music",
+                border=BORDER,
             )
-            return panel_with_title(content, name="Add Music", border=BORDER)
+            return Group(panel, footer_hint("↑↓ move · enter select · esc back"))
 
         selected = run_select(view_factory, items, variant="boxed")
         choice = items[selected].value if selected is not None else None
@@ -507,7 +509,10 @@ def paste_links(settings: Settings) -> None:
         (str(len(entries)), Style(color=GREEN, bold=True)),
         " playlist links to Playlists.txt?",
     )
-    if not confirm_boxes(message):
+    title = Text()
+    title.append("Add Music", style=Style(color=ACCENT, bold=True))
+    title.append("  Paste links", style=Style(color=DIM))
+    if not confirm_boxes(message, title=title):
         return
     saved = links.save_links(entries)
     ui.print_path_message(f"Saved {saved} link(s) to ", str(config.LINKS_FILE), success=True)

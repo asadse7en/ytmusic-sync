@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Iterable
 
-from rich.align import Align
 from rich.cells import cell_len
 from rich.columns import Columns
 from rich.console import Console, Group, RenderableType
@@ -101,7 +100,7 @@ def title_text(
 
 def panel_with_title(
     body: RenderableType,
-    name: str,
+    name: str | Text,
     dim: str | None = None,
     border: str = BORDER,
     name_color: str = ACCENT,
@@ -113,7 +112,7 @@ def panel_with_title(
 
     return Panel(
         body,
-        title=title_text(name, dim, name_color, dim_color),
+        title=title_text(name, dim, name_color, dim_color) if isinstance(name, str) else name,
         title_align="left",
         border_style=border,
         box=box.ROUNDED,
@@ -355,7 +354,7 @@ class _SelectRenderable:
 
     def __rich_console__(self, console: Console, options):
         width = max(1, min(self.width or options.max_width, options.max_width))
-        compact = self.variant == "compact" or console.height < 30
+        compact = self.variant == "compact"
         if compact:
             for index, item in enumerate(self.items):
                 selected = index == self.selected
@@ -387,28 +386,32 @@ class _SelectRenderable:
             selected = index == self.selected
             bar_color = ACCENT if selected else BAR_OFF
             edge_color = SEL_EDGE if selected else EDGE_OFF
+            background = SEL_FILL if selected else None
+            border_style = Style(color=edge_color, bgcolor=background)
             yield Text.assemble(
-                ("▌", Style(color=bar_color)),
-                ("─" * inner, Style(color=edge_color)),
-                ("╮", Style(color=edge_color)),
+                ("▖", Style(color=bar_color)),
+                ("╭", border_style),
+                ("─" * (inner - 1), border_style),
+                ("╮", border_style),
             )
             row = Text()
             row.append("▌", style=Style(color=bar_color))
-            row.append(" ")
+            row.append(" ", style=Style(bgcolor=background))
             row.append_text(_content(
                 item,
                 selected,
                 self.label_width,
                 content_width,
-                selected_background=False,
+                selected_background=True,
             ))
-            row.append(" ")
-            row.append("│", style=Style(color=edge_color))
+            row.append(" ", style=Style(bgcolor=background))
+            row.append("│", style=Style(color=edge_color, bgcolor=background))
             yield row
             yield Text.assemble(
-                ("▌", Style(color=bar_color)),
-                ("─" * inner, Style(color=edge_color)),
-                ("╯", Style(color=edge_color)),
+                ("▘", Style(color=bar_color)),
+                ("╰", border_style),
+                ("─" * (inner - 1), border_style),
+                ("╯", border_style),
             )
 
 
@@ -506,7 +509,8 @@ def _apply_key_result(result: int | str | None, selected: int, enabled: list[int
     return selected, False
 
 
-def _confirm_view(message: RenderableType, title: str | None, yes: bool, console: Console) -> RenderableType:
+def _confirm_view(message: RenderableType, title: str | Text | None, yes: bool,
+                  console: Console) -> RenderableType:
     from rich import box
 
     width = max(1, console.width)
@@ -532,14 +536,19 @@ def _confirm_view(message: RenderableType, title: str | None, yes: bool, console
             width=12,
             expand=False,
         ))
-    body = Group(msg, Align.center(Columns(options, equal=True, expand=False)))
-    body = Group(body, footer_hint("←→ choose · enter confirm · y / n"))
+    body = Group(msg, Columns(options, equal=True, expand=False, align="left"))
     if title is not None:
-        return panel_with_title(body, title, padding=(0, 1))
-    return body
+        panel = panel_with_title(body, title, padding=(0, 1))
+    else:
+        panel = body
+    return Group(panel, footer_hint("←→ choose · enter confirm · y / n"))
 
 
-def confirm_boxes(message: RenderableType, title: str | None = None, default: bool = True) -> bool:
+def confirm_boxes(
+    message: RenderableType,
+    title: str | Text | None = None,
+    default: bool = True,
+) -> bool:
     """Ask for confirmation using two side-by-side bordered choices."""
     console = get_console()
     yes = default
