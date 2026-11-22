@@ -7,21 +7,67 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from . import __version__, config, links, sync, ui, ytdlp
+from rich.console import Group
+from rich.text import Text
+
+from . import config, links, sync, ui, ytdlp
 from .config import Settings
-from .library import open_library, time_ago
+from .keys import read_key
+from .library import open_library
 from .scanner import short_error
+from .theme import ACCENT, BORDER, CYAN, DIM, GREEN, PATH, TEXT
+from .widgets import (
+    SelectItem,
+    confirm_boxes,
+    divider,
+    footer_hint,
+    panel_with_title,
+    render_select,
+    ruled_heading,
+    truncate,
+    run_select,
+)
 
 BACK = "__back__"
 SETTING_ROWS = [
-    ("format", "Format"), ("quality", "Quality"), ("name_style", "Filename style"), ("cover", "Cover art"),
-    ("square", "Square cover"), ("clean", "Clean titles"), ("playlist_files", "Playlist .m3u8 files"),
+    ("format", "Format"), ("quality", "Quality"), ("cover", "Cover art"), ("square", "Square cover"),
+    ("name_style", "Filename style"), ("clean", "Clean titles"), ("playlist_files", "Playlist .m3u8 files"),
     ("prune", "Prune removed songs"), ("skip_duplicate_songs", "Skip duplicate songs"),
     ("jobs", "Parallel downloads"), ("rate_limit", "Speed limit"), ("retries", "Retries"),
     ("cookies", "Browser cookies"),
 ]
 CHOICES = {"format": config.FORMATS, "quality": config.QUALITIES, "name_style": tuple(config.NAME_STYLES),
            "jobs": tuple(range(1, config.MAX_JOBS + 1))}
+SETTING_GROUPS = (
+    ("Audio", (("format", "Format"), ("quality", "Quality"), ("cover", "Cover art"), ("square", "Square cover"))),
+    ("Library", (("name_style", "Filename style"), ("clean", "Clean titles"),
+                 ("playlist_files", "Playlist .m3u8 files"), ("prune", "Prune removed songs"),
+                 ("skip_duplicate_songs", "Skip duplicate songs"))),
+    ("Downloads", (("jobs", "Parallel downloads"), ("rate_limit", "Speed limit"),
+                   ("retries", "Retries"), ("cookies", "Browser cookies"))),
+    ("Folders", (("_library", "Library folder"), ("_data", "Data folder"), ("_links", "Edit Playlists.txt"),
+                 ("_reset", "Reset to defaults"), (BACK, "Back"))),
+)
+SETTING_DESCRIPTIONS = {
+    "format": "output file type. Options: mp3 · m4a · opus · flac · wav · aac",
+    "quality": "audio quality. Options: best · 320 · 256 · 192 · 128",
+    "cover": "embed cover art in downloaded files.",
+    "square": "make embedded cover art square.",
+    "name_style": "Options: Title · Artist - Title · Title - Artist",
+    "clean": "clean titles before using them in filenames and tags.",
+    "playlist_files": "write playlist .m3u8 files in the library.",
+    "prune": "remove songs no longer present in synced playlists.",
+    "skip_duplicate_songs": "skip songs already downloaded in the library.",
+    "jobs": f"number of parallel downloads. Options: 1–{config.MAX_JOBS}",
+    "rate_limit": "maximum download speed; empty means unlimited.",
+    "retries": "number of retries after a failed download. Options: 0–20",
+    "cookies": "browser used for cookies; empty means none (e.g. chrome, firefox, edge).",
+    "_library": "choose the music library folder.",
+    "_data": "open the data folder and browse its files.",
+    "_links": "open Playlists.txt for editing saved playlist links.",
+    "_reset": "restore defaults while keeping the library folder.",
+    BACK: "return to the previous menu.",
+}
 
 
 @lru_cache(maxsize=1)
@@ -127,22 +173,26 @@ def welcome(settings: Settings) -> bool:
 
 
 # ---------- home ----------
-def header(settings: Settings) -> None:
-    out = ui.console()
-    lib = open_library(settings.out_path)
-    out.print(f"\n[bold {ui.ACCENT}]ytmusic-sync[/] [dim]{__version__}[/]")
-    out.print(f"[dim]{settings.out}  ·  {len(lib.songs)} songs  ·  synced {time_ago(lib.stats['last_run'])}[/]")
-    ui.print_update_hint()
-
-
 def home(settings: Settings) -> None:
     while True:
-        header(settings)
-        items = [("Update library", "update"), ("Add Music", "add"), ("Settings", "settings"), ("Stats", "stats")]
-        if ytdlp.update_available():
-            items.append(("Update yt-dlp", "ytdlp"))
-        items.append(("Quit", "quit"))
-        choice = pick("What now?", items, back=False)
+        items = [
+            SelectItem("Update library", "Download new songs", "u", value="update"),
+            SelectItem("Add Music", "Paste links", "a", value="add"),
+            SelectItem("Settings", f"{settings.format} · {settings.quality}", "s", value="settings"),
+            SelectItem("Stats", "Playlists overview", "t", value="stats"),
+            SelectItem("Quit", hotkey="q", value="quit"),
+        ]
+
+        def view_factory(selected: int):
+            return Group(
+                ui.build_header(),
+                Text(""),
+                render_select(items, selected, variant="boxed"),
+                footer_hint("↑↓ move · enter select · press the letter to jump"),
+            )
+
+        selected = run_select(view_factory, items, variant="boxed")
+        choice = items[selected].value if selected is not None else None
         if choice in (None, "quit"):
             return
         try:
@@ -186,9 +236,23 @@ def update_library(settings: Settings) -> None:
 def add_music(settings: Settings) -> None:
     while True:
         saved = len(links.read_links())
-        choice = pick("Add Music", [("Paste links", "paste"), (f"Load from Playlists.txt  ({saved} links)", "load"),
-                                    ("Edit Playlists.txt", "edit")])
-        if choice is None:
+        items = [
+            SelectItem("Paste links", "Playlists or songs", value="paste"),
+            SelectItem("Load from Playlists.txt", f"{saved} links", value="load"),
+            SelectItem("Edit Playlists.txt", "Open in editor", value="edit"),
+            SelectItem("Back", value=BACK),
+        ]
+
+        def view_factory(selected: int):
+            content = Group(
+                render_select(items, selected, variant="boxed"),
+                footer_hint("↑↓ move · enter select · esc back"),
+            )
+            return panel_with_title(content, name="Add Music", border=BORDER)
+
+        selected = run_select(view_factory, items, variant="boxed")
+        choice = items[selected].value if selected is not None else None
+        if choice in (None, BACK):
             return
         if choice == "paste":
             urls = paste_links()
@@ -273,35 +337,148 @@ def run_plan(settings: Settings, urls: list[str], *, review: bool, prune_ok: boo
 
 
 # ---------- settings ----------
-def _show(settings: Settings, key: str) -> str:
+def settings_menu(settings: Settings) -> None:
+    from rich.live import Live
+    from rich.style import Style
+
+    out = ui.console()
+    rows = [row for _, group in SETTING_GROUPS for row in group]
+    selected = 0
+
+    def view() -> Group:
+        width = max(1, out.width - 6)
+        content = []
+        index = 0
+        for group_index, (heading, group_rows) in enumerate(SETTING_GROUPS):
+            if group_index:
+                content.append(Text())
+            content.append(ruled_heading(heading, width))
+            for key, label in group_rows:
+                is_selected = index == selected
+                value, color = _setting_value(settings, key)
+                content.append(_settings_row(out, label, value, color, is_selected, width,
+                                             dim_label=key in ("_reset", BACK)))
+                index += 1
+
+        key, label = rows[selected]
+        description = Text()
+        description.append(label, style=Style(color=TEXT))
+        description.append(" · ", style=Style(color=DIM))
+        description.append(truncate(SETTING_DESCRIPTIONS[key], max(0, width - len(label) - 3)),
+                           style=Style(color=DIM))
+        content.extend((divider(width), description))
+        panel = panel_with_title(
+            Group(*content),
+            "Settings",
+            dim=f"Data: {config.DATA_DIR}",
+            border=BORDER,
+            dim_color=PATH,
+        )
+        return Group(panel, footer_hint("↑↓ move · ←→ change value · enter edit · esc back"))
+
+    with Live(view(), console=out, auto_refresh=False) as live:
+        while True:
+            key = read_key()
+            if key == "up":
+                selected = (selected - 1) % len(rows)
+            elif key == "down":
+                selected = (selected + 1) % len(rows)
+            elif key in ("left", "right"):
+                changed = _change_setting(settings, rows[selected][0], -1 if key == "left" else 1)
+                if changed:
+                    live.update(view(), refresh=True)
+                    continue
+            elif key == "enter":
+                setting_key = rows[selected][0]
+                if setting_key == BACK:
+                    return
+                live.stop()
+                _enter_setting(settings, setting_key)
+                live.start(refresh=True)
+            elif key in ("esc", "ctrl-c"):
+                return
+            live.update(view(), refresh=True)
+
+
+def _setting_value(settings: Settings, key: str) -> tuple[str, str]:
+    if key == "_library":
+        return settings.out or "not set", PATH
+    if key == "_data":
+        return str(config.DATA_DIR), PATH
+    if key in ("_links", "_reset", BACK):
+        return "", DIM
+
     value = getattr(settings, key)
     if isinstance(value, bool):
-        return "on" if value else "off"
-    return str(value) if value not in ("", None) else "off" if key in ("rate_limit", "cookies") else "-"
+        return ("on", GREEN) if value else ("off", DIM)
+    if key == "name_style":
+        return config.NAME_STYLES[value], CYAN
+    if key == "rate_limit":
+        return (value, CYAN) if value else ("unlimited", DIM)
+    if key == "cookies":
+        return (value, CYAN) if value else ("none", DIM)
+    return str(value), CYAN
 
 
-def settings_menu(settings: Settings) -> None:
-    while True:
-        items = [(f"{label:<22}{_show(settings, key)}", key) for key, label in SETTING_ROWS]
-        items += [(f"{'Library folder':<22}{settings.out}", "_library"), ("Data folder", "_data"),
-                  ("Edit Playlists.txt", "_links"), ("Reset to defaults", "_reset")]
-        choice = pick("Settings", items)
-        if choice is None:
-            return
-        if choice == "_library":
-            choose_library(settings)
-        elif choice == "_data":
-            data_folder_menu()
-        elif choice == "_links":
-            _ensure_links_file()
-            open_path(config.LINKS_FILE)
-        elif choice == "_reset":
+def _settings_row(out, label: str, value: str, color: str, selected: bool, width: int,
+                  *, dim_label: bool = False):
+    from rich.style import Style
+    from rich.text import Text
+
+    display_value = f"‹ {value} ›" if selected and value else value
+    row_renderable = render_select(
+        [SelectItem(label=label, desc=display_value)],
+        0 if selected else -1,
+        variant="compact",
+        label_width=24,
+        width=width + 1,
+    )
+    segments = out.render_lines(row_renderable, out.options.update(width=width + 1), pad=False)[0]
+    row = Text("".join(segment.text for segment in segments)[1:])
+    label_style = Style(color=ACCENT, bold=True) if selected else Style(color=DIM if dim_label else TEXT)
+    row.stylize(label_style, 0, min(24, len(row.plain)))
+    if len(row.plain) > 24:
+        row.stylize(Style(color=ACCENT if selected else color, bold=selected), 24, len(row.plain))
+    return row
+
+
+def _change_setting(settings: Settings, key: str, direction: int) -> bool:
+    if key in ("_library", "_data", "_links", "_reset", BACK, "rate_limit", "cookies"):
+        return False
+    current = getattr(settings, key)
+    if isinstance(current, bool):
+        setattr(settings, key, not current)
+    elif key in ("jobs", "retries"):
+        low, high = (1, config.MAX_JOBS) if key == "jobs" else (0, 20)
+        setattr(settings, key, max(low, min(high, current + direction)))
+    elif key in CHOICES:
+        choices = CHOICES[key]
+        setattr(settings, key, choices[(choices.index(current) + direction) % len(choices)])
+    else:
+        return False
+    settings.validated().save()
+    return True
+
+
+def _enter_setting(settings: Settings, key: str) -> None:
+    if key == "_library":
+        choose_library(settings)
+    elif key == "_data":
+        data_folder_menu()
+    elif key == "_links":
+        _ensure_links_file()
+        open_path(config.LINKS_FILE)
+    elif key == "_reset":
+        if confirm_boxes("Reset all settings to defaults?"):
             defaults = Settings(out=settings.out)
-            for key, _ in SETTING_ROWS:
-                setattr(settings, key, getattr(defaults, key))
+            for setting, _ in SETTING_ROWS:
+                setattr(settings, setting, getattr(defaults, setting))
             settings.save()
-        else:
-            _edit_setting(settings, choice)
+    elif key in ("rate_limit", "cookies"):
+        _edit_setting(settings, key)
+    elif key not in ("format", "quality", "name_style", "cover", "square", "clean",
+                     "playlist_files", "prune", "skip_duplicate_songs", "jobs", "retries"):
+        raise ValueError(f"Unknown settings row: {key}")
 
 
 def _edit_setting(settings: Settings, key: str) -> None:
@@ -316,7 +493,8 @@ def _edit_setting(settings: Settings, key: str) -> None:
             return
         setattr(settings, key, value)
     else:
-        hint = {"rate_limit": " (e.g. 2M, empty = off)", "cookies": " (chrome, firefox, edge..., empty = off)"}
+        hint = {"rate_limit": " (e.g. 2M, empty = unlimited)",
+                "cookies": " (chrome, firefox, edge..., empty = none)"}
         value = ask_text(f"{label}{hint.get(key, '')}:", str(current))
         if value is None:
             return

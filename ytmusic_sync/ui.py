@@ -1,25 +1,117 @@
 """Terminal output: live dashboard, summaries, stats. Rich is imported lazily."""
 from __future__ import annotations
 
-import sys
-from functools import lru_cache
+from datetime import datetime
 
-from . import ytdlp
-from .library import Library, time_ago
+from rich.cells import cell_len
+from rich.console import Group
+from rich.style import Style
+from rich.text import Text
+
+from . import __version__, config, ytdlp
+from .library import Library, open_library, time_ago
 from .progress import Tracker
+from .theme import ACCENT, BRAND, CYAN, DIM, DIVIDER, GREEN, PATH, RED, TEXT, get_console
+from .widgets import fmt_size, panel_with_title
 
-ACCENT, GOOD, BAD, DIM = "#ff9f1a", "#3fb950", "#f85149", "#8b8b8b"
-
-
-@lru_cache(maxsize=1)
 def console():
-    from rich.console import Console
+    return get_console()
 
-    try:  # box-drawing and ✓ need UTF-8 (Windows consoles default to cp1252 when redirected)
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    return Console()
+
+GOOD, BAD = GREEN, RED
+
+
+def build_header():
+    settings = config.Settings.load()
+    out_path = settings.out_path
+    if out_path is None:
+        raise ValueError("A music library folder is required to build the header.")
+    lib = open_library(out_path)
+    width = max(1, console().width - 4)
+
+    def relative_time(stamp: str) -> str:
+        try:
+            elapsed = max(0, int((datetime.now() - datetime.strptime(stamp, "%Y-%m-%d %H:%M")).total_seconds()))
+        except (TypeError, ValueError):
+            return "never"
+        if elapsed < 60:
+            return "just now"
+        if elapsed < 3600:
+            minutes = elapsed // 60
+            return f"{minutes} min ago"
+        if elapsed < 86400:
+            hours = elapsed // 3600
+            return f"{hours} hour{'s' if hours != 1 else ''} ago"
+        days = elapsed // 86400
+        return f"{days} day{'s' if days != 1 else ''} ago"
+
+    def middle_truncate(value: str, max_width: int) -> str:
+        if max_width <= 0:
+            return ""
+        if cell_len(value) <= max_width:
+            return value
+        if max_width == 1:
+            return "…"
+        available = max_width - 1
+        left_width = (available + 1) // 2
+        right_width = available - left_width
+
+        def take_left(text: str, limit: int) -> str:
+            result = ""
+            for char in text:
+                if cell_len(result + char) > limit:
+                    break
+                result += char
+            return result
+
+        left = take_left(value, left_width)
+        right = take_left(value[::-1], right_width)[::-1]
+        return left + "…" + right
+
+    def status_line():
+        path = str(out_path)
+        last_sync = relative_time(lib.stats.get("last_run", "never"))
+        suffix = Text()
+        suffix.append("Last sync ", style=Style(color=DIM))
+        suffix.append(last_sync, style=Style(color=TEXT))
+        available_path_width = max(0, width - cell_len(suffix.plain) - cell_len("  ·  "))
+        line = Text()
+        line.append(middle_truncate(path, available_path_width), style=Style(color=PATH))
+        line.append("  ·  ", style=Style(color=DIM))
+        line.append_text(suffix)
+        line.no_wrap = True
+        line.overflow = "crop"
+        return line
+
+    tagline = Text("YouTube music + Local, always in sync", style=Style(color=DIM))
+    tagline.no_wrap = True
+    tagline.overflow = "crop"
+
+    divider = Text("─" * width, style=Style(color=DIVIDER))
+    totals = Text()
+    totals.append(str(len(lib.songs)), style=Style(color=CYAN, bold=True))
+    totals.append(" songs ", style=Style(color=TEXT))
+    totals.append("·", style=Style(color=DIM))
+    totals.append(" ", style=Style(color=TEXT))
+    size, _, unit = fmt_size(lib.total_size()).partition(" ")
+    totals.append(size, style=Style(color=CYAN, bold=True))
+    totals.append(f" {unit} ", style=Style(color=TEXT))
+    totals.append("·", style=Style(color=DIM))
+    totals.append(" ", style=Style(color=TEXT))
+    totals.append(str(len(lib.playlists)), style=Style(color=CYAN, bold=True))
+    totals.append(" playlists", style=Style(color=TEXT))
+    totals.no_wrap = True
+    totals.overflow = "crop"
+
+    body = Group(tagline, divider, status_line(), totals)
+    return panel_with_title(
+        body,
+        name="♪ ytmusic-sync",
+        dim=f"v{__version__}",
+        border=BRAND,
+        name_color=BRAND,
+        padding=(0, 1),
+    )
 
 
 def human_size(n: float) -> str:
@@ -141,7 +233,6 @@ def print_plan(plan, dry_run: bool = False) -> None:
 
 
 def print_run_summary(result, lib: Library, playlist_rows: list[tuple], size_before: int) -> None:
-    from rich.panel import Panel
     from rich.table import Table
 
     out = console()
@@ -155,7 +246,7 @@ def print_run_summary(result, lib: Library, playlist_rows: list[tuple], size_bef
             f"[dim]{human_size(result.bytes)} downloaded in {clock(result.elapsed)}[/]",
             f"[dim]Library: {len(lib.songs)} songs · {human_size(after)} "
             f"({'+' if after >= size_before else '-'}{human_size(abs(after - size_before))})[/]"]
-    out.print(Panel("\n".join(body), border_style=ACCENT, title="Done", expand=False))
+    out.print(panel_with_title("\n".join(body), "Done", border=ACCENT, name_color=ACCENT, padding=(0, 1)))
 
     if playlist_rows:
         table = Table(box=None, pad_edge=False, show_header=True, header_style=DIM)

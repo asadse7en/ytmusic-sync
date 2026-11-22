@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from . import __version__, config
+from .theme import init_terminal
 
 EXAMPLES = """examples:
   ytmusic-sync                     interactive menu
@@ -62,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    init_terminal()
     parser = build_parser()
     args = parser.parse_args(argv)
     direct = bool(args.urls or args.playlists or args.update or args.stats or args.dry_run
