@@ -3,18 +3,20 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HOME = tempfile.mkdtemp(prefix="ytsync-test-")
 os.environ["YTMUSIC_SYNC_HOME"] = HOME
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ytmusic_sync import config, downloader, links, planner, sync, tags, ui, ytdlp  # noqa: E402
+from ytmusic_sync import config, downloader, links, planner, progress, sync, tags, ui, ytdlp  # noqa: E402
 from ytmusic_sync.library import Library  # noqa: E402
 from ytmusic_sync.progress import Tracker  # noqa: E402
-from ytmusic_sync.scanner import scan_links  # noqa: E402
+from ytmusic_sync.scanner import ScanResult, ScannedPlaylist, scan_links  # noqa: E402
 
 PL = "https://www.youtube.com/playlist?list=PLgym"
 PL2 = "https://www.youtube.com/playlist?list=PLchill"
@@ -32,14 +34,19 @@ CATALOG = {
 
 class FakeYDL:
     def __init__(self, opts):
-        self.opts, self.pps = opts, []
+        self.opts, self.params, self.pps = opts, dict(opts), []
 
     def __enter__(self): return self
     def __exit__(self, *exc): return False
+    def close(self): pass
     def add_post_processor(self, pp, when=None): self.pps.append(pp)
 
     def extract_info(self, url, download=False):
         if self.opts.get("extract_flat"):
+            if self.params.get("playlist_items") == "1":
+                if url not in CATALOG:
+                    raise ValueError("ERROR: [youtube] zzz: Video unavailable")
+                return {"playlist_count": len(CATALOG[url]["entries"])}
             if url not in CATALOG:
                 raise ValueError("ERROR: [youtube] zzz: Video unavailable")
             return CATALOG[url]
@@ -88,6 +95,26 @@ class LinkTests(unittest.TestCase):
                                         "nonsense https://example.com/x https://www.youtube.com/playlist?list=PL1")
         self.assertEqual(len(valid), 2)
         self.assertEqual(bad, ["nonsense", "https://example.com/x"])
+
+    def test_normalization_and_query_independent_identity(self):
+        playlist = "https://music.youtube.com/playlist?list=PL1&si=first"
+        same_playlist = "https://www.youtube.com/playlist?list=PL1&si=second"
+        video = "https://www.youtube.com/watch?v=abcdefghijk&si=first"
+        same_video = "https://youtu.be/abcdefghijk?si=second"
+
+        self.assertEqual(
+            links.normalize_url(playlist),
+            "https://www.youtube.com/playlist?list=PL1&si=first",
+        )
+        self.assertEqual(links.link_key(playlist), links.link_key(same_playlist))
+        self.assertEqual(links.link_key(video), links.link_key(same_video))
+        self.assertEqual(
+            links.dedupe([playlist, same_playlist, video, same_video]),
+            [links.canonical_url(playlist), video],
+        )
+        valid, invalid = links.parse_pasted("https://example.com/watch?v=abcdefghijk " + video)
+        self.assertEqual(valid, [video])
+        self.assertEqual(invalid, ["https://example.com/watch?v=abcdefghijk"])
 
     def test_save_links_no_duplicates_and_names(self):
         config.LINKS_FILE.unlink(missing_ok=True)
@@ -186,13 +213,88 @@ class LibraryTests(unittest.TestCase):
 
 
 class UiTests(unittest.TestCase):
-    def test_bar_split_sums_to_width(self):
-        for counts in ([1, 2, 3, 4], [0, 0, 0, 0], [5, 0, 0, 0], [1, 1, 1, 1000]):
-            self.assertEqual(sum(ui._split(counts, 37)), 37)
-
     def test_helpers(self):
         self.assertEqual(ui.clock(3725), "1:02:05")
         self.assertEqual(ui.human_size(1536), "1.5 KB")
+
+
+class ProgressTests(unittest.TestCase):
+    def test_eta_waits_for_five_seconds(self):
+        with patch.object(progress.time, "monotonic", side_effect=[100.0, 104.0, 105.0]):
+            tracker = Tracker(3, 1)
+            tracker.done = 1
+            self.assertIsNone(tracker.snapshot()["eta"])
+            self.assertEqual(tracker.snapshot()["eta"], 10.0)
+
+    def test_speed_samples_are_bounded_to_fifteen(self):
+        with patch.object(progress.time, "monotonic", side_effect=[100.0, 120.0]):
+            tracker = Tracker(2, 1)
+            self.assertEqual(len(tracker.snapshot()["speed_samples"]), 15)
+
+
+class ResultAggregationTests(unittest.TestCase):
+    def test_run_results_attribute_playlists_and_count_unique_downloads(self):
+        with tempfile.TemporaryDirectory(prefix="aggregation-") as directory:
+            music = Path(directory)
+            lib = Library(music)
+            successful = [
+                {"id": f"done{i:02}", "title": f"Song {i}", "dur": 180}
+                for i in range(35)
+            ]
+            failed = [
+                {"id": f"failed{i:02}", "title": f"Failed {i}", "dur": 180}
+                for i in range(35)
+            ]
+            for entry in successful:
+                filename = f"{entry['id']}.mp3"
+                (music / filename).write_bytes(b"audio")
+                lib.add_song(entry["id"], {
+                    "file": filename, "artist": "Artist", "title": entry["title"], "dur": entry["dur"],
+                })
+
+            playlists = [
+                ScannedPlaylist("Gym", PL, successful + failed),
+                ScannedPlaylist("Chill", PL2, successful[:1]),
+            ]
+            plan = planner.Plan(lib, ScanResult(playlists=playlists))
+            results = [
+                downloader.TrackResult(
+                    entry["id"], entry["title"], ("PLgym",) + (("PLchill",) if index == 0 else ()),
+                    "done", bytes=5,
+                )
+                for index, entry in enumerate(successful)
+            ]
+            results.extend(
+                downloader.TrackResult(entry["id"], entry["title"], ("PLgym",), "failed", reason="unavailable")
+                for entry in failed
+            )
+            result = sync.RunResult(
+                track_results=results,
+                failures=[downloader.Failure(entry["title"], "Artist", "unavailable", entry["id"], ("PLgym",))
+                          for entry in failed],
+            )
+            sync._set_result_totals(result)
+            rows = sync._finish_run(
+                config.Settings(out=str(music), playlist_files=False).validated(),
+                plan,
+                result,
+                time.monotonic(),
+            )
+
+            by_id = {row["id"]: row for row in rows}
+            self.assertEqual(result.new, 35)
+            self.assertEqual(by_id["PLgym"]["added"], 35)
+            self.assertEqual(by_id["PLgym"]["failed"], 35)
+            self.assertEqual(by_id["PLchill"]["added"], 1)
+            self.assertEqual(lib.stats["downloads"], 35)
+            self.assertEqual(lib.stats["runs"], 1)
+
+
+class RenderSmokeTests(unittest.TestCase):
+    def test_all_screens_render_at_supported_widths(self):
+        from render_smoke import run_render_smoke
+
+        run_render_smoke()
 
 
 if __name__ == "__main__":

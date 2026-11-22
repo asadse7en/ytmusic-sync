@@ -149,7 +149,11 @@ def ruled_heading(label: str, width: int) -> Text:
     return result
 
 
-def _largest_remainder(weights: list[float], width: int) -> list[int]:
+def _largest_remainder(
+    weights: list[float],
+    width: int,
+    minimum_indexes: list[int] | None = None,
+) -> list[int]:
     if width <= 0 or not weights or sum(weights) <= 0:
         return [0] * len(weights)
     total = sum(weights)
@@ -160,11 +164,17 @@ def _largest_remainder(weights: list[float], width: int) -> list[int]:
     for index in order[:remainder]:
         cells[index] += 1
 
-    positive = [index for index, weight in enumerate(weights) if weight > 0]
+    positive = minimum_indexes if minimum_indexes is not None else [
+        index for index, weight in enumerate(weights) if weight > 0
+    ]
     if len(positive) <= width:
+        positive_set = set(positive)
         for index in positive:
             if cells[index] == 0:
-                donors = [candidate for candidate in range(len(cells)) if cells[candidate] > 1]
+                donors = [
+                    candidate for candidate in range(len(cells))
+                    if cells[candidate] > (1 if candidate in positive_set else 0)
+                ]
                 if donors:
                     donor = max(donors, key=lambda candidate: (cells[candidate], weights[candidate]))
                     cells[donor] -= 1
@@ -183,7 +193,11 @@ def segmented_bar(width: int, parts: list[tuple[int, str]], total: int) -> Text:
         weights = [float(count) for count in counts] + [0.0]
     else:
         weights = [0.0] * len(parts) + [1.0]
-    allocations = _largest_remainder(weights, width)
+    allocations = _largest_remainder(
+        weights,
+        width,
+        [index for index, count in enumerate(counts) if count > 0],
+    )
 
     result = Text()
     for (_, color), cells in zip(parts, allocations):
@@ -344,8 +358,8 @@ class _SelectRenderable:
                 content_width = width - 1
                 content = _content(item, selected, self.label_width, content_width)
                 row.append_text(content)
-                if cell_len(row) < width:
-                    row.append(" " * (width - cell_len(row)), style=Style(bgcolor=bg))
+                if cell_len(row.plain) < width:
+                    row.append(" " * (width - cell_len(row.plain)), style=Style(bgcolor=bg))
                 yield row
                 secondary = _secondary(item)
                 if secondary is not None:
@@ -354,9 +368,9 @@ class _SelectRenderable:
                     line.append(" ", style=Style(bgcolor=bg))
                     line.append_text(_as_text(secondary, width - 2, console))
                     if selected:
-                        line.stylize(Style(bgcolor=SEL_FILL), 1, cell_len(line))
-                    if cell_len(line) < width:
-                        line.append(" " * (width - cell_len(line)), style=Style(bgcolor=bg))
+                        line.stylize(Style(bgcolor=SEL_FILL), 1, cell_len(line.plain))
+                    if cell_len(line.plain) < width:
+                        line.append(" " * (width - cell_len(line.plain)), style=Style(bgcolor=bg))
                     yield line
             return
 

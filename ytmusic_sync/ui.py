@@ -80,7 +80,7 @@ def print_path_message(prefix: str, path: str, suffix: str = "", *, success: boo
     if success:
         line.append("✓ ", style=Style(color=GREEN))
     line.append(prefix, style=Style(color=color))
-    path_width = max(0, out.width - cell_len(line) - cell_len(suffix))
+    path_width = max(0, out.width - cell_len(line.plain) - cell_len(suffix))
     line.append(middle_truncate(path, path_width), style=Style(color=GREEN if success else PATH))
     line.append(suffix, style=Style(color=color))
     line.no_wrap = True
@@ -92,7 +92,7 @@ def print_path_error(prefix: str, path: str, hint: str) -> None:
     out = console()
     line = Text("✗ ", style=Style(color=RED))
     line.append(prefix, style=Style(color=RED))
-    path_width = max(0, out.width - cell_len(line))
+    path_width = max(0, out.width - cell_len(line.plain))
     line.append(middle_truncate(path, path_width), style=Style(color=RED))
     line.no_wrap = True
     line.overflow = "crop"
@@ -177,7 +177,7 @@ def build_header() -> RenderableType:
 
         def make_line(include_duration: bool, include_new: bool, include_failed: bool) -> Text:
             rest = suffix(include_duration, include_new, include_failed)
-            available_path_width = max(0, width - cell_len(rest) - cell_len("  ·  "))
+            available_path_width = max(0, width - cell_len(rest.plain) - cell_len("  ·  "))
             shortened_path = middle_truncate(path, available_path_width)
             line = Text()
             if shortened_path:
@@ -189,10 +189,10 @@ def build_header() -> RenderableType:
             return line
 
         line = make_line(show_duration, show_new, show_failed)
-        if cell_len(line) > width and show_duration:
+        if cell_len(line.plain) > width and show_duration:
             show_duration = False
             line = make_line(show_duration, show_new, show_failed)
-        if cell_len(line) > width and (show_new or show_failed):
+        if cell_len(line.plain) > width and (show_new or show_failed):
             line = make_line(show_duration, False, False)
         return line
 
@@ -468,7 +468,7 @@ def build_download_view(state, width: int, height: int) -> RenderableType:
     percent = completed * 100 / snapshot["total"] if snapshot["total"] else 100.0
     percent_text = Text(f"{percent:.1f}%", style=Style(color=ACCENT, bold=True))
     count_text = Text(f"{completed} / {snapshot['total']}", style=Style(color=DIM))
-    bar_width = max(0, content_width - cell_len(percent_text) - cell_len(count_text) - 2)
+    bar_width = max(0, content_width - cell_len(percent_text.plain) - cell_len(count_text.plain) - 2)
     progress_row = Text()
     progress_row.append_text(percent_text)
     progress_row.append(" ")
@@ -691,7 +691,7 @@ def _failure_list_summary(failures, width: int) -> Text:
     else:
         line.append("No failures yet. · details in ", style=Style(color=DIM))
     path = str(config.FAILED_FILE)
-    path_width = max(0, width - cell_len(line))
+    path_width = max(0, width - cell_len(line.plain))
     line.append(middle_truncate(path, path_width), style=Style(color=DIM))
     line.no_wrap = True
     line.overflow = "crop"
@@ -1100,7 +1100,7 @@ def _failure_summary(failures, width: int) -> Text:
     prefix = Text(f"✗ {len(failures)} failed", style=Style(color=RED))
     common_text = f" · most common: {common[0][0]} ×{common[0][1]}" if common else ""
     location = " · details saved to "
-    path_width = max(0, width - cell_len(prefix) - cell_len(common_text) - cell_len(location))
+    path_width = max(0, width - cell_len(prefix.plain) - cell_len(common_text) - cell_len(location))
     path = middle_truncate(str(config.FAILED_FILE), path_width)
     line = Text()
     line.append_text(prefix)
