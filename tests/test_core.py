@@ -319,7 +319,9 @@ class DashboardViewTests(unittest.TestCase):
             self.assertLessEqual(len(text.splitlines()), height)
             return text
 
-        self.assertIn("Downloading", render(40))
+        downloads = render(40)
+        self.assertIn("Downloading", downloads)
+        self.assertIn("f failures (0) · q stop safely · Ctrl+C force quit", downloads)
         dashboard.handle_view_key("f", failures, 16)
         first_page = render(16)
         self.assertIn("Failures", first_page)

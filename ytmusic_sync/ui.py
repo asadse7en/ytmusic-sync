@@ -529,10 +529,7 @@ def build_download_view(state, width: int, height: int) -> RenderableType:
     )
     workers = _download_workers_panel(snapshot, width)
     failed_count = snapshot["failed"]
-    footer = footer_hint(
-        f"f failures ({failed_count}) · q stop safely · Ctrl+C force quit"
-        if failed_count else "f failures · q stop safely · Ctrl+C force quit"
-    )
+    footer = footer_hint(f"f failures ({failed_count}) · q stop safely · Ctrl+C force quit")
     return Group(overall, workers, footer)
 
 
