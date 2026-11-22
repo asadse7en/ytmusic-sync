@@ -1,4 +1,5 @@
 """Offline tests: everything except real YouTube access (yt-dlp is replaced by a fake)."""
+import io
 import os
 import sys
 import tempfile
@@ -8,6 +9,9 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+from rich.cells import cell_len
+from rich.console import Console
 
 HOME = tempfile.mkdtemp(prefix="ytsync-test-")
 os.environ["YTMUSIC_SYNC_HOME"] = HOME
@@ -288,6 +292,62 @@ class ResultAggregationTests(unittest.TestCase):
             self.assertEqual(by_id["PLchill"]["added"], 1)
             self.assertEqual(lib.stats["downloads"], 35)
             self.assertEqual(lib.stats["runs"], 1)
+
+
+class DashboardViewTests(unittest.TestCase):
+    def test_failures_view_replaces_downloads_and_scrolls_by_page(self):
+        tracker = Tracker(20, 2)
+        dashboard = ui.Dashboard(tracker)
+        failures = [
+            downloader.Failure(f"Track {index}", "Artist", "Video unavailable", f"video{index:07}")
+            for index in range(12)
+        ]
+        dashboard.update_failures(failures)
+
+        def render(height):
+            output = Console(
+                width=80,
+                height=height,
+                file=io.StringIO(),
+                force_terminal=True,
+                record=True,
+                color_system="truecolor",
+            )
+            output.print(dashboard)
+            text = output.export_text(styles=False)
+            self.assertTrue(all(cell_len(line) <= 80 for line in text.splitlines()))
+            self.assertLessEqual(len(text.splitlines()), height)
+            return text
+
+        self.assertIn("Downloading", render(40))
+        dashboard.handle_view_key("f", failures, 16)
+        first_page = render(16)
+        self.assertIn("Failures", first_page)
+        self.assertIn("Video unavailable", first_page)
+        self.assertIn("f back · ↑↓ scroll · q stop safely · Ctrl+C force quit", first_page)
+        self.assertIn("Track 0", first_page)
+        self.assertNotIn("Downloading", first_page)
+        self.assertNotIn("Workers", first_page)
+
+        dashboard.handle_view_key("pagedown", failures, 16)
+        second_page = render(16)
+        self.assertIn("Track 5", second_page)
+        self.assertNotIn("Track 0", second_page)
+        dashboard.handle_view_key("pageup", failures, 16)
+        self.assertIn("Track 0", render(16))
+
+        dashboard.handle_view_key("f", failures, 16)
+        downloads = render(40)
+        self.assertIn("Downloading", downloads)
+        self.assertIn("Workers", downloads)
+        self.assertNotIn("Failures", downloads)
+        dashboard.handle_view_key("f", failures, 16)
+
+        dashboard.handle_view_key("esc", failures, 16)
+        downloads = render(40)
+        self.assertIn("Downloading", downloads)
+        self.assertIn("Workers", downloads)
+        self.assertNotIn("Failures", downloads)
 
 
 class RenderSmokeTests(unittest.TestCase):

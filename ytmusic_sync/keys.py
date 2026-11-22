@@ -13,12 +13,16 @@ _WINDOWS_KEYS = {
     "P": "down",
     "K": "left",
     "M": "right",
+    "I": "pageup",
+    "Q": "pagedown",
 }
 _ANSI_KEYS = {
     b"\x1b[A": "up",
     b"\x1b[B": "down",
     b"\x1b[D": "left",
     b"\x1b[C": "right",
+    b"\x1b[5~": "pageup",
+    b"\x1b[6~": "pagedown",
 }
 
 
@@ -77,7 +81,7 @@ def read_key(timeout: float | None = None) -> str | None:
             return _normalize_char(char)
 
         sequence = first
-        while len(sequence) < 3:
+        while len(sequence) < 4 and sequence not in _ANSI_KEYS:
             readable, _, _ = select.select([fd], [], [], 0.03)
             if not readable:
                 break

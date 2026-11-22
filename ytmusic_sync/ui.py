@@ -727,6 +727,26 @@ def _failure_row(failure, selected: bool, width: int):
     return Group(row, link)
 
 
+def build_failures_view(failures, scroll: int, width: int, height: int) -> RenderableType:
+    width = max(1, width)
+    inner_width = max(1, width - 6)
+    visible_count = max(0, (height - 6) // 2)
+    max_scroll = max(0, len(failures) - visible_count)
+    start = min(max(0, scroll), max_scroll)
+    visible = failures[start:start + visible_count]
+    content = [_failure_list_summary(failures, inner_width)]
+    content.extend(_failure_row(item, False, inner_width) for item in visible)
+    return Group(
+        panel_with_title(
+            Group(*content),
+            name="Failures",
+            dim=f"{len(failures)} tracks",
+            border=BORDER,
+        ),
+        footer_hint("f back · ↑↓ scroll · q stop safely · Ctrl+C force quit"),
+    )
+
+
 def show_failures(failures) -> None:
     from rich.live import Live
 
@@ -797,9 +817,48 @@ class Dashboard:
 
     def __init__(self, tracker: Tracker):
         self.tracker = tracker
+        self.lock = threading.Lock()
+        self.mode = "downloads"
+        self.failures = []
+        self.failure_scroll = 0
+
+    def update_failures(self, failures) -> None:
+        with self.lock:
+            self.failures = list(failures)
+
+    def handle_view_key(self, key: str, failures, height: int) -> None:
+        with self.lock:
+            if key == "f":
+                if self.mode == "downloads":
+                    self.failures = list(failures)
+                    self.failure_scroll = 0
+                    self.mode = "failures"
+                else:
+                    self.mode = "downloads"
+                return
+            if key == "esc" and self.mode == "failures":
+                self.mode = "downloads"
+                return
+            if self.mode != "failures":
+                return
+
+            visible_count = max(0, (height - 6) // 2)
+            step = max(1, visible_count) if key in ("pageup", "pagedown") else 1
+            max_scroll = max(0, len(self.failures) - visible_count)
+            if key in ("up", "pageup"):
+                self.failure_scroll = max(0, self.failure_scroll - step)
+            elif key in ("down", "pagedown"):
+                self.failure_scroll = min(max_scroll, self.failure_scroll + step)
 
     def __rich_console__(self, console, options):
-        yield build_download_view(self.tracker, options.max_width, console.height)
+        with self.lock:
+            mode = self.mode
+            failures = list(self.failures)
+            scroll = self.failure_scroll
+        if mode == "failures":
+            yield build_failures_view(failures, scroll, options.max_width, console.height)
+        else:
+            yield build_download_view(self.tracker, options.max_width, console.height)
 
 
 class StoppingProgress:

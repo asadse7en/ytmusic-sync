@@ -136,7 +136,8 @@ def _postprocessor_classes():
 
 def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: Tracker,
                   stop: threading.Event, on_result=None,
-                  track_results: list[TrackResult] | None = None, on_stopping=None) -> list[Failure]:
+                  track_results: list[TrackResult] | None = None, on_stopping=None,
+                  on_view_key=None, on_failure_update=None) -> list[Failure]:
     """Download `todo` with settings.jobs workers. Returns the failures.
 
     `stop` is checked inside every yt-dlp hook, so setting it aborts running downloads quickly.
@@ -172,7 +173,7 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
                     return
                 _download_one(
                     ydl, entry, slot, lib, settings, tracker, stop, failures, failures_lock, on_result,
-                    track_results, track_results_lock,
+                    track_results, track_results_lock, on_failure_update,
                 )
 
     with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="dl") as pool:
@@ -192,9 +193,16 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
                 elif key == "f":
                     with failures_lock:
                         current_failures = list(failures)
-                    from . import ui
+                    if on_view_key is not None:
+                        on_view_key(key, current_failures)
+                    else:
+                        from . import ui
 
-                    ui.show_failures(current_failures)
+                        ui.show_failures(current_failures)
+                elif key == "esc" and on_view_key is not None:
+                    with failures_lock:
+                        current_failures = list(failures)
+                    on_view_key(key, current_failures)
                 elif key == "ctrl-c":
                     raise KeyboardInterrupt
         except KeyboardInterrupt:
@@ -211,7 +219,7 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
 
 
 def _download_one(ydl, entry, slot, lib, settings, tracker, stop, failures, failures_lock, on_result,
-                  track_results, track_results_lock):
+                  track_results, track_results_lock, on_failure_update):
     vid, started = entry["id"], time.time()
     playlist_ids = tuple(entry.get("playlist_ids", ()))
     tracker.start(slot, entry["title"])
@@ -245,6 +253,9 @@ def _download_one(ydl, entry, slot, lib, settings, tracker, stop, failures, fail
             failure = Failure(entry["title"], tracker.artist(slot) or "Unknown", reason, vid, playlist_ids)
             with failures_lock:
                 failures.append(failure)
+                current_failures = list(failures)
+            if on_failure_update is not None:
+                on_failure_update(current_failures)
             _record_track_result(
                 track_results, track_results_lock,
                 TrackResult(vid, entry["title"], playlist_ids, "failed", reason=reason),

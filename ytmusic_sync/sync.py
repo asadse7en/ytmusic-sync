@@ -95,7 +95,9 @@ def execute(settings: config.Settings, plan: Plan, *, compact: bool = False, pru
         else:
             from rich.live import Live
 
-            with Live(ui.Dashboard(tracker), console=out, refresh_per_second=8,
+            dashboard = ui.Dashboard(tracker)
+
+            with Live(dashboard, console=out, refresh_per_second=8,
                       transient=True, screen=True) as live:
                 stopping = {"progress": None}
 
@@ -108,6 +110,8 @@ def execute(settings: config.Settings, plan: Plan, *, compact: bool = False, pru
                     plan.todo, lib, settings, tracker, stop,
                     track_results=result.track_results,
                     on_stopping=show_stopping,
+                    on_view_key=lambda key, failures: dashboard.handle_view_key(key, failures, out.height),
+                    on_failure_update=dashboard.update_failures,
                 )
                 _finish_unreported_tracks(plan, result)
                 _set_result_totals(result)
