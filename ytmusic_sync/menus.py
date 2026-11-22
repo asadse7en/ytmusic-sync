@@ -98,8 +98,9 @@ def pick(message: str, items: list[tuple[str, object]], back: bool = True):
 def ask_text(message: str, default: str = "") -> str | None:
     out = ui.console()
     shown_default = middle_truncate(default, max(0, out.width - len(message) - 6))
+    default_hint = f" [{shown_default}]" if default else ""
     try:
-        value = out.input(f"{message} [{shown_default}]: ", markup=False)
+        value = out.input(f"{message}{default_hint}: ", markup=False)
     except (EOFError, KeyboardInterrupt):
         return None
     return value if value else default
@@ -152,9 +153,8 @@ def _first_run(settings: Settings) -> bool:
 
 
 def choose_library(settings: Settings) -> bool:
-    out = ui.console()
     if settings.out and not Path(settings.out).is_dir():
-        ui.print_path_error("Music folder is unavailable: ", settings.out,
+        ui.print_path_error("Music folder is unavailable: ", str(settings.out),
                             "Reconnect the drive or choose a folder.")
     default = settings.out or str(Path.home() / "Music" / "YouTube")
     answer = ask_text("Music folder", default)

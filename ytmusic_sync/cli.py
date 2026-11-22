@@ -1,4 +1,4 @@
-"""Command line entry point. Heavy imports (yt-dlp, rich, questionary) happen only when needed."""
+"""Command line entry point. Heavy imports (yt-dlp and Rich UI) happen only when needed."""
 from __future__ import annotations
 
 import argparse
@@ -23,9 +23,9 @@ class _Version(argparse.Action):
         super().__init__(option_strings, dest, nargs=0, **kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
-        from . import ytdlp
+        from . import ui, ytdlp
 
-        print(f"ytmusic-sync {__version__} (yt-dlp {ytdlp.installed_version()})")
+        ui.print_notice(f"ytmusic-sync {__version__} (yt-dlp {ytdlp.installed_version()})")
         parser.exit()
 
 
@@ -74,24 +74,41 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _run(args, direct)
     except KeyboardInterrupt:
-        print("\nCancelled.", file=sys.stderr)
+        from . import ui
+
+        ui.print_notice("Cancelled.")
         return 130
     except OSError as exc:
-        print(f"Could not access the music or data folder: {exc}\n"
-              "Check that the music folder is connected and writable.", file=sys.stderr)
+        from . import ui
+
+        if exc.filename:
+            ui.print_path_error("Could not access the music or data folder: ",
+                                str(exc.filename),
+                                "Check that the music folder is connected and writable.")
+        else:
+            ui.print_error("Could not access the music or data folder.",
+                           "Check that the music folder is connected and writable.")
         return 1
     except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        from . import ui
+
+        if "yt-dlp is not installed" in str(exc):
+            ui.print_missing_dependency("yt-dlp", "Install yt-dlp with: pip install yt-dlp")
+        else:
+            ui.print_error(str(exc), "See the sync log for details.")
         return 1
 
 
 def _run(args, direct: bool) -> int:
     config.ensure_data_dir()
     if args.update_ytdlp:
-        from . import ytdlp
+        from . import ui, ytdlp
 
         ok = ytdlp.upgrade()
-        print("yt-dlp updated." if ok else "Update failed. Try: pip install -U yt-dlp")
+        if ok:
+            ui.print_success("yt-dlp updated.")
+        else:
+            ui.print_error("Could not update yt-dlp.", "Try: pip install -U yt-dlp")
         return 0 if ok else 1
 
     settings = config.Settings.load()
@@ -101,7 +118,10 @@ def _run(args, direct: bool) -> int:
         if _ensure_folder(settings.out_path):
             settings.save()
     if args.where:
-        print(f"Data folder:    {config.DATA_DIR}\nLibrary folder: {settings.out or '(not selected)'}")
+        from . import ui
+
+        ui.print_path_message("Data folder:    ", str(config.DATA_DIR))
+        ui.print_path_message("Library folder: ", settings.out or "(not selected)")
         return 0
 
     if not direct:
@@ -120,8 +140,10 @@ def _run(args, direct: bool) -> int:
 
     out = settings.out_path
     if out is None or not out.is_dir():
-        print(f"No usable music folder ({settings.out or 'none selected'}). Run ytmusic-sync once to pick one, "
-              "or pass -o FOLDER.", file=sys.stderr)
+        from . import ui
+
+        ui.print_path_error("No usable music folder: ", settings.out or "none selected",
+                            "Run ytmusic-sync once to pick one, or pass -o FOLDER.")
         return 1
 
     from . import sync, ui, ytdlp
@@ -141,7 +163,7 @@ def _run(args, direct: bool) -> int:
         urls += links.read_links()
     urls = links.dedupe(urls)
     if not urls:
-        ui.console().print(f"[yellow]No links yet. Add links to {config.LINKS_FILE} or pass a URL.[/]")
+        ui.print_path_message("No links yet. Add links to ", str(config.LINKS_FILE), " or pass a URL.")
         return 0
 
     ytdlp.check_for_updates_in_background()

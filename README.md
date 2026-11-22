@@ -34,21 +34,18 @@ First run: pick a music folder, choose **Use defaults & start**, paste playlist 
 ytmusic-sync -u        # or open ytmusic-sync and choose "Update library"
 ```
 
-## Menus
+## Screens
 
-Every menu has **‹ Back**. Ctrl+C goes back, or quits from the home screen.
+- **Menu:** ↑/↓ move, Enter select, letter hotkeys jump; Esc/Ctrl+C goes back or quits from Home.
+- **Scan:** `q` cancels the scan.
+- **Downloading:** `f` opens failures, `q` stops safely, Ctrl+C force quits.
+- **Results:** Enter/Esc returns; `f` opens failures when there are failures.
+- **Stats:** arrows move between playlists; Enter/Esc returns.
+- **Settings:** ↑/↓ move, ←/→ change values, Enter edits or runs an action, Esc returns.
+- **Failures:** ↑/↓ select, Enter opens a link, `c` copies it, Esc returns.
 
-| Screen | What it does |
-| --- | --- |
-| Welcome (first run) | Use defaults & start, Customize, Quit |
-| Home | Update library, Add Music, Settings, Stats, (Update yt-dlp), Quit |
-| Add Music | Paste links, Load from Playlists.txt, Edit Playlists.txt |
-| Ready | Shows new/known song counts, then Start (or Save playlist links & start) |
-| Settings | All options below, saved automatically |
-
-**Update library** uses your saved links and settings and asks nothing.
-In **Paste links**, only valid YouTube links are counted. Playlist links can be saved to `playlists.txt`
-(with the playlist name as a comment above each link); single-song links are downloaded for that run only.
+**Update library** uses your saved links and settings. In **Paste links**, enter one playlist or song link per
+line; playlist links can be saved to `playlists.txt` with their names, while single-song links are for that run.
 
 ## Commands
 
