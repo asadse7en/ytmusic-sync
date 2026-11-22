@@ -131,9 +131,11 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
     work: queue.Queue = queue.Queue()
     for entry in todo:
         work.put(entry)
+    tracker.set_queue([entry["title"] for entry in todo])
     failures: list[Failure] = []
     failures_lock = threading.Lock()
     jobs = max(1, min(settings.jobs, len(todo)))
+    interactive_dashboard = on_result is None
 
     def worker(slot: int) -> None:
         yt_dlp = ytdlp.module()
@@ -159,8 +161,22 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
     with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="dl") as pool:
         futures = [pool.submit(worker, slot) for slot in range(jobs)]
         try:
-            while wait(futures, timeout=0.25).not_done:  # short timeout keeps Ctrl+C responsive on Windows
-                pass
+            while wait(futures, timeout=0.125).not_done:  # keep keyboard stop and Ctrl+C responsive
+                if not interactive_dashboard:
+                    continue
+                from .keys import read_key
+
+                key = read_key(timeout=0)
+                if key == "q":
+                    stop.set()
+                elif key == "f":
+                    with failures_lock:
+                        current_failures = list(failures)
+                    from . import ui
+
+                    ui.show_failures(current_failures)
+                elif key == "ctrl-c":
+                    raise KeyboardInterrupt
         except KeyboardInterrupt:
             stop.set()
             try:  # let running conversions finish; a second Ctrl+C quits immediately

@@ -11,8 +11,23 @@ from rich.text import Text
 from . import __version__, config, ytdlp
 from .library import Library, open_library, time_ago
 from .progress import Tracker
-from .theme import ACCENT, BLUE, BORDER, BRAND, CYAN, DIM, DIMMER, DIVIDER, GREEN, PATH, RED, TEXT, get_console
-from .widgets import fmt_size, footer_hint, panel_with_title, segmented_bar, truncate
+from .theme import (
+    ACCENT, BLUE, BORDER, BRAND, CYAN, DIM, DIMMER, DIVIDER, GREEN, PATH, RED, TEXT, TRACK,
+    WORKER_BORDER, get_console,
+)
+from .widgets import (
+    clock_12h,
+    divider,
+    fmt_duration,
+    fmt_size,
+    fmt_speed,
+    footer_hint,
+    panel_with_title,
+    segmented_bar,
+    sparkline,
+    stage_meter,
+    truncate,
+)
 
 def console():
     return get_console()
@@ -389,68 +404,208 @@ def print_scan_summary(snapshot: dict) -> None:
 
 
 # ---------- live dashboard ----------
+def build_download_view(state, width: int, height: int) -> RenderableType:
+    from rich.table import Table
+
+    snapshot = state.snapshot()
+    width = max(1, width)
+    content_width = max(1, width - 6)
+    completed = snapshot["done"] + snapshot["failed"]
+    percent = completed * 100 / snapshot["total"] if snapshot["total"] else 100.0
+    percent_text = Text(f"{percent:.1f}%", style=Style(color=ACCENT, bold=True))
+    count_text = Text(f"{completed} / {snapshot['total']}", style=Style(color=DIM))
+    bar_width = max(0, content_width - cell_len(percent_text) - cell_len(count_text) - 2)
+    progress_row = Text()
+    progress_row.append_text(percent_text)
+    progress_row.append(" ")
+    progress_row.append_text(segmented_bar(
+        bar_width,
+        [(snapshot["done"], GREEN), (snapshot["failed"], RED), (snapshot["active"], ACCENT)],
+        snapshot["total"],
+    ))
+    progress_row.append(" ")
+    progress_row.append_text(count_text)
+    progress_row.no_wrap = True
+    progress_row.overflow = "crop"
+
+    speed_row = Text()
+    speed_row.append("Speed ", style=Style(color=DIM))
+    speed_row.append_text(sparkline(snapshot["speed_samples"], width=15))
+    speed_row.append(f" {fmt_speed(snapshot['speed'])}", style=Style(color=TEXT))
+    finishes = "—"
+    eta_text = "—"
+    if snapshot["elapsed"] >= 5 and snapshot["eta"] is not None:
+        finishes = f"~{clock_12h(datetime.now().timestamp() + snapshot['eta'])}"
+        eta_text = fmt_duration(snapshot["eta"])
+    timing_row = Text()
+    timing_row.append("Finishes ", style=Style(color=DIM))
+    timing_row.append(finishes, style=Style(color=TEXT))
+    timing_row.append(" · ETA ", style=Style(color=DIM))
+    timing_row.append(eta_text, style=Style(color=ACCENT))
+
+    timing = Table.grid(expand=True, padding=(0, 0))
+    timing.add_column(ratio=1, no_wrap=True)
+    timing.add_column(justify="right", no_wrap=True)
+    timing.add_row(speed_row, timing_row)
+
+    summary = Text()
+    summary.append("● ", style=Style(color=GREEN))
+    summary.append(str(snapshot["done"]), style=Style(color=TEXT))
+    summary.append(" done  ", style=Style(color=DIM))
+    summary.append("● ", style=Style(color=RED))
+    summary.append(str(snapshot["failed"]), style=Style(color=TEXT))
+    summary.append(" failed  ", style=Style(color=DIM))
+    summary.append("● ", style=Style(color=ACCENT))
+    summary.append(str(snapshot["active"]), style=Style(color=TEXT))
+    summary.append(" active  ", style=Style(color=DIM))
+    summary.append(fmt_size(snapshot["bytes_total"]), style=Style(color=TEXT))
+    summary.append("  Elapsed ", style=Style(color=DIM))
+    summary.append(clock(snapshot["elapsed"]), style=Style(color=TEXT))
+    summary.no_wrap = True
+    summary.overflow = "crop"
+    summary.truncate(content_width, overflow="crop")
+
+    overall = panel_with_title(
+        Group(progress_row, timing, summary),
+        name="Downloading",
+        dim="Update library",
+        dim_color=PATH,
+        border=BORDER,
+    )
+    workers = _download_workers_panel(snapshot, width)
+    failed_count = snapshot["failed"]
+    footer = footer_hint(
+        f"f failures ({failed_count}) · q stop safely · Ctrl+C force quit"
+        if failed_count else "f failures · q stop safely · Ctrl+C force quit"
+    )
+    return Group(overall, workers, footer)
+
+
+def _download_workers_panel(snapshot: dict, width: int) -> RenderableType:
+    from rich.table import Table
+
+    inner_width = max(1, width - 6)
+    compact = width < 90
+    if compact:
+        track_width = max(1, inner_width - 38)
+        columns = [4, track_width, 28]
+    else:
+        track_width = max(1, inner_width - 68)
+        columns = [4, track_width, 14, 28, 12]
+
+    table = Table(box=None, pad_edge=False, show_header=False, expand=True, padding=(0, 1))
+    table.add_column(width=columns[0], no_wrap=True)
+    table.add_column(width=columns[1], no_wrap=True)
+    if compact:
+        table.add_column(width=columns[2], no_wrap=True)
+    else:
+        table.add_column(width=columns[2], no_wrap=True)
+        table.add_column(width=columns[3], no_wrap=True)
+        table.add_column(width=columns[4], justify="right", no_wrap=True)
+
+    header = [Text(""), Text("TRACK", style=Style(color=DIMMER))]
+    if not compact:
+        header.extend((
+            Text("STAGE", style=Style(color=DIMMER)),
+            Text("PROGRESS", style=Style(color=DIMMER)),
+            Text("SPEED", style=Style(color=DIMMER)),
+        ))
+    else:
+        header.append(Text("PROGRESS", style=Style(color=DIMMER)))
+    table.add_row(*header)
+    table.add_row(*(Text("─" * column, style=Style(color=DIVIDER)) for column in columns))
+
+    stage_names = ("Fetch", "Download", "Convert", "Tag")
+    progress_width = columns[-1] if compact else columns[3]
+    for index, worker in enumerate(snapshot["workers"], 1):
+        active = worker["state"] == "active"
+        worker_label = Text(f"W{index}", style=Style(color=ACCENT if active else DIM))
+        title = worker["title"] or ""
+        track = Text(truncate(title, track_width), style=Style(color=TEXT, bold=True))
+        track.append("\n")
+        track.append(truncate(worker["artist"], track_width), style=Style(color=DIM))
+
+        bytes_done, bytes_total = worker["bytes_done"], worker["bytes_total"]
+        percent = min(100, int(bytes_done * 100 / bytes_total)) if bytes_total else 0
+        fill = GREEN if bytes_total and percent == 100 else ACCENT if bytes_total and bytes_done else TRACK
+        bar_width = max(1, progress_width - 5)
+        bar = segmented_bar(bar_width, [(bytes_done if bytes_total else 0, fill)], bytes_total)
+        progress = Text()
+        progress.append_text(bar)
+        progress.append(" ")
+        progress.append(f"{percent:3d}%", style=Style(color=DIM if percent == 0 else TEXT))
+
+        if compact:
+            table.add_row(worker_label, track, progress)
+            continue
+
+        if active:
+            stage = Text()
+            stage.append_text(stage_meter(worker["stage_index"]))
+            stage.append(f" {stage_names[worker['stage_index']]}", style=Style(color=ACCENT))
+        else:
+            stage = Text("idle", style=Style(color=DIMMER))
+        speed = (Text("waiting…", style=Style(color=DIMMER)) if bytes_done == 0
+                 else Text(fmt_speed(worker["speed"]), style=Style(color=DIM)))
+        table.add_row(worker_label, track, stage, progress, speed)
+
+    upcoming = Text("Up next", style=Style(color=TEXT))
+    titles = " · ".join(snapshot["upcoming"])
+    remaining = snapshot["queue_remaining"]
+    more = f" +{remaining} more" if remaining else ""
+    available = max(0, inner_width - cell_len("Up next") - 2 - cell_len(more))
+    if titles:
+        upcoming.append("  ")
+        upcoming.append(truncate(titles, available), style=Style(color=TEXT))
+    if more:
+        upcoming.append(more, style=Style(color=DIMMER))
+    upcoming.no_wrap = True
+    upcoming.overflow = "crop"
+
+    body = Group(table, divider(inner_width), upcoming)
+    return panel_with_title(
+        body,
+        name="Workers",
+        dim=f"{snapshot['active']} active",
+        border=WORKER_BORDER,
+    )
+
+
+def show_failures(failures) -> None:
+    from .keys import read_key
+
+    out = console()
+    live = getattr(out, "_live", None)
+    if live is not None:
+        live.stop()
+    try:
+        lines = []
+        for failure in failures:
+            line = Text(failure.title, style=Style(color=TEXT))
+            if failure.reason:
+                line.append(f"  {failure.reason}", style=Style(color=RED))
+            lines.append(line)
+        with out.screen():
+            out.print(panel_with_title(
+                Group(*lines),
+                name="Failures",
+                dim=f"{len(failures)} tracks",
+                border=BORDER,
+            ))
+            read_key()
+    finally:
+        if live is not None:
+            live.start(refresh=True)
+
+
 class Dashboard:
-    """Rich renderable: progress bar, totals and one line per active download."""
+    """Rich renderable used by the download Live display."""
 
     def __init__(self, tracker: Tracker):
         self.tracker = tracker
 
     def __rich_console__(self, console, options):
-        from rich.text import Text
-
-        snap = self.tracker.snapshot()
-        width = max(options.max_width, 40)
-        total, done, failed, active = snap["total"], snap["done"], snap["failed"], snap["active"]
-        left = max(total - done - failed - active, 0)
-        finished = done + failed
-        percent = f"{finished / total:.0%}" if total else "100%"
-        count = f"{finished}/{total}"
-        bar_width = max(width - len(percent) - len(count) - 4, 10)
-
-        bar = Text(f"{percent} ", style=f"bold {ACCENT}")
-        segments = [done, failed, active, left]
-        cells = _split(segments, bar_width)
-        for n, color in zip(cells, (GOOD, BAD, ACCENT, "#333333")):
-            bar.append("━" * n, style=color)
-        bar.append(f" {count}", style=DIM)
-        yield bar
-
-        speed = snap["speed"]
-        stats = Text()
-        stats.append(f"✓ {done}", style=GOOD)
-        stats.append(f"  ✗ {failed}", style=BAD if failed else DIM)
-        stats.append(f"  ● {active} active", style=ACCENT)
-        stats.append(f"  ·  {human_size(snap['bytes'])}  ·  {human_size(speed)}/s", style=DIM)
-        stats.append(f"  ·  ETA {clock(snap['eta']) if snap['eta'] else '—'}  ·  {clock(snap['elapsed'])}", style=DIM)
-        yield stats
-        yield Text("")
-
-        for slot in snap["slots"]:
-            line = Text()
-            line.append("● ", style=ACCENT)
-            label = slot.title or "…"
-            if slot.artist:
-                label += f" — {slot.artist}"
-            label = label[:max(width - 24, 10)]
-            line.append(label.ljust(max(width - 24, 10)))
-            if slot.stage == "downloading" and slot.total:
-                line.append(f"  {slot.downloaded / slot.total:>4.0%}", style=DIM)
-                line.append(f"  {human_size(slot.speed)}/s", style=DIM)
-            else:
-                line.append(f"  {slot.stage}", style=DIM)
-            yield line
-
-
-def _split(counts: list[int], width: int) -> list[int]:
-    """Divide `width` cells between segments proportionally (largest remainder)."""
-    total = sum(counts)
-    if not total:
-        return [0, 0, 0, width]
-    cells = [c * width // total for c in counts]
-    order = sorted(range(len(counts)), key=lambda i: (counts[i] * width) % total, reverse=True)
-    for i in order[:width - sum(cells)]:
-        cells[i] += 1
-    return cells
+        yield build_download_view(self.tracker, options.max_width, console.height)
 
 
 def song_line(ok: bool, count: int, total: int, title: str, note: str) -> str:

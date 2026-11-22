@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 
@@ -10,10 +11,20 @@ from dataclasses import dataclass
 class Slot:
     title: str = ""
     artist: str = ""
-    stage: str = "downloading"   # downloading | converting | retrying
-    downloaded: int = 0
-    total: int = 0
+    stage: str = "fetch"
+    stage_index: int = 0
+    bytes_done: int = 0
+    bytes_total: int = 0
     speed: float = 0.0
+    state: str = "idle"
+
+    @property
+    def downloaded(self) -> int:
+        return self.bytes_done
+
+    @property
+    def total(self) -> int:
+        return self.bytes_total
 
 
 class Tracker:
@@ -21,18 +32,36 @@ class Tracker:
         self.total, self.jobs = total, jobs
         self.lock = threading.Lock()
         self.started = time.monotonic()
+        self.start_time = time.time()
         self.done = self.failed = self.bytes = 0
-        self.slots: dict[int, Slot] = {}
+        self.slots: dict[int, Slot] = {slot: Slot() for slot in range(jobs)}
+        self.queue: list[str] = []
+        self.speed_samples = deque(maxlen=15)
+        self._smoothed_speed = 0.0
+        self._last_speed_sample = self.started
 
     def start(self, slot_id: int, title: str) -> None:
         with self.lock:
-            self.slots[slot_id] = Slot(title=title)
+            slot = self.slots.setdefault(slot_id, Slot())
+            slot.title, slot.artist = title, ""
+            slot.stage, slot.stage_index = "fetch", 0
+            slot.bytes_done = slot.bytes_total = 0
+            slot.speed, slot.state = 0.0, "active"
+            try:
+                self.queue.remove(title)
+            except ValueError:
+                pass
+
+    def set_queue(self, titles: list[str]) -> None:
+        with self.lock:
+            self.queue = list(titles)
 
     def set_track(self, slot_id: int, title: str, artist: str) -> None:
         with self.lock:
             slot = self.slots.get(slot_id)
             if slot:
                 slot.title, slot.artist = title, artist
+                slot.stage, slot.stage_index = "tag", 3
 
     def artist(self, slot_id: int) -> str:
         with self.lock:
@@ -40,42 +69,93 @@ class Tracker:
             return slot.artist if slot else ""
 
     def set_stage(self, slot_id: int, stage: str) -> None:
+        stages = {"fetch": 0, "retrying": 0, "downloading": 1, "converting": 2, "tag": 3}
+        normalized = "fetch" if stage == "retrying" else stage
         with self.lock:
             slot = self.slots.get(slot_id)
             if slot:
-                slot.stage = stage
+                slot.stage = normalized
+                slot.stage_index = stages.get(normalized, slot.stage_index)
 
     def update(self, slot_id: int, info: dict) -> None:
         """yt-dlp progress hook payload."""
         with self.lock:
             slot = self.slots.get(slot_id)
             if slot and info.get("status") == "downloading":
-                slot.stage = "downloading"
-                slot.downloaded = info.get("downloaded_bytes") or 0
-                slot.total = info.get("total_bytes") or info.get("total_bytes_estimate") or 0
+                slot.state = "active"
+                slot.stage, slot.stage_index = "downloading", 1
+                slot.bytes_done = info.get("downloaded_bytes") or 0
+                slot.bytes_total = info.get("total_bytes") or info.get("total_bytes_estimate") or 0
                 slot.speed = info.get("speed") or 0.0
 
     def finish(self, slot_id: int, ok: bool, size: int = 0) -> None:
         with self.lock:
-            self.slots.pop(slot_id, None)
+            slot = self.slots.setdefault(slot_id, Slot())
             if ok:
                 self.done += 1
                 self.bytes += size
             else:
                 self.failed += 1
+            slot.title = slot.artist = ""
+            slot.stage, slot.stage_index = "fetch", 0
+            slot.bytes_done = slot.bytes_total = 0
+            slot.speed, slot.state = 0.0, "idle"
 
     def snapshot(self) -> dict:
+        now = time.monotonic()
         with self.lock:
             slots = [Slot(**vars(s)) for _, s in sorted(self.slots.items())]
-            done, failed, nbytes = self.done, self.failed, self.bytes
-        elapsed = time.monotonic() - self.started
+            done, failed, completed_bytes = self.done, self.failed, self.bytes
+            active = sum(slot.state == "active" for slot in slots)
+            speed = sum(slot.speed for slot in slots if slot.state == "active")
+            elapsed = now - self.started
+            sample_count = int(now - self._last_speed_sample)
+            if sample_count:
+                for _ in range(min(sample_count, 15)):
+                    self._smoothed_speed = (
+                        speed if not self.speed_samples else 0.35 * speed + 0.65 * self._smoothed_speed
+                    )
+                    self.speed_samples.append(self._smoothed_speed)
+                self._last_speed_sample += sample_count
+            samples = list(self.speed_samples)
+            smoothed_speed = self._smoothed_speed
+            upcoming = self.queue[:3]
+            queue_remaining = max(0, len(self.queue) - len(upcoming))
         finished = done + failed
         eta = None
         if finished and elapsed >= 5 and finished < self.total:
             eta = elapsed / finished * (self.total - finished)
-        return {"done": done, "failed": failed, "active": len(slots), "total": self.total,
-                "bytes": nbytes + sum(s.downloaded for s in slots),
-                "speed": sum(s.speed for s in slots), "elapsed": elapsed, "eta": eta, "slots": slots}
+        bytes_total = completed_bytes + sum(slot.bytes_done for slot in slots if slot.state == "active")
+        workers = [
+            {
+                "title": slot.title,
+                "artist": slot.artist,
+                "stage": slot.stage,
+                "stage_index": slot.stage_index,
+                "bytes_done": slot.bytes_done,
+                "bytes_total": slot.bytes_total,
+                "speed": slot.speed,
+                "state": slot.state,
+            }
+            for slot in slots
+        ]
+        return {
+            "done": done,
+            "failed": failed,
+            "active": active,
+            "total": self.total,
+            "bytes": bytes_total,
+            "bytes_total": bytes_total,
+            "speed": smoothed_speed,
+            "speed_samples": samples,
+            "elapsed": elapsed,
+            "eta": eta,
+            "start_time": self.start_time,
+            "slots": slots,
+            "workers": workers,
+            "upcoming": upcoming,
+            "queue_remaining": queue_remaining,
+        }
 
 
 @dataclass

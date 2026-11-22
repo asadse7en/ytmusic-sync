@@ -81,7 +81,7 @@ def execute(settings: config.Settings, plan: Plan, *, compact: bool = False, pru
         else:
             from rich.live import Live
 
-            with Live(ui.Dashboard(tracker), console=out, refresh_per_second=4, transient=True):
+            with Live(ui.Dashboard(tracker), console=out, refresh_per_second=8, transient=True):
                 result.failures = run_downloads(plan.todo, lib, settings, tracker, stop)
         result.new, result.bytes = tracker.done, tracker.bytes
     result.stopped = stop.is_set()
