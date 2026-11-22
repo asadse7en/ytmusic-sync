@@ -178,7 +178,7 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
     with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="dl") as pool:
         futures = [pool.submit(worker, slot) for slot in range(jobs)]
         try:
-            while wait(futures, timeout=0.125).not_done:  # keep keyboard stop and Ctrl+C responsive
+            while wait(futures, timeout=0.075).not_done:  # keep keyboard stop and Ctrl+C responsive
                 if not interactive_dashboard:
                     continue
                 from .keys import read_key
@@ -263,8 +263,7 @@ def _download_one(ydl, entry, slot, lib, settings, tracker, stop, failures, fail
         return
 
 
-def _record_track_result(results: list[TrackResult] | None, lock: threading.Lock,
-                         result: TrackResult) -> None:
+def _record_track_result(results: list[TrackResult] | None, lock, result: TrackResult) -> None:
     if results is not None:
         with lock:
             results.append(result)

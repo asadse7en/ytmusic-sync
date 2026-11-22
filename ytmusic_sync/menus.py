@@ -558,7 +558,6 @@ def run_plan(settings: Settings, urls: list[str], *, review: bool, prune_ok: boo
         count = sync.remember_links(plan, only_playlists=True)
         out.print(f"[green]Saved {count} link(s) to {config.LINKS_FILE}[/]")
     sync.execute(settings, plan, prune_ok=prune_ok, interactive=True)
-    pause()
 
 
 # ---------- settings ----------
