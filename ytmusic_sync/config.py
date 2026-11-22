@@ -91,6 +91,7 @@ class Settings:
     retries: int = 5
     rate_limit: str = ""
     cookies: str = ""
+    fallback: bool = True
 
     @classmethod
     def load(cls) -> "Settings":
@@ -107,7 +108,7 @@ class Settings:
             self.quality = defaults.quality
         if self.name_style not in NAME_STYLES:
             self.name_style = defaults.name_style
-        for name in ("cover", "square", "clean", "playlist_files", "prune", "skip_duplicate_songs"):
+        for name in ("cover", "square", "clean", "playlist_files", "prune", "skip_duplicate_songs", "fallback"):
             setattr(self, name, bool(getattr(self, name)))
         self.jobs = _clamp(self.jobs, 1, MAX_JOBS, defaults.jobs)
         self.retries = _clamp(self.retries, 0, 20, defaults.retries)

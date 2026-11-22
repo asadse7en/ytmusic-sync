@@ -318,6 +318,7 @@ def _content(
     content_width: int,
     *,
     selected_background: bool = True,
+    accent_selected_desc: bool = True,
 ) -> Text:
     label_width = min(max(0, label_width), content_width)
     label = truncate(item.label, label_width)
@@ -328,12 +329,18 @@ def _content(
     prefix_width = rest_width - hotkey_width
     desc_width = max(0, prefix_width - (1 if hotkey and prefix_width else 0))
     desc = truncate(item.desc, desc_width)
-    padding = " " * max(0, prefix_width - cell_len(desc))
-    prefix = padding + desc if item.desc_align == "right" else desc + padding
+    if item.desc_align == "right":
+        separator = " " if hotkey and prefix_width else ""
+        padding = " " * max(0, prefix_width - cell_len(desc) - len(separator))
+        prefix = padding + desc + separator
+    else:
+        padding = " " * max(0, prefix_width - cell_len(desc))
+        prefix = desc + padding
     dimmed = item.dim or not item.enabled
     label_color = DIMMER if dimmed else (ACCENT if selected else TEXT)
-    desc_color = DIMMER if dimmed else (ACCENT if selected else (item.desc_color or DIM))
-    desc_bold = selected and not dimmed
+    desc_selected = selected and accent_selected_desc
+    desc_color = DIMMER if dimmed else (ACCENT if desc_selected else (item.desc_color or DIM))
+    desc_bold = desc_selected and not dimmed
     hotkey_color = DIMMER if dimmed or not selected else ACCENT
     bgcolor = SEL_FILL if selected and selected_background else None
     result = Text()
@@ -390,8 +397,9 @@ class _SelectRenderable:
             selected = index == self.selected
             bar_color = ACCENT if selected else BAR_OFF
             edge_color = SEL_EDGE if selected else EDGE_OFF
-            background = SEL_FILL if selected else None
-            border_style = Style(color=edge_color, bgcolor=background)
+            right_aligned = item.desc_align == "right"
+            border_style = Style(color=edge_color)
+            content_width = max(0, inner - (1 if right_aligned else 2))
             yield Text.assemble(
                 ("▖", Style(color=bar_color)),
                 ("╭", border_style),
@@ -400,16 +408,18 @@ class _SelectRenderable:
             )
             row = Text()
             row.append("▌", style=Style(color=bar_color))
-            row.append(" ", style=Style(bgcolor=background))
+            row.append(" ")
             row.append_text(_content(
                 item,
                 selected,
                 self.label_width,
                 content_width,
-                selected_background=True,
+                selected_background=False,
+                accent_selected_desc=False,
             ))
-            row.append(" ", style=Style(bgcolor=background))
-            row.append("│", style=Style(color=edge_color, bgcolor=background))
+            if not right_aligned:
+                row.append(" ")
+            row.append("│", style=Style(color=edge_color))
             yield row
             yield Text.assemble(
                 ("▘", Style(color=bar_color)),

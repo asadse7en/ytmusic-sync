@@ -23,6 +23,16 @@ from .tags import clean_tags, first_text, safe_name
 
 log = logging.getLogger(__name__)
 TRANSIENT = re.compile(r"\b429\b|sign in|timed out|timeout|connection|temporar|HTTP Error 5\d\d", re.I)
+UNAVAILABLE = re.compile(r"unavailable|private video|removed|not available|no longer|blocked|copyright", re.I)
+ALTERNATE_EXCLUSIONS = (
+    re.compile(r"\blive\b", re.I),
+    re.compile(r"\bcover\b", re.I),
+    re.compile(r"\bremix\b", re.I),
+    re.compile(r"\breaction\b", re.I),
+    re.compile(r"\bslowed\b", re.I),
+    re.compile(r"\bsped[\s-]+up\b", re.I),
+    re.compile(r"\bkaraoke\b", re.I),
+)
 
 
 class Cancelled(Exception):
@@ -50,6 +60,48 @@ class TrackResult:
 
 def watch_url(vid: str) -> str:
     return f"https://www.youtube.com/watch?v={vid}"
+
+
+def _find_alternate(entry, settings) -> str | None:
+    try:
+        yt_dlp = ytdlp.module()
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "skip_download": True,
+            "logger": ytdlp.QuietLogger(),
+        }
+        if settings.cookies:
+            options["cookiesfrombrowser"] = (settings.cookies,)
+
+        with yt_dlp.YoutubeDL(options) as search:
+            info = search.extract_info(f"ytsearch5:{entry['title']}", download=False) or {}
+
+        original_title = str(entry.get("title") or "")
+        original_id = str(entry.get("id") or "")
+        duration = float(entry.get("dur") or 0)
+        for result in info.get("entries") or []:
+            if not isinstance(result, dict):
+                continue
+            result_id = str(result.get("id") or "")
+            if not result_id or result_id == original_id:
+                continue
+            title = str(result.get("title") or "")
+            if any(pattern.search(title) and not pattern.search(original_title)
+                   for pattern in ALTERNATE_EXCLUSIONS):
+                continue
+            if duration > 0:
+                try:
+                    result_duration = float(result.get("duration"))
+                except (TypeError, ValueError):
+                    continue
+                if abs(result_duration - duration) > 5:
+                    continue
+            return result_id
+    except Exception:
+        log.exception("Alternate search failed for %s", entry.get("title", ""))
+    return None
 
 
 def build_options(settings: Settings, out: Path, hooks: dict) -> dict:
@@ -221,17 +273,20 @@ def run_downloads(todo: list[dict], lib: Library, settings: Settings, tracker: T
 def _download_one(ydl, entry, slot, lib, settings, tracker, stop, failures, failures_lock, on_result,
                   track_results, track_results_lock, on_failure_update):
     vid, started = entry["id"], time.time()
+    tried_alternate = False
+    download_id = vid
     playlist_ids = tuple(entry.get("playlist_ids", ()))
     tracker.start(slot, entry["title"])
     attempt = 0
     while True:
         try:
-            info = ydl.extract_info(watch_url(vid), download=True)
+            info = ydl.extract_info(watch_url(download_id), download=True)
             file = _output_file(info, lib, vid, settings)
             size = file.stat().st_size
             lib.add_song(vid, {"file": file.name, "artist": first_text(info.get("artist"), "Unknown"),
                                "title": first_text(info.get("title"), entry["title"]),
-                               "dur": int(info.get("duration") or entry["dur"] or 0)})
+                               "dur": int(info.get("duration") or entry["dur"] or 0),
+                               "source_id": download_id})
             lib.save()
         except Cancelled:
             tracker.finish(slot, False)
@@ -248,6 +303,14 @@ def _download_one(ydl, entry, slot, lib, settings, tracker, stop, failures, fail
                     tracker.finish(slot, False)
                     return
                 continue
+            if settings.fallback and not tried_alternate and UNAVAILABLE.search(str(exc)) and entry["title"]:
+                alternate = _find_alternate(entry, settings)
+                if alternate:
+                    tried_alternate = True
+                    tracker.set_stage(slot, "alternate")
+                    log.info("Using alternate %s for unavailable %s", alternate, vid)
+                    download_id = alternate
+                    continue
             reason = short_error(exc)
             log.exception("Download failed for %s", vid)
             failure = Failure(entry["title"], tracker.artist(slot) or "Unknown", reason, vid, playlist_ids)

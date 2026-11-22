@@ -138,6 +138,95 @@ class ConfigTests(unittest.TestCase):
         config.CONFIG_FILE.write_text('{"format": "flac", "urls": ["old"], "files": []}')
         self.assertEqual(config.Settings.load().format, "flac")
 
+    def test_fallback_defaults_on_and_is_validated_as_boolean(self):
+        self.assertTrue(config.Settings().validated().fallback)
+        self.assertFalse(config.Settings(fallback=0).validated().fallback)
+
+
+class FallbackTests(unittest.TestCase):
+    def test_search_skips_original_excluded_titles_and_duration_mismatches(self):
+        results = {
+            "entries": [
+                {"id": "original", "title": "Song", "duration": 100},
+                {"id": "live", "title": "Song Live", "duration": 100},
+                {"id": "short", "title": "Song Audio", "duration": 94},
+                {"id": "alternate", "title": "Song Official Audio", "duration": 105},
+            ]
+        }
+        captured = {}
+
+        class SearchYDL:
+            def __init__(self, options):
+                captured["options"] = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, query, download=False):
+                captured["query"] = query
+                return results
+
+        fake = types.SimpleNamespace(YoutubeDL=SearchYDL)
+        with patch.object(ytdlp, "module", return_value=fake):
+            alternate = downloader._find_alternate(
+                {"id": "original", "title": "Song", "dur": 100},
+                config.Settings(cookies="firefox"),
+            )
+
+        self.assertEqual(alternate, "alternate")
+        self.assertEqual(captured["query"], "ytsearch5:Song")
+        self.assertEqual(captured["options"]["cookiesfrombrowser"], ("firefox",))
+        self.assertTrue(captured["options"]["extract_flat"])
+        self.assertTrue(captured["options"]["skip_download"])
+
+    def test_successful_alternate_is_stored_under_original_id(self):
+        class DownloadYDL:
+            def __init__(self, music):
+                self.music = music
+
+            def extract_info(self, url, download=False):
+                if "v=original" in url:
+                    raise ValueError("Video unavailable")
+                path = self.music / "alternate.mp3"
+                path.write_bytes(b"audio")
+                return {
+                    "requested_downloads": [{"filepath": str(path)}],
+                    "artist": "Artist",
+                    "title": "Song",
+                    "duration": 100,
+                }
+
+        with tempfile.TemporaryDirectory(prefix="fallback-") as directory:
+            music = Path(directory)
+            lib = Library(music)
+            settings = config.Settings(out=str(music)).validated()
+            tracker = Tracker(1, 1)
+            failures = []
+            track_results = []
+            with patch.object(downloader, "_find_alternate", return_value="alternate"):
+                downloader._download_one(
+                    DownloadYDL(music),
+                    {"id": "original", "title": "Song", "dur": 100, "playlist_ids": ("PL1",)},
+                    0,
+                    lib,
+                    settings,
+                    tracker,
+                    threading.Event(),
+                    failures,
+                    threading.Lock(),
+                    None,
+                    track_results,
+                    threading.Lock(),
+                    None,
+                )
+
+            self.assertEqual(failures, [])
+            self.assertEqual(set(lib.songs), {"original"})
+            self.assertEqual(lib.songs["original"]["source_id"], "alternate")
+
 
 class EndToEnd(unittest.TestCase):
     def setUp(self):

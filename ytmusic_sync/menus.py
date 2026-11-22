@@ -32,12 +32,19 @@ from .widgets import (
 )
 
 BACK = "__back__"
+
+
+def _menu_label_width(items: list[SelectItem], content_width: int) -> int:
+    longest = max((cell_len(item.label) for item in items), default=0) + 2
+    return min(longest, max(0, content_width // 2))
+
+
 SETTING_ROWS = [
     ("format", "Format"), ("quality", "Quality"), ("cover", "Cover art"), ("square", "Square cover"),
     ("name_style", "Filename style"), ("clean", "Clean titles"), ("playlist_files", "Playlist .m3u8 files"),
     ("prune", "Prune removed songs"), ("skip_duplicate_songs", "Skip duplicate songs"),
     ("jobs", "Parallel downloads"), ("rate_limit", "Speed limit"), ("retries", "Retries"),
-    ("cookies", "Browser cookies"),
+    ("cookies", "Browser cookies"), ("fallback", "Find alternate version"),
 ]
 CHOICES = {"format": config.FORMATS, "quality": config.QUALITIES, "name_style": tuple(config.NAME_STYLES),
            "jobs": tuple(range(1, config.MAX_JOBS + 1))}
@@ -47,7 +54,8 @@ SETTING_GROUPS = (
                  ("playlist_files", "Playlist .m3u8 files"), ("prune", "Prune removed songs"),
                  ("skip_duplicate_songs", "Skip duplicate songs"))),
     ("Downloads", (("jobs", "Parallel downloads"), ("rate_limit", "Speed limit"),
-                   ("retries", "Retries"), ("cookies", "Browser cookies"))),
+                   ("retries", "Retries"), ("cookies", "Browser cookies"),
+                   ("fallback", "Find alternate version"))),
     ("Folders", (("_library", "Library folder"), ("_data", "Data folder"), ("_links", "Edit Playlists.txt"),
                  ("_reset", "Reset to defaults"), (BACK, "Back"))),
 )
@@ -65,6 +73,7 @@ SETTING_DESCRIPTIONS = {
     "rate_limit": "maximum download speed; empty means unlimited.",
     "retries": "number of retries after a failed download. Options: 0–20",
     "cookies": "browser used for cookies; empty means none (e.g. chrome, firefox, edge).",
+    "fallback": "search for a working version when a song is unavailable.",
     "_library": "choose the music library folder.",
     "_data": "open the data folder and browse its files.",
     "_links": "open Playlists.txt for editing saved playlist links.",
@@ -81,10 +90,11 @@ def pick(message: str, items: list[tuple[str, object]], back: bool = True):
         choices.append(SelectItem(label="Back", value=BACK))
     out = ui.console()
     title = truncate(message, max(1, out.width - 12))
+    label_width = _menu_label_width(choices, max(1, out.width - 10))
 
     def view_factory(selected: int):
         panel = panel_with_title(
-            render_select(choices, selected, variant="boxed"),
+            render_select(choices, selected, variant="boxed", label_width=label_width),
             name=title,
             border=BORDER,
         )
@@ -190,20 +200,23 @@ def welcome(settings: Settings) -> bool:
 
 # ---------- home ----------
 def home(settings: Settings) -> None:
+    out = ui.console()
     while True:
         items = [
-            SelectItem("Update library", "Download new songs", "u", value="update"),
-            SelectItem("Add Music", "Paste links", "a", value="add"),
-            SelectItem("Settings", f"{settings.format} · {settings.quality}", "s", value="settings"),
-            SelectItem("Stats", "Playlists overview", "t", value="stats"),
-            SelectItem("Quit", hotkey="q", value="quit"),
+            SelectItem("Update library", "Download new songs", "u", value="update", desc_align="right"),
+            SelectItem("Add Music", "Paste links", "a", value="add", desc_align="right"),
+            SelectItem("Settings", f"{settings.format} · {settings.quality}", "s", value="settings",
+                       desc_align="right"),
+            SelectItem("Stats", "Playlists overview", "t", value="stats", desc_align="right"),
+            SelectItem("Quit", hotkey="q", value="quit", desc_align="right"),
         ]
+        label_width = _menu_label_width(items, max(1, out.width - 3))
 
         def view_factory(selected: int):
             return Group(
                 ui.build_header(),
                 Text(""),
-                render_select(items, selected, variant="boxed"),
+                render_select(items, selected, variant="boxed", label_width=label_width),
                 footer_hint("↑↓ move · enter select · press the letter to jump"),
             )
 
@@ -258,15 +271,17 @@ def add_music(settings: Settings) -> None:
     while True:
         saved = len(links.read_links())
         items = [
-            SelectItem("Paste links", "Playlists or songs", value="paste"),
-            SelectItem("Load from Playlists.txt", f"{saved} links", value="load"),
-            SelectItem("Edit Playlists.txt", "Open in editor", value="edit"),
-            SelectItem("Back", value=BACK),
+            SelectItem("Paste links", "Playlists or songs", value="paste", desc_align="right"),
+            SelectItem("Load from Playlists.txt", f"{saved} links", value="load", desc_align="right"),
+            SelectItem("Edit Playlists.txt", "Open in editor", value="edit", desc_align="right"),
+            SelectItem("Back", value=BACK, desc_align="right"),
         ]
+        out = ui.console()
+        label_width = _menu_label_width(items, max(1, out.width - 9))
 
         def view_factory(selected: int):
             panel = panel_with_title(
-                render_select(items, selected, variant="boxed"),
+                render_select(items, selected, variant="boxed", label_width=label_width),
                 name="Add Music",
                 border=BORDER,
             )
@@ -693,7 +708,7 @@ def _enter_setting(settings: Settings, key: str) -> None:
     elif key in ("rate_limit", "cookies"):
         _edit_setting(settings, key)
     elif key not in ("format", "quality", "name_style", "cover", "square", "clean",
-                     "playlist_files", "prune", "skip_duplicate_songs", "jobs", "retries"):
+                     "playlist_files", "prune", "skip_duplicate_songs", "jobs", "retries", "fallback"):
         raise ValueError(f"Unknown settings row: {key}")
 
 

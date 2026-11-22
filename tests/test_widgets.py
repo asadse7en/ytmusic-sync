@@ -81,7 +81,7 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(clock_12h(midnight), "12:00 AM")
         self.assertEqual(clock_12h(noon), "12:00 PM")
 
-    def test_boxed_selection_has_transparent_fill_and_bounded_rail(self):
+    def test_boxed_selection_has_no_background_fill_and_bounded_rail(self):
         width = 40
         console = Console(width=width, height=60, file=io.StringIO(), color_system="truecolor")
         rendered = render_select(
@@ -97,14 +97,29 @@ class WidgetTests(unittest.TestCase):
             rail = next(segment for segment in line if segment.text.startswith(glyph))
             self.assertEqual(rail.style.color.name, "#ff9f1a")
             self.assertIsNone(rail.style.bgcolor)
-            self.assertTrue(all(
-                segment.style.bgcolor is not None
-                for segment in line if segment is not rail
-            ))
+            self.assertTrue(all(segment.style.bgcolor is None for segment in line))
         for line, glyph in zip(lines[3:], ("▖", "▌", "▘")):
             rail = next(segment for segment in line if segment.text.startswith(glyph))
             self.assertEqual(rail.style.color.name, "#2f2f2f")
             self.assertTrue(all(segment.style.bgcolor is None for segment in line))
+
+    def test_boxed_right_alignment_preserves_long_label_and_hotkey_column(self):
+        width = 60
+        label = "Load from Playlists.txt"
+        console = Console(width=width, height=20, file=io.StringIO())
+        rendered = render_select(
+            [SelectItem(label, "42 links", hotkey="u", desc_align="right")],
+            selected=0,
+            variant="boxed",
+            label_width=cell_len(label) + 2,
+            width=width,
+        )
+        row = "".join(
+            segment.text
+            for segment in console.render_lines(rendered, console.options.update(width=width), pad=False)[1]
+        )
+        self.assertIn(label, row)
+        self.assertTrue(row.endswith("42 links u│"))
 
     def test_boxed_selector_stays_boxed_on_short_terminals(self):
         console = Console(width=40, height=12, file=io.StringIO())

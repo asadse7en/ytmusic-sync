@@ -56,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument("-n", "--name-style", dest="name_style", choices=list(config.NAME_STYLES))
     out.add_argument("--no-cover", action="store_true", help="skip cover art")
     out.add_argument("--no-playlist-files", action="store_true", help="do not write .m3u8 files")
+    out.add_argument("--no-fallback", action="store_true",
+                     help="do not search for an alternate when a song is unavailable")
     out.add_argument("--prune", action="store_true", help="with -u: delete songs no longer in any playlist (asks first)")
     net = ap.add_argument_group("network")
     net.add_argument("--cookies-from-browser", dest="cookies", metavar="NAME", help="chrome, firefox, edge... (private playlists)")
@@ -143,6 +145,7 @@ def _run(args, direct: bool) -> int:
             setattr(settings, key, getattr(args, key))
     settings.cover = settings.cover and not args.no_cover
     settings.playlist_files = settings.playlist_files and not args.no_playlist_files
+    settings.fallback = settings.fallback and not args.no_fallback
     settings.prune = settings.prune or args.prune
     settings.validated()
 

@@ -69,7 +69,7 @@ class Tracker:
             return slot.artist if slot else ""
 
     def set_stage(self, slot_id: int, stage: str) -> None:
-        stages = {"fetch": 0, "retrying": 0, "downloading": 1, "converting": 2, "tag": 3}
+        stages = {"fetch": 0, "retrying": 0, "alternate": 0, "downloading": 1, "converting": 2, "tag": 3}
         normalized = "fetch" if stage == "retrying" else stage
         with self.lock:
             slot = self.slots.get(slot_id)

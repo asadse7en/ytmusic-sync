@@ -597,7 +597,8 @@ def _download_workers_panel(snapshot: dict, width: int) -> RenderableType:
         if active:
             stage = Text()
             stage.append_text(stage_meter(worker["stage_index"]))
-            stage.append(f" {stage_names[worker['stage_index']]}", style=Style(color=ACCENT))
+            stage_name = "Alternate" if worker["stage"] == "alternate" else stage_names[worker["stage_index"]]
+            stage.append(f" {stage_name}", style=Style(color=ACCENT))
         else:
             stage = Text("idle", style=Style(color=DIMMER))
         speed = (Text("waiting…", style=Style(color=DIMMER)) if bytes_done == 0
