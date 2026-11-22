@@ -11,8 +11,8 @@ from rich.text import Text
 from . import __version__, config, ytdlp
 from .library import Library, open_library, time_ago
 from .progress import Tracker
-from .theme import ACCENT, BRAND, CYAN, DIM, DIVIDER, GREEN, PATH, RED, TEXT, get_console
-from .widgets import fmt_size, panel_with_title
+from .theme import ACCENT, BLUE, BORDER, BRAND, CYAN, DIM, DIMMER, DIVIDER, GREEN, PATH, RED, TEXT, get_console
+from .widgets import fmt_size, footer_hint, panel_with_title, segmented_bar, truncate
 
 def console():
     return get_console()
@@ -174,6 +174,213 @@ def confirm(question: str, default: bool = False) -> bool:
     except (EOFError, KeyboardInterrupt):
         return False
     return default if not answer else answer.startswith("y")
+
+
+class ScanPanel:
+    """Live playlist-scan view backed by the shared, locked scan state."""
+
+    def __init__(self, progress):
+        self.progress = progress
+
+    def __rich_console__(self, console, options):
+        from rich.table import Table
+
+        snapshot = self.progress.snapshot()
+        width = max(1, min(options.max_width, console.width) - 6)
+        height = max(1, console.height - 9)
+        completed = snapshot["finished"] + snapshot["failed"]
+        elapsed = snapshot["elapsed"]
+        eta = "—"
+        if snapshot["finished"] >= 3 or elapsed >= 5:
+            if completed:
+                eta = clock(elapsed / completed * max(0, snapshot["total"] - completed))
+
+        header = Table.grid(expand=True, padding=(0, 0))
+        header.add_column(ratio=1)
+        header.add_column(justify="right", no_wrap=True)
+        left_header = Text()
+        left_header.append("⠹", style=Style(color=GREEN))
+        left_header.append(" Scanning playlists…", style=Style(color=BLUE))
+        right_header = Text()
+        right_header.append(f"{completed}", style=Style(color=TEXT))
+        right_header.append(" / ", style=Style(color=DIM))
+        right_header.append(f"{snapshot['total']}", style=Style(color=TEXT))
+        right_header.append(" · Elapsed ", style=Style(color=DIM))
+        right_header.append(clock(elapsed), style=Style(color=TEXT))
+        right_header.append(" · ETA ", style=Style(color=DIM))
+        right_header.append(eta, style=Style(color=ACCENT))
+        header.add_row(left_header, right_header)
+
+        bar = segmented_bar(
+            width,
+            [(snapshot["finished"], GREEN), (snapshot["failed"], RED),
+             (snapshot["in_progress"], ACCENT)],
+            snapshot["total"],
+        )
+        stacked = console.width < 100
+        compact = console.width < 70
+        rows_limit = max(1, height - 8) if stacked else height
+        visible, more_queued = _visible_scan_rows(snapshot["playlists"], rows_limit)
+        left_width = width if stacked else max(1, width - 50)
+        left_table = _scan_playlist_table(visible, more_queued, left_width, compact)
+
+        if stacked:
+            remaining = max(8, height - len(visible) - (1 if more_queued else 0))
+            right = _scan_summary(snapshot, min(width, 28), remaining)
+            columns = Group(left_table, right)
+        else:
+            right_width = 28
+            gap_width = 22
+            columns = Table.grid(expand=True, padding=(0, 0))
+            columns.add_column(width=left_width, no_wrap=True)
+            columns.add_column(width=gap_width, no_wrap=True)
+            columns.add_column(width=right_width, no_wrap=True)
+            columns.add_row(left_table, Text(" " * gap_width), _scan_summary(snapshot, right_width, height))
+
+        panel = panel_with_title(
+            Group(header, bar, columns),
+            name="Update library",
+            border=BORDER,
+        )
+        yield Group(panel, footer_hint("q cancel scan"))
+
+
+def _visible_scan_rows(playlists: list[dict], limit: int) -> tuple[list[tuple[dict, str]], int]:
+    terminal = [(index, row) for index, row in enumerate(playlists)
+                if row["state"] in ("finished", "failed")]
+    active = [(index, row) for index, row in enumerate(playlists) if row["state"] == "fetching"]
+    queued = [(index, row) for index, row in enumerate(playlists) if row["state"] == "queued"]
+    if len(playlists) <= limit:
+        return [(row, "") for row in playlists], 0
+
+    room = max(0, limit - len(active))
+    if len(queued) > room:
+        if room == 0:
+            selected = active[:limit]
+            return [(row, "") for _, row in selected], len(queued)
+        show_queued = max(0, room - 1)
+        selected = sorted(active + queued[:show_queued], key=lambda item: item[0])
+        return [(row, "") for _, row in selected], len(queued) - show_queued
+
+    selected = active + queued
+    terminal_room = max(0, limit - len(selected))
+    if terminal_room:
+        selected.extend(terminal[-terminal_room:])
+    selected.sort(key=lambda item: item[0])
+    return [(row, "") for _, row in selected], 0
+
+
+def _scan_playlist_table(rows: list[tuple[dict, str]], more_queued: int, width: int, compact: bool):
+    from rich.table import Table
+
+    table = Table.grid(expand=True, padding=(0, 0))
+    table.add_column(width=2, no_wrap=True)
+    if compact:
+        table.add_column(width=max(1, width - 2), no_wrap=True, overflow="ellipsis")
+    else:
+        table.add_column(width=max(1, width - 25), no_wrap=True, overflow="ellipsis")
+        table.add_column(width=10, justify="right", no_wrap=True)
+        table.add_column(width=13, justify="right", no_wrap=True)
+
+    for row, _ in rows:
+        state = row["state"]
+        name = row["title"] or (row["id"][:13] + ("…" if len(row["id"]) > 13 else ""))
+        name_color = DIMMER if state == "queued" else DIM if row["title"] is None else TEXT
+        icon = {"finished": ("✓", GREEN), "fetching": ("●", ACCENT),
+                "queued": ("○", DIMMER), "failed": ("✗", RED)}.get(state, ("○", DIMMER))
+        if compact:
+            table.add_row(Text(f"{icon[0]} ", style=Style(color=icon[1])),
+                          Text(truncate(name, max(1, width - 2)), style=Style(color=name_color)))
+            continue
+
+        count = Text(f"{row['songs']} songs", style=Style(color=DIM)) if state == "finished" else Text("")
+        if state == "finished":
+            status = Text(f"+{row['new']} new", style=Style(color=GREEN)) if row["new"] else Text("")
+        elif state == "fetching":
+            status = Text("fetching…", style=Style(color=ACCENT))
+        elif state == "queued":
+            status = Text("queued", style=Style(color=DIMMER))
+        else:
+            status = Text(row["error"] or "unavailable", style=Style(color=RED))
+        table.add_row(
+            Text(f"{icon[0]} ", style=Style(color=icon[1])),
+            Text(truncate(name, max(1, width - 25)), style=Style(color=name_color)),
+            count,
+            status,
+        )
+
+    if more_queued:
+        summary = Text(f"+ {more_queued} more queued", style=Style(color=DIMMER))
+        if compact:
+            table.add_row(Text("  "), Text(truncate(summary.plain, max(1, width - 2)), style=Style(color=DIMMER)))
+        else:
+            table.add_row(Text("  "), Text(truncate(summary.plain, max(1, width - 25)), style=Style(color=DIMMER)),
+                          Text(""), Text(""))
+    return table
+
+
+def _scan_summary(snapshot: dict, width: int, height: int):
+    from rich.table import Table
+
+    inner_width = max(1, width - 2)
+    lines: list[Text] = []
+
+    def append_line(text: Text) -> None:
+        bordered = Text("│ ", style=Style(color=DIVIDER))
+        bordered.append_text(text)
+        lines.append(bordered)
+
+    def label(text: str) -> Text:
+        return Text(text, style=Style(color=DIM))
+
+    def rule() -> Text:
+        return Text("│ " + "─" * inner_width, style=Style(color=DIVIDER))
+
+    append_line(label("New songs"))
+    new_count = Text(str(snapshot["new_songs"]), style=Style(color=GREEN, bold=True))
+    new_count.append(f" in {snapshot['new_playlists']} playlists", style=Style(color=DIM))
+    append_line(new_count)
+    lines.append(rule())
+    append_line(label("Library after sync"))
+    library = Text(str(snapshot["library_before"]), style=Style(color=DIM))
+    library.append(" → ", style=Style(color=DIM))
+    library.append(str(snapshot["library_after"]), style=Style(color=TEXT, bold=True))
+    library.append(f" +{snapshot['library_after'] - snapshot['library_before']}", style=Style(color=GREEN))
+    library.append(" songs", style=Style(color=DIM))
+    append_line(library)
+    failed = snapshot["failed"]
+    append_line(Text(f"{failed} failed", style=Style(color=RED, bold=failed > 0) if failed else Style(color=DIM)))
+    lines.append(rule())
+    append_line(label("Latest new"))
+
+    slots = max(0, height - len(lines))
+    latest = snapshot["latest_new"]
+    if latest and slots:
+        visible_count = min(len(latest), slots)
+        if len(latest) > slots:
+            visible_count = max(0, slots - 1)
+        for title in latest[:visible_count]:
+            append_line(Text(truncate(title, inner_width), style=Style(color=TEXT)))
+        remaining = max(0, snapshot["new_songs"] - visible_count)
+        if remaining and len(lines) < height:
+            append_line(Text(f"+{remaining} more", style=Style(color=DIMMER)))
+
+    table = Table.grid(expand=False, padding=(0, 0))
+    table.add_column(width=width, no_wrap=True)
+    for line in lines[:max(1, height)]:
+        table.add_row(line)
+    return table
+
+
+def print_scan_summary(snapshot: dict) -> None:
+    line = Text()
+    line.append("✓", style=Style(color=GREEN))
+    line.append(
+        f" Scanned {snapshot['total']} playlists · {snapshot['new_songs']} new · "
+        f"{snapshot['failed']} failed · {snapshot['elapsed']:.1f}s",
+        style=Style(color=TEXT),
+    )
+    console().print(line)
 
 
 # ---------- live dashboard ----------
