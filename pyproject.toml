@@ -4,15 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ytmusic-sync"
-version = "0.1"
+dynamic = ["version"]
 description = "Download YouTube playlists as clean, tagged music files and keep .m3u8 playlists in sync."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-dependencies = ["yt-dlp", "rich", "questionary", "mutagen", "platformdirs", "imageio-ffmpeg"]
+dependencies = ["yt-dlp", "rich", "questionary", "mutagen", "imageio-ffmpeg"]
 
 [project.scripts]
-ytmusic-sync = "ytmusic_sync:main"
+ytmusic-sync = "ytmusic_sync.cli:main"
 
 [tool.setuptools]
-py-modules = ["ytmusic_sync"]
+packages = ["ytmusic_sync"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ytmusic_sync.__version__" }

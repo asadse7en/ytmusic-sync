@@ -1,0 +1,74 @@
+"""Turn scan results into a download plan: what is new, what is a duplicate."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from .library import Library
+from .scanner import ScanResult, ScannedPlaylist
+from .tags import song_key
+
+DUPLICATE_SECONDS = 3  # same cleaned title and length within 3 s = same song under another video ID
+
+
+@dataclass
+class Plan:
+    lib: Library
+    scan: ScanResult
+    wanted: dict = field(default_factory=dict)      # canonical id -> entry, every song the links contain
+    todo: list = field(default_factory=list)        # entries not in the library yet
+    entries: int = 0                                # songs across all links, counting repeats
+    duplicates: int = 0                             # video IDs mapped onto an existing/earlier song
+
+    @property
+    def playlists(self) -> list[ScannedPlaylist]:
+        return self.scan.playlists
+
+    @property
+    def errors(self):
+        return self.scan.errors
+
+
+def make_plan(lib: Library, scan: ScanResult, skip_duplicates: bool = True) -> Plan:
+    entries = [e for p in scan.playlists for e in p.items] + scan.singles
+    unique: dict[str, dict] = {}
+    for entry in entries:
+        unique.setdefault(entry["id"], entry)
+
+    with lib.lock:
+        by_title: dict[str, list[tuple[int, str]]] = {}
+        for vid, song in lib.songs.items():
+            key, seconds = song_key(song.get("title", "")), int(song.get("dur") or 0)
+            if key and seconds > 0:
+                by_title.setdefault(key, []).append((seconds, vid))
+
+        fresh: dict[str, dict] = {}
+        for vid, entry in unique.items():
+            if vid in lib.aliases:
+                continue
+            key, seconds = song_key(entry["title"]), entry["dur"]
+            match = None
+            if skip_duplicates and key and seconds > 0:
+                match = next((kept for s, kept in by_title.get(key, [])
+                              if kept != vid and abs(seconds - s) <= DUPLICATE_SECONDS), None)
+            if match:
+                lib.aliases[vid] = match
+                continue
+            fresh[vid] = entry
+            if key and seconds > 0:
+                by_title.setdefault(key, []).append((seconds, vid))
+
+        wanted: dict[str, dict] = {}
+        for vid, entry in unique.items():
+            kept = lib.canonical(vid)
+            if kept in fresh:
+                wanted.setdefault(kept, fresh[kept])
+            elif kept in lib.songs:
+                song = lib.songs[kept]
+                wanted.setdefault(kept, {"id": kept, "title": song.get("title", entry["title"]),
+                                         "dur": int(song.get("dur") or entry["dur"] or 0)})
+            else:
+                wanted.setdefault(vid, entry)
+
+        todo = [e for vid, e in wanted.items() if vid not in lib.songs]
+        duplicates = sum(1 for vid in unique if vid in lib.aliases)
+    return Plan(lib, scan, wanted, todo, len(entries), duplicates)

@@ -1,2 +1,2 @@
 [console_scripts]
-ytmusic-sync = ytmusic_sync:main
+ytmusic-sync = ytmusic_sync.cli:main
