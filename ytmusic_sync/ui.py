@@ -529,7 +529,10 @@ def build_download_view(state, width: int, height: int) -> RenderableType:
     )
     workers = _download_workers_panel(snapshot, width)
     failed_count = snapshot["failed"]
-    footer = footer_hint(f"f failures ({failed_count}) · q stop safely · Ctrl+C force quit")
+    footer = footer_hint(
+        f"f failures ({failed_count}) · q stop safely · Ctrl+C force quit"
+        if failed_count else "f failures · q stop safely · Ctrl+C force quit"
+    )
     return Group(overall, workers, footer)
 
 
@@ -1268,9 +1271,13 @@ def _playlist_stats_panel(row: dict, rank: int, selected: bool, width: int):
     status.overflow = "ellipsis"
 
     border = ACCENT if selected else DARK_ORANGE if rank < 3 else BOX_BORDER
+    title = Text(
+        truncate(row["name"], max(1, width - 4)),
+        style=Style(color=TEXT, bold=rank < 3),
+    )
     return panel_with_title(
         Group(songs, status),
-        name=truncate(row["name"], max(1, width - 4)),
+        name=title,
         border=border,
         padding=(0, 1),
     )

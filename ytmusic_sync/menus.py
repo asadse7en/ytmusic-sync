@@ -16,7 +16,7 @@ from .config import Settings
 from .keys import drain_pending, read_key
 from .library import open_library
 from .scanner import scan_links, short_error
-from .theme import ACCENT, BORDER, CYAN, DIM, GREEN, PATH, RED, TEXT
+from .theme import ACCENT, BORDER, BOX_BORDER, CYAN, DIM, GREEN, PATH, RED, TEXT
 from .widgets import (
     SelectItem,
     confirm_boxes,
@@ -25,7 +25,6 @@ from .widgets import (
     middle_truncate,
     panel_with_title,
     render_select,
-    ruled_heading,
     truncate,
     run_select,
 )
@@ -563,16 +562,28 @@ def settings_menu(settings: Settings) -> None:
         width = max(1, out.width - 6)
         content = []
         index = 0
-        for group_index, (heading, group_rows) in enumerate(SETTING_GROUPS):
-            if group_index:
-                content.append(Text())
-            content.append(ruled_heading(heading, width))
+        for heading, group_rows in SETTING_GROUPS:
+            group_content = []
             for key, label in group_rows:
                 is_selected = index == selected
                 value, color = _setting_value(settings, key)
-                content.append(_settings_row(out, label, value, color, is_selected, width,
-                                             dim_label=key in ("_reset", BACK)))
+                group_content.append(_settings_row(
+                    out,
+                    label,
+                    value,
+                    color,
+                    is_selected,
+                    max(1, width - 4),
+                    dim_label=key in ("_reset", BACK),
+                ))
                 index += 1
+            group_title = Text(heading, style=Style(color=DIM, bold=False))
+            content.append(panel_with_title(
+                Group(*group_content),
+                name=group_title,
+                border=BOX_BORDER,
+                padding=(0, 1),
+            ))
 
         key, label = rows[selected]
         description = Text()
