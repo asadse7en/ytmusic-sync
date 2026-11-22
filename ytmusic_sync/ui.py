@@ -948,7 +948,10 @@ def print_run_summary(
 
     body = [summary]
     if result.duplicates_skipped:
-        body.append(Text(f"{result.duplicates_skipped} duplicates skipped", style=Style(color=DIM)))
+        duplicates = Text(f"{result.duplicates_skipped} duplicates skipped", style=Style(color=DIM))
+        duplicates.no_wrap = True
+        duplicates.overflow = "crop"
+        body.append(duplicates)
     body.append(_playlist_results_table(
         playlist_rows,
         width,
@@ -981,11 +984,16 @@ def print_run_summary(
     all_time.append(" downloads · ", style=Style(color=DIM))
     all_time.append(str(lib.stats["runs"]), style=Style(color=TEXT))
     all_time.append(" runs", style=Style(color=DIM))
+    all_time.no_wrap = True
+    all_time.overflow = "crop"
     body.append(all_time)
 
     if result.failures:
         body.append(_failure_summary(result.failures, content_width))
-    body.append(Text("Run again anytime. Only new songs download.", style=Style(color=DIMMER)))
+    run_again = Text("Run again anytime. Only new songs download.", style=Style(color=DIMMER))
+    run_again.no_wrap = True
+    run_again.overflow = "crop"
+    body.append(run_again)
 
     panel = panel_with_title(
         Group(*body),

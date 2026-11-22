@@ -29,8 +29,16 @@ class _Version(argparse.Action):
         parser.exit()
 
 
+class _ThemedParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        from . import ui
+
+        ui.print_error(message, "Run ytmusic-sync --help for usage.")
+        self.exit(2)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
+    ap = _ThemedParser(
         prog="ytmusic-sync", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=EXAMPLES,
         description="Download YouTube songs/playlists with clean tags and keep .m3u8 playlists in sync.\n"
                     "Run with no arguments for the interactive menu.")

@@ -123,7 +123,10 @@ def panel_with_title(
 
 def footer_hint(text: str) -> Text:
     """Return a dimmer footer line."""
-    return Text(text, style=Style(color=DIMMER))
+    result = Text(text, style=Style(color=DIMMER))
+    result.no_wrap = True
+    result.overflow = "crop"
+    return result
 
 
 def divider(width: int, color: str = DIVIDER) -> Text:
@@ -481,8 +484,16 @@ def _confirm_view(message: RenderableType, title: str | None, yes: bool, console
     from rich import box
 
     width = max(1, console.width)
-    msg = (Text(truncate(message, max(1, width - (6 if title else 0))))
-           if isinstance(message, str) else message)
+    if isinstance(message, str):
+        msg = Text(truncate(message, max(1, width - (6 if title else 0))))
+    elif isinstance(message, Text):
+        msg = message.copy()
+        msg.truncate(max(1, width - (6 if title else 0)), overflow="ellipsis")
+    else:
+        msg = message
+    if isinstance(msg, Text):
+        msg.no_wrap = True
+        msg.overflow = "ellipsis"
     options = []
     for label, selected in (("Yes", yes), ("No", not yes)):
         style = Style(color=ACCENT, bold=True, bgcolor=SEL_FILL) if selected else Style(color=TEXT, bold=False)

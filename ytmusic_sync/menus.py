@@ -128,7 +128,6 @@ def open_path(path: Path) -> None:
 
 # ---------- entry point ----------
 def run(settings: Settings) -> int:
-    out = ui.console()
     sync.setup_logging()
     ytdlp.check_for_updates_in_background()
     try:
