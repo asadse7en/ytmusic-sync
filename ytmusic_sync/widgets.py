@@ -298,6 +298,7 @@ class SelectItem:
     value: Any = None
     enabled: bool = True
     dim: bool = False
+    desc_color: str | None = None
 
 
 def _secondary(item: SelectItem) -> RenderableType | None:
@@ -329,18 +330,19 @@ def _content(
     prefix = desc + " " * max(0, prefix_width - cell_len(desc))
     dimmed = item.dim or not item.enabled
     label_color = DIMMER if dimmed else (ACCENT if selected else TEXT)
-    desc_color = DIMMER if dimmed or not selected else DIM
+    desc_color = DIMMER if dimmed else (ACCENT if selected else (item.desc_color or DIM))
+    desc_bold = selected and not dimmed
     hotkey_color = DIMMER if dimmed or not selected else ACCENT
     bgcolor = SEL_FILL if selected and selected_background else None
     result = Text()
     result.append(label, style=Style(color=label_color, bold=selected and not dimmed, bgcolor=bgcolor))
     result.append(" " * label_padding, style=Style(color=label_color, bold=selected and not dimmed, bgcolor=bgcolor))
-    result.append(prefix, style=Style(color=desc_color, bold=False, bgcolor=bgcolor))
+    result.append(prefix, style=Style(color=desc_color, bold=desc_bold, bgcolor=bgcolor))
     if hotkey:
         result.append(hotkey, style=Style(color=hotkey_color, bold=False, bgcolor=bgcolor))
     if not hotkey and cell_len(prefix) < rest_width:
         result.append(" " * (rest_width - cell_len(prefix)),
-                      style=Style(color=desc_color, bold=False, bgcolor=bgcolor))
+                      style=Style(color=desc_color, bold=desc_bold, bgcolor=bgcolor))
     return result
 
 

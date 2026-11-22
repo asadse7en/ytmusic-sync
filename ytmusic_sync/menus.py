@@ -16,7 +16,7 @@ from .config import Settings
 from .keys import drain_pending, read_key
 from .library import open_library
 from .scanner import scan_links, short_error
-from .theme import ACCENT, BORDER, BOX_BORDER, CYAN, DIM, GREEN, PATH, RED, TEXT
+from .theme import ACCENT, BORDER, CYAN, DIM, GREEN, PATH, RED, TEXT
 from .widgets import (
     SelectItem,
     confirm_boxes,
@@ -25,6 +25,7 @@ from .widgets import (
     middle_truncate,
     panel_with_title,
     render_select,
+    ruled_heading,
     truncate,
     run_select,
 )
@@ -562,28 +563,22 @@ def settings_menu(settings: Settings) -> None:
         width = max(1, out.width - 6)
         content = []
         index = 0
-        for heading, group_rows in SETTING_GROUPS:
-            group_content = []
+        for group_index, (heading, group_rows) in enumerate(SETTING_GROUPS):
+            if group_index:
+                content.append(Text())
+            content.append(ruled_heading(heading, width))
             for key, label in group_rows:
                 is_selected = index == selected
                 value, color = _setting_value(settings, key)
-                group_content.append(_settings_row(
-                    out,
+                content.append(_settings_row(
                     label,
                     value,
                     color,
                     is_selected,
-                    max(1, width - 4),
+                    width,
                     dim_label=key in ("_reset", BACK),
                 ))
                 index += 1
-            group_title = Text(heading, style=Style(color=DIM, bold=False))
-            content.append(panel_with_title(
-                Group(*group_content),
-                name=group_title,
-                border=BOX_BORDER,
-                padding=(0, 1),
-            ))
 
         key, label = rows[selected]
         description = Text()
@@ -645,26 +640,16 @@ def _setting_value(settings: Settings, key: str) -> tuple[str, str]:
     return str(value), CYAN
 
 
-def _settings_row(out, label: str, value: str, color: str, selected: bool, width: int,
+def _settings_row(label: str, value: str, color: str, selected: bool, width: int,
                   *, dim_label: bool = False):
-    from rich.style import Style
-    from rich.text import Text
-
     display_value = f"‹ {value} ›" if selected and value else value
-    row_renderable = render_select(
-        [SelectItem(label=label, desc=display_value)],
+    return render_select(
+        [SelectItem(label=label, desc=display_value, desc_color=color, dim=dim_label)],
         0 if selected else -1,
         variant="compact",
         label_width=24,
-        width=width + 1,
+        width=width,
     )
-    segments = out.render_lines(row_renderable, out.options.update(width=width + 1), pad=False)[0]
-    row = Text("".join(segment.text for segment in segments)[1:])
-    label_style = Style(color=ACCENT, bold=True) if selected else Style(color=DIM if dim_label else TEXT)
-    row.stylize(label_style, 0, min(24, len(row.plain)))
-    if len(row.plain) > 24:
-        row.stylize(Style(color=ACCENT if selected else color, bold=selected), 24, len(row.plain))
-    return row
 
 
 def _change_setting(settings: Settings, key: str, direction: int) -> bool:
