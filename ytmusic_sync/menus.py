@@ -205,8 +205,7 @@ def home(settings: Settings) -> None:
             elif choice == "settings":
                 settings_menu(settings)
             elif choice == "stats":
-                ui.print_stats(open_library(settings.out_path))
-                pause()
+                ui.print_stats(open_library(settings.out_path), interactive=True)
             elif choice == "ytdlp":
                 ui.console().print("[green]yt-dlp updated. Restart ytmusic-sync to use it.[/]" if ytdlp.upgrade()
                                    else "[red]Update failed. Try: pip install -U yt-dlp[/]")

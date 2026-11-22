@@ -43,6 +43,7 @@ class Library:
         self.songs: dict = _dict(data.get("songs"))
         self.aliases: dict = _dict(data.get("aliases"))
         self.playlists: dict = _dict(data.get("playlists"))
+        self.playlist_names: dict[str, str] = _dict(data.get("playlist_names"))
         self.stats: dict = {"runs": 0, "downloads": 0, "bytes": 0, "last_run": "never", **_dict(data.get("stats"))}
 
         files = self.refresh_files()
@@ -187,7 +188,8 @@ class Library:
 
             config.atomic_write(self.path, json.dumps(
                 {"songs": self.songs, "aliases": self.aliases, "playlists": self.playlists,
-                 "stats": self.stats}, indent=1, ensure_ascii=False))
+                 "playlist_names": self.playlist_names, "stats": self.stats},
+                indent=1, ensure_ascii=False))
             self._dirty, self._last_save = False, time.monotonic()
 
     def record_run(self, downloads: int, nbytes: int) -> None:

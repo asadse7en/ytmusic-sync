@@ -8,17 +8,19 @@ from datetime import datetime
 
 from rich.cells import cell_len
 from rich.console import Group, RenderableType
+from rich.panel import Panel
 from rich.style import Style
 from rich.text import Text
 
-from . import __version__, config, ytdlp
+from . import __version__, config, keys, ytdlp
 from .library import Library, open_library, time_ago
 from .progress import Tracker
 from .theme import (
-    ACCENT, BLUE, BORDER, BRAND, CYAN, DIM, DIMMER, DIVIDER, GREEN, PATH, RED, TEXT, TRACK,
-    WORKER_BORDER, get_console,
+    ACCENT, BLUE, BORDER, BOX_BORDER, BRAND, CYAN, DARK_ORANGE, DIM, DIMMER, DIVIDER, GREEN, LINK,
+    LINK_DIM, PATH, RED, TEXT, TRACK, WORKER_BORDER, get_console,
 )
 from .widgets import (
+    SelectItem,
     clock_12h,
     divider,
     fmt_duration,
@@ -27,9 +29,11 @@ from .widgets import (
     footer_hint,
     middle_truncate,
     panel_with_title,
+    render_select,
     segmented_bar,
     sparkline,
     stage_meter,
+    tile,
     truncate,
 )
 
@@ -575,28 +579,162 @@ def _download_workers_panel(snapshot: dict, width: int) -> RenderableType:
     )
 
 
+def _failure_category(reason: str) -> str:
+    value = reason.casefold()
+    if "private" in value:
+        return "private"
+    if "age" in value:
+        return "age restricted"
+    if "region" in value or "geo" in value or "country" in value:
+        return "region blocked"
+    if "copyright" in value:
+        return "copyright"
+    if "timeout" in value or "timed out" in value:
+        return "timeout"
+    if "unavailable" in value or "not available" in value or "not found" in value:
+        return "unavailable"
+    return "other"
+
+
+def _failure_url(failure) -> tuple[str, str]:
+    url = getattr(failure, "url", "") or ""
+    video_id = getattr(failure, "video_id", "") or getattr(failure, "id", "") or ""
+    if not url and video_id:
+        url = video_id if "://" in video_id else f"https://www.youtube.com/watch?v={video_id}"
+    if not url:
+        return "", ""
+    display = url.split("://", 1)[-1]
+    if display.startswith("www."):
+        display = display[4:]
+    if display.startswith("youtu.be/"):
+        display = "youtube.com/watch?v=" + display.split("/", 1)[1].split("?", 1)[0]
+    return url, display
+
+
+def _failure_list_summary(failures, width: int) -> Text:
+    from collections import Counter
+
+    labels = {
+        "unavailable": "Video unavailable",
+        "private": "Private",
+        "age restricted": "Age restricted",
+        "region blocked": "Region blocked",
+        "copyright": "Copyright",
+        "timeout": "Timeout",
+        "other": "Other",
+    }
+    counts = Counter(_failure_category(getattr(item, "reason", "") or "") for item in failures)
+    line = Text()
+    for index, (category, count) in enumerate(
+        sorted(counts.items(), key=lambda item: (-item[1], list(labels).index(item[0])))
+    ):
+        if index:
+            line.append(" · ", style=Style(color=DIM))
+        else:
+            line.append("● ", style=Style(color=RED))
+        line.append(labels[category], style=Style(color=DIM))
+        line.append(f" {count}", style=Style(color=TEXT))
+    prefix = " · details in "
+    if line:
+        line.append(prefix, style=Style(color=DIM))
+    else:
+        line.append("No failures yet. · details in ", style=Style(color=DIM))
+    path = str(config.FAILED_FILE)
+    path_width = max(0, width - cell_len(line))
+    line.append(middle_truncate(path, path_width), style=Style(color=DIM))
+    line.no_wrap = True
+    line.overflow = "crop"
+    return line
+
+
+def _failure_row(failure, selected: bool, width: int):
+    from rich.table import Table
+
+    category = _failure_category(getattr(failure, "reason", "") or "")
+    reason = category
+    reason_width = min(max(10, cell_len(reason)), max(10, width // 3))
+    title_width = max(1, width - reason_width)
+    title = getattr(failure, "title", "") or "Unknown title"
+    selector = render_select(
+        [SelectItem(label=title)],
+        0 if selected else -1,
+        variant="compact",
+        label_width=max(0, title_width - 1),
+        width=title_width,
+    )
+    row = Table.grid(expand=True, padding=(0, 0), pad_edge=False)
+    row.add_column(ratio=1, no_wrap=True)
+    row.add_column(width=reason_width, justify="right", no_wrap=True)
+    row.add_row(selector, Text(reason, style=Style(color=RED)))
+
+    url, display = _failure_url(failure)
+    link = Text(f"  {display or 'link unavailable'}",
+                style=Style(color=LINK_DIM if not selected else LINK, link=url or None))
+    link.no_wrap = True
+    link.overflow = "ellipsis"
+    return Group(row, link)
+
+
 def show_failures(failures) -> None:
-    from .keys import read_key
+    from rich.live import Live
 
     out = console()
     live = getattr(out, "_live", None)
     if live is not None:
         live.stop()
+    selected = 0
+    note = ""
     try:
-        lines = []
-        for failure in failures:
-            line = Text(failure.title, style=Style(color=TEXT))
-            if failure.reason:
-                line.append(f"  {failure.reason}", style=Style(color=RED))
-            lines.append(line)
         with out.screen():
-            out.print(panel_with_title(
-                Group(*lines),
-                name="Failures",
-                dim=f"{len(failures)} tracks",
-                border=BORDER,
-            ))
-            read_key()
+            def view():
+                width = max(1, out.width - 6)
+                height = out.height
+                summary = _failure_list_summary(failures, width)
+                available_lines = max(0, height - 7 - (1 if note else 0))
+                visible_count = max(1, available_lines // 2)
+                start = max(0, min(selected - visible_count + 1, len(failures) - visible_count))
+                end = min(len(failures), start + visible_count)
+                content = [summary]
+                if note:
+                    content.append(Text(note, style=Style(color=DIM)))
+                content.extend(_failure_row(item, index == selected, width)
+                               for index, item in enumerate(failures)
+                               if start <= index < end)
+                if len(failures) > visible_count:
+                    content.append(Text(f"+ {len(failures) - visible_count} more",
+                                        style=Style(color=DIMMER)))
+                return Group(
+                    panel_with_title(
+                        Group(*content),
+                        name="Failures",
+                        dim=f"{len(failures)} tracks",
+                        border=BORDER,
+                    ),
+                    footer_hint("↑↓ move · enter open link · c copy link · esc back"),
+                )
+
+            with Live(view(), console=out, auto_refresh=False, transient=True) as failure_live:
+                while True:
+                    key = keys.read_key()
+                    if key is None:
+                        continue
+                    if key in ("up", "down") and failures:
+                        step = -1 if key == "up" else 1
+                        selected = (selected + step) % len(failures)
+                        note = ""
+                    elif key == "enter" and failures:
+                        url, _ = _failure_url(failures[selected])
+                        note = "Could not open link." if url and not keys.open_url(url) else (
+                            "Link is unavailable." if not url else "Opened link."
+                        )
+                    elif key == "c" and failures:
+                        url, _ = _failure_url(failures[selected])
+                        note = ("Link is unavailable." if not url else
+                                "Link copied." if keys.copy_to_clipboard(url) else
+                                "Clipboard is unavailable.")
+                    elif key in ("esc", "ctrl-c"):
+                        return
+                    failure_live.update(view(), refresh=True)
     finally:
         if live is not None:
             live.start(refresh=True)
@@ -776,13 +914,17 @@ def print_run_summary(
         dim="Update library",
         border=BORDER,
     )
-    out.print(Group(panel, footer_hint("enter back")))
+    out.print(Group(
+        panel,
+        footer_hint("enter back · f failures" if result.failures else "enter back"),
+    ))
     if wait_for_key:
-        from .keys import read_key
-
-        key = read_key()
-        while key not in ("enter", "esc"):
-            key = read_key()
+        while True:
+            key = keys.read_key()
+            if key == "f" and result.failures:
+                show_failures(result.failures)
+            elif key in ("enter", "esc", "ctrl-c"):
+                break
 
 
 def _playlist_results_table(
@@ -884,25 +1026,215 @@ def _failure_summary(failures, width: int) -> Text:
     return line
 
 
-def print_stats(lib: Library) -> None:
+def _stat_count(value) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _stats_playlist_rows(lib: Library) -> list[dict]:
+    saved = lib.stats.get("last_playlists")
+    if isinstance(saved, list):
+        source = saved
+    else:
+        source = [
+            {
+                "name": name,
+                "songs": len({lib.canonical(value) for value in ids
+                              if lib.canonical(value) in lib.songs}),
+                "new": 0,
+                "failed": 0,
+            }
+            for name, ids in lib.playlists.items()
+        ]
+    rows = []
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        rows.append({
+            "name": str(item.get("name") or item.get("id") or "Unknown playlist"),
+            "songs": _stat_count(item.get("songs")),
+            "new": _stat_count(item.get("new", item.get("added", 0))),
+            "failed": _stat_count(item.get("failed")),
+        })
+    return sorted(rows, key=lambda row: -row["songs"])
+
+
+def _stats_sync_line(stats: dict) -> Text:
+    stamp = stats.get("last_run")
+    if not stamp or stamp == "never":
+        return Text("Last sync never", style=Style(color=DIM))
+
+    line = Text("Last sync ", style=Style(color=DIM))
+    line.append(time_ago(str(stamp)), style=Style(color=TEXT))
+    details = []
+    new_count = _stat_count(stats.get("new"))
+    failed_count = _stat_count(stats.get("failed"))
+    try:
+        elapsed = float(stats.get("duration_seconds") or 0)
+    except (TypeError, ValueError):
+        elapsed = 0
+    if new_count:
+        details.append(("+", f"{new_count} new", GREEN))
+    if failed_count:
+        details.append(("", f"{failed_count} failed", RED))
+    if elapsed > 0:
+        details.append(("", f"{elapsed:.1f}s", DIM))
+    for sign, value, color in details:
+        line.append(" · ", style=Style(color=DIM))
+        line.append(f"{sign}{value}", style=Style(color=color))
+    line.no_wrap = True
+    line.overflow = "crop"
+    return line
+
+
+def _playlist_stats_panel(row: dict, rank: int, selected: bool, width: int, box):
+    songs = Text()
+    songs.append(str(row["songs"]), style=Style(
+        color=ACCENT if rank < 3 else TEXT,
+        bold=True,
+    ))
+    songs.append(" songs", style=Style(color=DIM))
+
+    status = Text()
+    parts = []
+    if row["new"]:
+        parts.append((f"+{row['new']} new", GREEN))
+    if row["failed"]:
+        parts.append((f"✗ {row['failed']} failed", RED))
+    if not parts:
+        status.append("no changes", style=Style(color=DIMMER))
+    else:
+        for index, (label, color) in enumerate(parts):
+            if index:
+                status.append(" · ", style=Style(color=DIM))
+            status.append(label, style=Style(color=color))
+    status.no_wrap = True
+    status.overflow = "ellipsis"
+
+    border = ACCENT if selected else DARK_ORANGE if rank < 3 else BOX_BORDER
+    title = Text(truncate(row["name"], max(1, width - 4)),
+                 style=Style(color=TEXT, bold=rank < 3))
+    return Panel(
+        Group(songs, status),
+        title=title,
+        title_align="left",
+        border_style=border,
+        box=box.ROUNDED,
+        padding=(0, 1),
+        width=width,
+        expand=False,
+    )
+
+
+def print_stats(lib: Library, *, interactive: bool = False) -> None:
+    from math import ceil
+    from rich import box
+    from rich.live import Live
     from rich.table import Table
 
     out = console()
-    s = lib.stats
-    out.print(f"[bold {ACCENT}]Library[/]  {lib.out}")
-    out.print(f"  Songs [bold]{len(lib.songs)}[/]  ·  Size [bold]{human_size(lib.total_size())}[/]  ·  "
-              f"Downloaded all-time [bold]{s['downloads']}[/] ({human_size(s['bytes'])})")
-    out.print(f"  Runs [bold]{s['runs']}[/]  ·  Last sync [bold]{time_ago(s['last_run'])}[/]")
-    if lib.playlists:
-        table = Table(box=None, pad_edge=False, header_style=DIM)
-        table.add_column("Playlist")
-        table.add_column("Songs", justify="right")
-        counts = {n: len({lib.canonical(v) for v in ids if lib.canonical(v) in lib.songs})
-                  for n, ids in lib.playlists.items()}
-        for name, count in sorted(counts.items(), key=lambda kv: -kv[1]):
-            table.add_row(name, str(count))
-        out.print()
-        out.print(table)
+    stats = lib.stats
+    rows = _stats_playlist_rows(lib)
+    selected = 0
+
+    def view():
+        width = max(1, out.width)
+        inner_width = max(1, width - 6)
+        metric_columns = 4 if width >= 80 else 2
+        tile_width = max(4, (inner_width - 2 * (metric_columns - 1)) // metric_columns)
+        metrics = [
+            ("Songs", str(len(lib.songs))),
+            ("Size", fmt_size(lib.total_size())),
+            ("Downloads", str(_stat_count(stats.get("downloads")))),
+            ("Runs", str(_stat_count(stats.get("runs")))),
+        ]
+        metric_grid = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
+        for _ in range(metric_columns):
+            metric_grid.add_column(ratio=1)
+        for start in range(0, len(metrics), metric_columns):
+            metric_grid.add_row(*(
+                tile(label, value, tile_width)
+                for label, value in metrics[start:start + metric_columns]
+            ))
+
+        columns = 3 if width >= 100 else 2 if width >= 60 else 1
+        card_width = max(8, (inner_width - 2 * (columns - 1)) // columns)
+        total_rows = ceil(len(rows) / columns) if rows else 0
+        tile_rows = ceil(len(metrics) / metric_columns)
+        max_visible_rows = max(
+            1,
+            (out.height - 4 - 1 - tile_rows * 4 - 2 - 1) // 4,
+        )
+        visible_rows = min(total_rows, max_visible_rows) if total_rows else 0
+        selected_row = selected // columns if rows else 0
+        start_row = max(0, min(selected_row - visible_rows + 1, total_rows - visible_rows))
+        start_index = start_row * columns
+        end_index = min(len(rows), start_index + visible_rows * columns)
+        grid = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
+        for _ in range(columns):
+            grid.add_column(ratio=1)
+        visible = rows[start_index:end_index]
+        for offset in range(0, len(visible), columns):
+            items = visible[offset:offset + columns]
+            rendered = [
+                _playlist_stats_panel(
+                    item,
+                    start_index + offset + index,
+                    start_index + offset + index == selected,
+                    card_width,
+                    box,
+                )
+                for index, item in enumerate(items)
+            ]
+            rendered.extend(Text("") for _ in range(columns - len(rendered)))
+            grid.add_row(*rendered)
+
+        body = [
+            metric_grid,
+            _stats_sync_line(stats),
+            Text("Playlists", style=Style(color=BRAND, bold=True)),
+        ]
+        if rows:
+            body.append(grid)
+            hidden = len(rows) - len(visible)
+            if hidden:
+                body.append(Text(f"+ {hidden} more", style=Style(color=DIMMER)))
+        return Group(
+            panel_with_title(
+                Group(*body),
+                name="♪ Stats",
+                dim="Library overview",
+                border=BRAND,
+                name_color=BRAND,
+            ),
+            footer_hint("↑↓←→ move · enter or esc back"),
+        )
+
+    if not interactive:
+        out.print(view())
+        return
+
+    with Live(view(), console=out, auto_refresh=False, transient=True) as live:
+        while True:
+            key = keys.read_key()
+            if key in ("enter", "esc", "ctrl-c"):
+                return
+            if not rows:
+                continue
+            columns = 3 if out.width >= 100 else 2 if out.width >= 60 else 1
+            if key == "up":
+                selected = max(0, selected - columns)
+            elif key == "down":
+                selected = min(len(rows) - 1, selected + columns)
+            elif key == "left":
+                selected = max(0, selected - 1)
+            elif key == "right":
+                selected = min(len(rows) - 1, selected + 1)
+            else:
+                continue
+            live.update(view(), refresh=True)
 
 
 def print_update_hint() -> None:

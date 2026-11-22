@@ -22,8 +22,8 @@ class RunResult:
     bytes: int = 0
     elapsed: float = 0.0
     failures: list[Failure] = field(default_factory=list)
-    track_results: list[TrackResult] = field(default_factory=list)
     stopped: bool = False
+    track_results: list[TrackResult] = field(default_factory=list)
     duplicates_skipped: int = 0
     songs_before: int = 0
     size_before: int = 0
@@ -81,7 +81,7 @@ def execute(settings: config.Settings, plan: Plan, *, compact: bool = False, pru
     )
     started = time.monotonic()
     stop = threading.Event()
-    playlist_rows = None
+    playlist_rows: list[dict] | None = None
 
     if plan.todo:
         tracker = Tracker(len(plan.todo), settings.jobs)
@@ -129,6 +129,7 @@ def execute(settings: config.Settings, plan: Plan, *, compact: bool = False, pru
         _finish_unreported_tracks(plan, result)
         _set_result_totals(result)
         playlist_rows = _finish_run(settings, plan, result, started, prune_ok=prune_ok)
+    assert playlist_rows is not None
 
     if sum(1 for f in result.failures if ytdlp.BLOCKED.search(f.reason)) >= 2:
         out.print("[yellow]These errors usually mean yt-dlp is outdated.[/]")
@@ -166,11 +167,13 @@ def _set_result_totals(result: RunResult) -> None:
 def _finish_run(settings: config.Settings, plan: Plan, result: RunResult, started: float,
                 stopping=None, live=None, prune_ok: bool = False) -> list[dict]:
     lib = plan.lib
-    previous_playlists = {
-        (links.playlist_id(playlist.url) or playlist.url):
-        {lib.canonical(vid) for vid in lib.playlists.get(playlist.name, [])}
-        for playlist in plan.playlists
-    }
+    previous_playlists = {}
+    for playlist in plan.playlists:
+        playlist_id = links.playlist_id(playlist.url) or playlist.url
+        previous_name = lib.playlist_names.get(playlist_id, playlist.name)
+        previous_playlists[playlist_id] = {
+            lib.canonical(vid) for vid in lib.playlists.get(previous_name, [])
+        }
     _write_playlists(settings, plan)
     removed_ids: set[str] = set()
     if settings.prune and prune_ok and not result.stopped and not plan.errors:
@@ -189,11 +192,6 @@ def _finish_run(settings: config.Settings, plan: Plan, result: RunResult, starte
     lib.stats["new"] = result.new
     lib.stats["failed"] = len(result.failures)
     lib.stats["duration_seconds"] = result.elapsed
-    lib.save(force=True)
-    _write_failed_file(result.failures)
-    if stopping is not None:
-        stopping.set_step(2, "done")
-        live.update(ui.StoppingView(stopping), refresh=True)
 
     added: dict[str, int] = {}
     failed: dict[str, int] = {}
@@ -220,16 +218,33 @@ def _finish_run(settings: config.Settings, plan: Plan, result: RunResult, starte
             "failed": failed.get(playlist_id, 0),
             "removed": removed.get(playlist_id, 0),
         })
+    lib.stats["last_playlists"] = [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "songs": row["songs"],
+            "new": row["added"],
+            "failed": row["failed"],
+        }
+        for row in rows
+    ]
+    lib.save(force=True)
+    _write_failed_file(result.failures)
+    if stopping is not None:
+        stopping.set_step(2, "done")
+        live.update(ui.StoppingView(stopping), refresh=True)
     return rows
 
 
 def _write_playlists(settings: config.Settings, plan: Plan) -> None:
     lib = plan.lib
     for playlist in plan.playlists:
+        playlist_id = links.playlist_id(playlist.url) or playlist.url
         ids = [entry["id"] for entry in playlist.items]
         if settings.playlist_files:
             lib.write_playlist(playlist.name, ids)
         lib.playlists[playlist.name] = ids
+        lib.playlist_names[playlist_id] = playlist.name
 
 
 def _prune(plan: Plan) -> set[str]:
