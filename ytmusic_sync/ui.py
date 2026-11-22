@@ -91,6 +91,18 @@ def print_path_message(prefix: str, path: str, suffix: str = "", *, success: boo
     out.print(line)
 
 
+def print_path_error(prefix: str, path: str, hint: str) -> None:
+    out = console()
+    line = Text("✗ ", style=Style(color=RED))
+    line.append(prefix, style=Style(color=RED))
+    path_width = max(0, out.width - cell_len(line))
+    line.append(middle_truncate(path, path_width), style=Style(color=RED))
+    line.no_wrap = True
+    line.overflow = "crop"
+    out.print(line)
+    print_notice(hint)
+
+
 def print_missing_dependency(name: str, fix: str) -> None:
     out = console()
     width = max(1, out.width - 6)

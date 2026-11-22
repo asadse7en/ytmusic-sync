@@ -122,11 +122,7 @@ def open_path(path: Path) -> None:
             subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as exc:
-        width = max(0, ui.console().width - 20)
-        ui.print_error(
-            f"Could not open {middle_truncate(str(path), width)}",
-            short_error(exc),
-        )
+        ui.print_path_error("Could not open ", str(path), short_error(exc))
 
 
 # ---------- entry point ----------
@@ -158,9 +154,8 @@ def _first_run(settings: Settings) -> bool:
 def choose_library(settings: Settings) -> bool:
     out = ui.console()
     if settings.out and not Path(settings.out).is_dir():
-        folder = middle_truncate(settings.out, max(0, out.width - 44))
-        ui.print_error(f"Music folder is unavailable: {folder}",
-                       "Reconnect the drive or choose a folder.")
+        ui.print_path_error("Music folder is unavailable: ", settings.out,
+                            "Reconnect the drive or choose a folder.")
     default = settings.out or str(Path.home() / "Music" / "YouTube")
     answer = ask_text("Music folder", default)
     if answer is None:
@@ -168,10 +163,14 @@ def choose_library(settings: Settings) -> bool:
     path = Path(answer).expanduser()
     if not path.exists():
         if not path.parent.is_dir():
-            ui.print_error(f"Parent folder does not exist: {middle_truncate(str(path.parent), out.width - 28)}",
-                           "Choose an existing folder or connect the drive.")
+            ui.print_path_error("Parent folder does not exist: ", str(path.parent),
+                                "Choose an existing folder or connect the drive.")
             return False
         path.mkdir()
+    elif not path.is_dir():
+        ui.print_error("The selected music path is not a folder.",
+                       "Choose an existing folder or connect the drive.")
+        return False
     settings.out = str(path.resolve())
     settings.save()
     return True
