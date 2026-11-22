@@ -8,7 +8,6 @@ from datetime import datetime
 
 from rich.cells import cell_len
 from rich.console import Group, RenderableType
-from rich.panel import Panel
 from rich.style import Style
 from rich.text import Text
 
@@ -44,6 +43,73 @@ def console():
 GOOD, BAD = GREEN, RED
 
 
+def print_error(message: str, hint: str | None = None) -> None:
+    out = console()
+    line = Text("✗ ", style=Style(color=RED))
+    line.append(truncate(" ".join(str(message).splitlines()), max(0, out.width - 2)),
+                style=Style(color=RED))
+    line.no_wrap = True
+    line.overflow = "crop"
+    out.print(line)
+    if hint:
+        note = Text(truncate(" ".join(str(hint).splitlines()), out.width), style=Style(color=DIM))
+        note.no_wrap = True
+        note.overflow = "crop"
+        out.print(note)
+
+
+def print_success(message: str) -> None:
+    out = console()
+    line = Text("✓ ", style=Style(color=GREEN))
+    line.append(truncate(" ".join(str(message).splitlines()), max(0, out.width - 2)),
+                style=Style(color=GREEN))
+    line.no_wrap = True
+    line.overflow = "crop"
+    out.print(line)
+
+
+def print_notice(message: str) -> None:
+    line = Text(truncate(" ".join(str(message).splitlines()), console().width),
+                style=Style(color=DIM))
+    line.no_wrap = True
+    line.overflow = "crop"
+    console().print(line)
+
+
+def print_path_message(prefix: str, path: str, suffix: str = "", *, success: bool = False) -> None:
+    out = console()
+    color = GREEN if success else DIM
+    line = Text()
+    if success:
+        line.append("✓ ", style=Style(color=GREEN))
+    line.append(prefix, style=Style(color=color))
+    path_width = max(0, out.width - cell_len(line) - cell_len(suffix))
+    line.append(middle_truncate(path, path_width), style=Style(color=GREEN if success else PATH))
+    line.append(suffix, style=Style(color=color))
+    line.no_wrap = True
+    line.overflow = "crop"
+    out.print(line)
+
+
+def print_missing_dependency(name: str, fix: str) -> None:
+    out = console()
+    width = max(1, out.width - 6)
+    lines = []
+    for raw_line in fix.splitlines():
+        if not raw_line.strip():
+            continue
+        line = Text(truncate(raw_line.strip(), width), style=Style(color=DIM))
+        line.no_wrap = True
+        line.overflow = "crop"
+        lines.append(line)
+    out.print(panel_with_title(
+        Group(*lines),
+        name=f"Missing {name}",
+        border=RED,
+        padding=(0, 1),
+    ))
+
+
 def build_header() -> RenderableType:
     settings = config.Settings.load()
     out_path = settings.out_path
@@ -67,29 +133,6 @@ def build_header() -> RenderableType:
             return f"{hours} hour{'s' if hours != 1 else ''} ago"
         days = elapsed // 86400
         return f"{days} day{'s' if days != 1 else ''} ago"
-
-    def middle_truncate(value: str, max_width: int) -> str:
-        if max_width <= 0:
-            return ""
-        if cell_len(value) <= max_width:
-            return value
-        if max_width == 1:
-            return "…"
-        available = max_width - 1
-        left_width = (available + 1) // 2
-        right_width = available - left_width
-
-        def take_left(text: str, limit: int) -> str:
-            result = ""
-            for char in text:
-                if cell_len(result + char) > limit:
-                    break
-                result += char
-            return result
-
-        left = take_left(value, left_width)
-        right = take_left(value[::-1], right_width)[::-1]
-        return left + "…" + right
 
     def status_line():
         path = str(out_path)
@@ -188,15 +231,6 @@ def clock(seconds: float) -> str:
     minutes, secs = divmod(int(seconds), 60)
     hours, minutes = divmod(minutes, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
-
-
-def confirm(question: str, default: bool = False) -> bool:
-    """Plain y/n prompt (no extra imports, works in any terminal)."""
-    try:
-        answer = console().input(f"{question} [{'Y/n' if default else 'y/N'}] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return False
-    return default if not answer else answer.startswith("y")
 
 
 class ScanPanel:
@@ -401,6 +435,7 @@ def _scan_summary(snapshot: dict, width: int, height: int):
 
 
 def print_scan_summary(snapshot: dict) -> None:
+    out = console()
     line = Text()
     line.append("✓", style=Style(color=GREEN))
     line.append(
@@ -408,7 +443,10 @@ def print_scan_summary(snapshot: dict) -> None:
         f"{snapshot['failed']} failed · {snapshot['elapsed']:.1f}s",
         style=Style(color=TEXT),
     )
-    console().print(line)
+    line.truncate(out.width, overflow="crop")
+    line.no_wrap = True
+    line.overflow = "crop"
+    out.print(line)
 
 
 # ---------- live dashboard ----------
@@ -817,9 +855,21 @@ class StoppingView:
         )
 
 
-def song_line(ok: bool, count: int, total: int, title: str, note: str) -> str:
-    mark = "[green]✓[/]" if ok else "[red]✗[/]"
-    return f"{mark} {count}/{total} {title[:50]}  [dim]{note}[/]"
+def song_line(ok: bool, count: int, total: int, title: str, note: str) -> Text:
+    width = max(1, console().width)
+    mark = "✓" if ok else "✗"
+    color = GREEN if ok else RED
+    prefix = f"{mark} {count}/{total} "
+    note_text = truncate(note, max(0, width // 3))
+    title_width = max(0, width - cell_len(prefix) - cell_len(note_text) - (2 if note_text else 0))
+    line = Text(prefix, style=Style(color=color))
+    line.append(truncate(title, title_width), style=Style(color=TEXT))
+    if note_text:
+        line.append("  ")
+        line.append(note_text, style=Style(color=DIM))
+    line.no_wrap = True
+    line.overflow = "crop"
+    return line
 
 
 # ---------- summaries ----------
@@ -827,23 +877,39 @@ def print_plan(plan, dry_run: bool = False) -> None:
     """Short pre-download overview (also used by the review screen)."""
     out = console()
     scan = plan.scan
-    out.print(f"[bold]{len(plan.wanted)}[/] unique songs · [bold {GOOD}]{len(plan.todo)}[/] new · "
-              f"{len(plan.wanted) - len(plan.todo)} already in library")
+    summary = Text()
+    summary.append(str(len(plan.wanted)), style=Style(color=TEXT, bold=True))
+    summary.append(" unique songs · ", style=Style(color=DIM))
+    summary.append(str(len(plan.todo)), style=Style(color=GREEN, bold=True))
+    summary.append(" new · ", style=Style(color=DIM))
+    summary.append(f"{len(plan.wanted) - len(plan.todo)} already in library", style=Style(color=DIM))
+    summary.no_wrap = True
+    summary.overflow = "crop"
+    out.print(summary)
     for p in plan.playlists:
-        out.print(f"  [dim]•[/] {p.name} [dim]({len(p.items)})[/]")
+        line = Text("  • ", style=Style(color=DIM))
+        line.append(truncate(p.name, max(0, out.width - 18)), style=Style(color=TEXT))
+        line.append(f" ({len(p.items)})", style=Style(color=DIM))
+        line.no_wrap = True
+        line.overflow = "crop"
+        out.print(line)
     notes = []
     if plan.duplicates:
         notes.append(f"{plan.duplicates} duplicate version(s) skipped")
     if scan.unavailable:
         notes.append(f"{scan.unavailable} private/deleted skipped")
     if notes:
-        out.print("[dim]" + " · ".join(notes) + "[/]")
+        print_notice(" · ".join(notes))
     for url, reason in plan.errors:
-        out.print(f"[red]✗[/] {url}  [dim]{reason}[/]")
+        print_error(truncate(url, max(0, out.width - 2)), reason)
     if dry_run:
         for entry in plan.todo:
-            out.print(f"  [green]+[/] {entry['title']}")
-        out.print(f"\n[yellow]Dry run: {len(plan.todo)} new, nothing downloaded.[/]")
+            line = Text("  + ", style=Style(color=GREEN))
+            line.append(truncate(entry["title"], max(0, out.width - 4)), style=Style(color=TEXT))
+            line.no_wrap = True
+            line.overflow = "crop"
+            out.print(line)
+        print_notice(f"Dry run: {len(plan.todo)} new, nothing downloaded.")
 
 
 def print_run_summary(
@@ -1097,7 +1163,7 @@ def _stats_sync_line(stats: dict) -> Text:
     return line
 
 
-def _playlist_stats_panel(row: dict, rank: int, selected: bool, width: int, box):
+def _playlist_stats_panel(row: dict, rank: int, selected: bool, width: int):
     songs = Text()
     songs.append(str(row["songs"]), style=Style(
         color=ACCENT if rank < 3 else TEXT,
@@ -1122,23 +1188,16 @@ def _playlist_stats_panel(row: dict, rank: int, selected: bool, width: int, box)
     status.overflow = "ellipsis"
 
     border = ACCENT if selected else DARK_ORANGE if rank < 3 else BOX_BORDER
-    title = Text(truncate(row["name"], max(1, width - 4)),
-                 style=Style(color=TEXT, bold=rank < 3))
-    return Panel(
+    return panel_with_title(
         Group(songs, status),
-        title=title,
-        title_align="left",
-        border_style=border,
-        box=box.ROUNDED,
+        name=truncate(row["name"], max(1, width - 4)),
+        border=border,
         padding=(0, 1),
-        width=width,
-        expand=False,
     )
 
 
 def print_stats(lib: Library, *, interactive: bool = False) -> None:
     from math import ceil
-    from rich import box
     from rich.live import Live
     from rich.table import Table
 
@@ -1192,7 +1251,6 @@ def print_stats(lib: Library, *, interactive: bool = False) -> None:
                     start_index + offset + index,
                     start_index + offset + index == selected,
                     card_width,
-                    box,
                 )
                 for index, item in enumerate(items)
             ]
@@ -1248,5 +1306,5 @@ def print_stats(lib: Library, *, interactive: bool = False) -> None:
 def print_update_hint() -> None:
     update = ytdlp.update_available()
     if update:
-        console().print(f"[yellow]yt-dlp {update[0]} → {update[1]} available[/] [dim](Update yt-dlp in the menu, "
-                        f"or: ytmusic-sync --update-ytdlp)[/]")
+        print_notice(f"yt-dlp {update[0]} → {update[1]} available · Update yt-dlp in the menu, "
+                     "or: ytmusic-sync --update-ytdlp")

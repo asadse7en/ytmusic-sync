@@ -8,12 +8,17 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from rich.style import Style
+from rich.text import Text
+
 from . import config, links, ui, ytdlp
 from .downloader import Failure, TrackResult, run_downloads
 from .library import open_library
 from .planner import Plan, make_plan
 from .progress import Tracker
 from .scanner import scan_links
+from .theme import CYAN
+from .widgets import confirm_boxes
 
 
 @dataclass
@@ -46,12 +51,13 @@ def setup_logging() -> None:
 def prepare(settings: config.Settings, urls: list[str]) -> Plan:
     """Open the library, scan the links and work out what is new."""
     out = ui.console()
-    with out.status("[cyan]Loading library..."):
+    with out.status(Text("Loading library...", style=Style(color=CYAN))):
         lib = open_library(settings.out_path)
         lib.refresh_files()
-    with out.status("[cyan]Scanning links...") as status:
+    with out.status(Text("Scanning links...", style=Style(color=CYAN))) as status:
         scan = scan_links(urls, settings,
-                          progress=lambda done, total: status.update(f"[cyan]Scanning links... {done}/{total}"))
+                          progress=lambda done, total: status.update(
+                              Text(f"Scanning links... {done}/{total}", style=Style(color=CYAN))))
     return make_plan(lib, scan, settings.skip_duplicate_songs)
 
 
@@ -67,7 +73,7 @@ def execute(settings: config.Settings, plan: Plan, *, compact: bool = False, pru
     """Run the plan. Returns None only when ffmpeg is missing."""
     out, lib = ui.console(), plan.lib
     if plan.todo and not ytdlp.ffmpeg_path():
-        out.print(f"[red]{ytdlp.FFMPEG_HELP}[/]")
+        ui.print_missing_dependency("ffmpeg", ytdlp.FFMPEG_HELP)
         return None
 
     result = RunResult(
@@ -132,12 +138,14 @@ def execute(settings: config.Settings, plan: Plan, *, compact: bool = False, pru
     assert playlist_rows is not None
 
     if sum(1 for f in result.failures if ytdlp.BLOCKED.search(f.reason)) >= 2:
-        out.print("[yellow]These errors usually mean yt-dlp is outdated.[/]")
-        if interactive and ui.confirm("Update yt-dlp now?", default=True):
+        ui.print_notice("These errors usually mean yt-dlp is outdated.")
+        if interactive and confirm_boxes("Update yt-dlp now?", default=True):
             if ytdlp.upgrade():
-                out.print("[green]yt-dlp updated. Restart ytmusic-sync to use it.[/]")
+                ui.print_success("yt-dlp updated. Restart ytmusic-sync to use it.")
+            else:
+                ui.print_error("Could not update yt-dlp.", "Try: pip install -U yt-dlp")
         else:
-            out.print("[dim]Run: ytmusic-sync --update-ytdlp[/]")
+            ui.print_notice("Run: ytmusic-sync --update-ytdlp")
     ui.print_run_summary(
         result,
         lib,
@@ -250,7 +258,7 @@ def _write_playlists(settings: config.Settings, plan: Plan) -> None:
 def _prune(plan: Plan) -> set[str]:
     lib = plan.lib
     stale = [vid for vid in lib.songs if vid not in plan.wanted]
-    if stale and ui.confirm(f"Delete {len(stale)} song(s) no longer in any playlist?"):
+    if stale and confirm_boxes(f"Delete {len(stale)} song(s) no longer in any playlist?", default=False):
         removed = {lib.canonical(vid) for vid in stale}
         lib.remove_songs(stale)
         # rewrite playlist files so they no longer point at deleted songs

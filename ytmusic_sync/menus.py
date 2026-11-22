@@ -5,10 +5,10 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 from pathlib import Path
 
 from rich.console import Group
+from rich.style import Style
 from rich.text import Text
 
 from . import config, links, sync, ui, ytdlp
@@ -22,6 +22,7 @@ from .widgets import (
     confirm_boxes,
     divider,
     footer_hint,
+    middle_truncate,
     panel_with_title,
     render_select,
     ruled_heading,
@@ -72,37 +73,43 @@ SETTING_DESCRIPTIONS = {
 _LINK_PREVIEWS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="link-preview")
 
 
-@lru_cache(maxsize=1)
-def _q():
-    try:
-        import questionary
-    except ImportError as exc:
-        raise RuntimeError("Missing package 'questionary'. Run: pip install questionary") from exc
-    return questionary
-
-
-def _style():
-    return _q().Style([("pointer", "fg:#ff9f1a bold"), ("highlighted", "fg:#ff9f1a bold"),
-                       ("selected", "fg:#ff9f1a"), ("question", "bold")])
-
-
 def pick(message: str, items: list[tuple[str, object]], back: bool = True):
     """Arrow-key menu. Returns the chosen value, or None for Back / Ctrl+C."""
-    q = _q()
-    choices = [q.Choice(title=label, value=value) for label, value in items]
+    choices = [SelectItem(label=label, value=value) for label, value in items]
     if back:
-        choices.append(q.Choice(title="‹ Back", value=BACK))
-    answer = q.select(message, choices=choices, style=_style(), qmark="", instruction=" ").ask()
-    return None if answer in (None, BACK) else answer
+        choices.append(SelectItem(label="Back", value=BACK))
+    out = ui.console()
+    title = truncate(message, max(1, out.width - 12))
+
+    def view_factory(selected: int):
+        body = Group(
+            render_select(choices, selected, variant="boxed"),
+            footer_hint("↑↓ move · enter select · esc back"),
+        )
+        return panel_with_title(body, name=title, border=BORDER)
+
+    selected = run_select(view_factory, choices, variant="boxed")
+    if selected is None:
+        return None
+    value = choices[selected].value
+    return None if value == BACK else value
 
 
 def ask_text(message: str, default: str = "") -> str | None:
-    return _q().text(message, default=default, style=_style(), qmark="").ask()
+    out = ui.console()
+    shown_default = middle_truncate(default, max(0, out.width - len(message) - 6))
+    try:
+        value = out.input(f"{message} [{shown_default}]: ", markup=False)
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return value if value else default
 
 
 def pause() -> None:
+    ui.console().print(footer_hint("enter continue"))
     try:
-        ui.console().input("[dim]Press Enter to continue[/]")
+        while read_key() not in ("enter", "esc", "ctrl-c"):
+            pass
     except (EOFError, KeyboardInterrupt):
         pass
 
@@ -115,7 +122,11 @@ def open_path(path: Path) -> None:
             subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as exc:
-        ui.console().print(f"[red]Could not open {path}: {exc}[/]")
+        width = max(0, ui.console().width - 20)
+        ui.print_error(
+            f"Could not open {middle_truncate(str(path), width)}",
+            short_error(exc),
+        )
 
 
 # ---------- entry point ----------
@@ -132,7 +143,7 @@ def run(settings: Settings) -> int:
         home(settings)
     except KeyboardInterrupt:
         pass
-    out.print("[dim]Bye.[/]")
+    ui.print_notice("Bye.")
     return 0
 
 
@@ -147,15 +158,18 @@ def _first_run(settings: Settings) -> bool:
 def choose_library(settings: Settings) -> bool:
     out = ui.console()
     if settings.out and not Path(settings.out).is_dir():
-        out.print(f"[yellow]Music folder is unavailable: {settings.out}. Reconnect the drive or choose a folder.[/]")
+        folder = middle_truncate(settings.out, max(0, out.width - 44))
+        ui.print_error(f"Music folder is unavailable: {folder}",
+                       "Reconnect the drive or choose a folder.")
     default = settings.out or str(Path.home() / "Music" / "YouTube")
-    answer = _q().path("Music folder:", default=default, only_directories=True, style=_style(), qmark="").ask()
-    if not answer:
+    answer = ask_text("Music folder", default)
+    if answer is None:
         return False
     path = Path(answer).expanduser()
     if not path.exists():
         if not path.parent.is_dir():
-            out.print(f"[red]Parent folder does not exist: {path.parent}[/]")
+            ui.print_error(f"Parent folder does not exist: {middle_truncate(str(path.parent), out.width - 28)}",
+                           "Choose an existing folder or connect the drive.")
             return False
         path.mkdir()
     settings.out = str(path.resolve())
@@ -207,11 +221,13 @@ def home(settings: Settings) -> None:
             elif choice == "stats":
                 ui.print_stats(open_library(settings.out_path), interactive=True)
             elif choice == "ytdlp":
-                ui.console().print("[green]yt-dlp updated. Restart ytmusic-sync to use it.[/]" if ytdlp.upgrade()
-                                   else "[red]Update failed. Try: pip install -U yt-dlp[/]")
+                if ytdlp.upgrade():
+                    ui.print_success("yt-dlp updated. Restart ytmusic-sync to use it.")
+                else:
+                    ui.print_error("Could not update yt-dlp.", "Try: pip install -U yt-dlp")
                 pause()
         except KeyboardInterrupt:
-            ui.console().print("\n[yellow]Cancelled.[/]")
+            ui.print_notice("Cancelled.")
         except Exception as exc:
             _error(exc)
 
@@ -220,14 +236,18 @@ def _error(exc: Exception) -> None:
     import logging
 
     logging.getLogger(__name__).exception("Menu action failed")
-    ui.console().print(f"[red]Error: {short_error(exc)}[/]")
+    if isinstance(exc, RuntimeError) and "yt-dlp is not installed" in str(exc):
+        ui.print_missing_dependency("yt-dlp", "Install yt-dlp with: pip install yt-dlp")
+    else:
+        ui.print_error(short_error(exc), "See the sync log for details.")
     pause()
 
 
 def update_library(settings: Settings) -> None:
     urls = links.read_links()
     if not urls:
-        ui.console().print(f"[yellow]No saved links yet. Use Add Music, or put links in {config.LINKS_FILE}[/]")
+        ui.print_path_message("No saved links yet. Use Add Music, or put links in ",
+                              str(config.LINKS_FILE), ".")
         pause()
         return
     run_plan(settings, urls, review=False, prune_ok=True)
@@ -260,7 +280,8 @@ def add_music(settings: Settings) -> None:
         elif choice == "load":
             if not links.read_links():
                 _ensure_links_file()
-                ui.console().print(f"[yellow]No links found. Add one link per line in {config.LINKS_FILE}.[/]")
+                ui.print_path_message("No links found. Add one link per line in ",
+                                      str(config.LINKS_FILE), ".")
                 continue
             run_plan(settings, links.read_links(), review=True, prune_ok=True)
             return
@@ -307,36 +328,6 @@ def _clean_pending(raw: str) -> str:
                 chars.append("\b" if char == "\x7f" else char)
             index += 1
     return "".join(chars)
-
-
-def _middle_truncate_path(path: str, width: int) -> str:
-    from rich.cells import cell_len
-
-    if width <= 0:
-        return ""
-    if cell_len(path) <= width:
-        return path
-    if width == 1:
-        return "…"
-
-    available = width - 1
-    left_width = (available + 1) // 2
-    right_width = available - left_width
-    left, used = [], 0
-    for char in path:
-        cells = cell_len(char)
-        if used + cells > left_width:
-            break
-        left.append(char)
-        used += cells
-    right, used = [], 0
-    for char in reversed(path):
-        cells = cell_len(char)
-        if used + cells > right_width:
-            break
-        right.append(char)
-        used += cells
-    return "".join(left) + "…" + "".join(reversed(right))
 
 
 def paste_links(settings: Settings) -> None:
@@ -515,16 +506,13 @@ def paste_links(settings: Settings) -> None:
 
     message = Text.assemble(
         "Add these ",
-        (str(len(entries)), "bold #3fb950"),
+        (str(len(entries)), Style(color=GREEN, bold=True)),
         " playlist links to Playlists.txt?",
     )
     if not confirm_boxes(message):
         return
     saved = links.save_links(entries)
-    prefix = f"Saved {saved} link(s) to "
-    path_width = max(0, out.width - cell_len(prefix) - 2)
-    saved_path = _middle_truncate_path(str(config.LINKS_FILE), path_width)
-    out.print(Text.assemble((prefix, Style(color=GREEN)), (saved_path, Style(color=GREEN))))
+    ui.print_path_message(f"Saved {saved} link(s) to ", str(config.LINKS_FILE), success=True)
 
 
 def run_plan(settings: Settings, urls: list[str], *, review: bool, prune_ok: bool = False,
@@ -533,8 +521,8 @@ def run_plan(settings: Settings, urls: list[str], *, review: bool, prune_ok: boo
     out = ui.console()
     if not plan.wanted and not plan.todo:
         for url, reason in plan.errors:
-            out.print(f"[red]✗[/] {url}  [dim]{reason}[/]")
-        out.print("[yellow]Nothing to do.[/]")
+            ui.print_error(truncate(url, max(0, out.width - 2)), reason)
+        ui.print_notice("Nothing to do.")
         pause()
         return
     save = False
@@ -555,7 +543,7 @@ def run_plan(settings: Settings, urls: list[str], *, review: bool, prune_ok: boo
             break
     if save:
         count = sync.remember_links(plan, only_playlists=True)
-        out.print(f"[green]Saved {count} link(s) to {config.LINKS_FILE}[/]")
+        ui.print_path_message(f"Saved {count} link(s) to ", str(config.LINKS_FILE), success=True)
     sync.execute(settings, plan, prune_ok=prune_ok, interactive=True)
 
 
@@ -593,7 +581,7 @@ def settings_menu(settings: Settings) -> None:
         panel = panel_with_title(
             Group(*content),
             "Settings",
-            dim=f"Data: {config.DATA_DIR}",
+            dim=f"Data: {middle_truncate(str(config.DATA_DIR), max(1, width - 14))}",
             border=BORDER,
             dim_color=PATH,
         )
@@ -730,7 +718,8 @@ def data_folder_menu() -> None:
         files = sorted(p for p in config.DATA_DIR.rglob("*") if p.is_file())
         items = [("Open in file explorer", "_open")] + [
             (f"{p.relative_to(config.DATA_DIR)}  ({ui.human_size(p.stat().st_size)})", p) for p in files]
-        choice = pick(f"Data folder  {config.DATA_DIR}", items)
+        title_path = middle_truncate(str(config.DATA_DIR), max(1, ui.console().width - 20))
+        choice = pick(f"Data folder  {title_path}", items)
         if choice is None:
             return
         open_path(config.DATA_DIR if choice == "_open" else choice)
