@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from rich.cells import cell_len
-from rich.console import Group
+from rich.console import Group, RenderableType
 from rich.style import Style
 from rich.text import Text
 
@@ -21,7 +21,7 @@ def console():
 GOOD, BAD = GREEN, RED
 
 
-def build_header():
+def build_header() -> RenderableType:
     settings = config.Settings.load()
     out_path = settings.out_path
     if out_path is None:
@@ -70,17 +70,55 @@ def build_header():
 
     def status_line():
         path = str(out_path)
-        last_sync = relative_time(lib.stats.get("last_run", "never"))
-        suffix = Text()
-        suffix.append("Last sync ", style=Style(color=DIM))
-        suffix.append(last_sync, style=Style(color=TEXT))
-        available_path_width = max(0, width - cell_len(suffix.plain) - cell_len("  ·  "))
-        line = Text()
-        line.append(middle_truncate(path, available_path_width), style=Style(color=PATH))
-        line.append("  ·  ", style=Style(color=DIM))
-        line.append_text(suffix)
-        line.no_wrap = True
-        line.overflow = "crop"
+        stamp = lib.stats.get("last_run", "never")
+        has_sync = stamp != "never"
+        last_sync = relative_time(stamp)
+        new_count = lib.stats.get("new")
+        failed_count = lib.stats.get("failed")
+        duration = lib.stats.get("duration_seconds")
+        show_new = has_sync and isinstance(new_count, int) and not isinstance(new_count, bool)
+        show_failed = has_sync and isinstance(failed_count, int) and not isinstance(failed_count, bool) and failed_count > 0
+        show_duration = (has_sync and isinstance(duration, (int, float)) and not isinstance(duration, bool)
+                         and duration >= 0)
+
+        def suffix(include_duration: bool, include_new: bool, include_failed: bool) -> Text:
+            parts: list[Text] = []
+            last = Text()
+            last.append("Last sync ", style=Style(color=DIM))
+            last.append(last_sync, style=Style(color=TEXT))
+            parts.append(last)
+            if include_new:
+                parts.append(Text(f"✓ {new_count} new", style=Style(color=GREEN)))
+            if include_failed:
+                parts.append(Text(f"✗ {failed_count} failed", style=Style(color=RED)))
+            if include_duration:
+                parts.append(Text(f"{duration:.1f}s", style=Style(color=DIM)))
+            result = Text()
+            for index, part in enumerate(parts):
+                if index:
+                    result.append("  ·  ", style=Style(color=DIM))
+                result.append_text(part)
+            return result
+
+        def make_line(include_duration: bool, include_new: bool, include_failed: bool) -> Text:
+            rest = suffix(include_duration, include_new, include_failed)
+            available_path_width = max(0, width - cell_len(rest) - cell_len("  ·  "))
+            shortened_path = middle_truncate(path, available_path_width)
+            line = Text()
+            if shortened_path:
+                line.append(shortened_path, style=Style(color=PATH))
+                line.append("  ·  ", style=Style(color=DIM))
+            line.append_text(rest)
+            line.no_wrap = True
+            line.overflow = "crop"
+            return line
+
+        line = make_line(show_duration, show_new, show_failed)
+        if cell_len(line) > width and show_duration:
+            show_duration = False
+            line = make_line(show_duration, show_new, show_failed)
+        if cell_len(line) > width and (show_new or show_failed):
+            line = make_line(show_duration, False, False)
         return line
 
     tagline = Text("YouTube music + Local, always in sync", style=Style(color=DIM))

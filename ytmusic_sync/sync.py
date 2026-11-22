@@ -91,8 +91,11 @@ def execute(settings: config.Settings, plan: Plan, *, compact: bool = False, pru
         _prune(plan)
     lib.cleanup_partials()
     lib.record_run(result.new, result.bytes)
-    lib.save(force=True)
     result.elapsed = time.monotonic() - started
+    lib.stats["new"] = result.new
+    lib.stats["failed"] = len(result.failures)
+    lib.stats["duration_seconds"] = result.elapsed
+    lib.save(force=True)
     _write_failed_file(result.failures)
 
     ui.print_run_summary(result, lib, rows, size_before)

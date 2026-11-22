@@ -477,11 +477,12 @@ def _apply_key_result(result: int | str | None, selected: int, enabled: list[int
     return selected, False
 
 
-def _confirm_view(message: str, title: str | None, yes: bool, console: Console) -> RenderableType:
+def _confirm_view(message: RenderableType, title: str | None, yes: bool, console: Console) -> RenderableType:
     from rich import box
 
     width = max(1, console.width)
-    msg = Text(truncate(message, max(1, width - (6 if title else 0))))
+    msg = (Text(truncate(message, max(1, width - (6 if title else 0))))
+           if isinstance(message, str) else message)
     options = []
     for label, selected in (("Yes", yes), ("No", not yes)):
         style = Style(color=ACCENT, bold=True, bgcolor=SEL_FILL) if selected else Style(color=TEXT, bold=False)
@@ -501,7 +502,7 @@ def _confirm_view(message: str, title: str | None, yes: bool, console: Console) 
     return body
 
 
-def confirm_boxes(message: str, title: str | None = None, default: bool = True) -> bool:
+def confirm_boxes(message: RenderableType, title: str | None = None, default: bool = True) -> bool:
     """Ask for confirmation using two side-by-side bordered choices."""
     console = get_console()
     yes = default

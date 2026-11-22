@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,10 +13,10 @@ from rich.text import Text
 
 from . import config, links, sync, ui, ytdlp
 from .config import Settings
-from .keys import read_key
+from .keys import drain_pending, read_key
 from .library import open_library
-from .scanner import short_error
-from .theme import ACCENT, BORDER, CYAN, DIM, GREEN, PATH, TEXT
+from .scanner import scan_links, short_error
+from .theme import ACCENT, BORDER, CYAN, DIM, GREEN, PATH, RED, TEXT
 from .widgets import (
     SelectItem,
     confirm_boxes,
@@ -68,6 +69,7 @@ SETTING_DESCRIPTIONS = {
     "_reset": "restore defaults while keeping the library folder.",
     BACK: "return to the previous menu.",
 }
+_LINK_PREVIEWS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="link-preview")
 
 
 @lru_cache(maxsize=1)
@@ -255,10 +257,7 @@ def add_music(settings: Settings) -> None:
         if choice in (None, BACK):
             return
         if choice == "paste":
-            urls = paste_links()
-            if urls:
-                run_plan(settings, urls, review=True, offer_save=True)
-                return
+            paste_links(settings)
         elif choice == "load":
             if not links.read_links():
                 _ensure_links_file()
@@ -278,29 +277,255 @@ def _ensure_links_file() -> None:
                                      encoding="utf-8")
 
 
-def paste_links() -> list[str]:
-    """Read links one per line until an empty line. Only valid, new links are counted."""
+def _preview_link(url: str, settings: Settings) -> tuple[str, int] | None:
+    result = scan_links([url], settings)
+    if result.errors:
+        return None
+    if result.playlists:
+        playlist = result.playlists[0]
+        return playlist.name, len(playlist.items)
+    if result.singles:
+        return result.singles[0]["title"], 1
+    return None
+
+
+def _clean_pending(raw: str) -> str:
+    chars = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char in ("\x00", "\xe0"):
+            index += 2
+        elif char == "\x1b":
+            index += 1
+            if index < len(raw) and raw[index] == "[":
+                index += 1
+                while index < len(raw) and not ("@" <= raw[index] <= "~"):
+                    index += 1
+                index += index < len(raw)
+        else:
+            if char in ("\r", "\n", "\b", "\x7f") or char.isprintable():
+                chars.append("\b" if char == "\x7f" else char)
+            index += 1
+    return "".join(chars)
+
+
+def _middle_truncate_path(path: str, width: int) -> str:
+    from rich.cells import cell_len
+
+    if width <= 0:
+        return ""
+    if cell_len(path) <= width:
+        return path
+    if width == 1:
+        return "…"
+
+    available = width - 1
+    left_width = (available + 1) // 2
+    right_width = available - left_width
+    left, used = [], 0
+    for char in path:
+        cells = cell_len(char)
+        if used + cells > left_width:
+            break
+        left.append(char)
+        used += cells
+    right, used = [], 0
+    for char in reversed(path):
+        cells = cell_len(char)
+        if used + cells > right_width:
+            break
+        right.append(char)
+        used += cells
+    return "".join(left) + "…" + "".join(reversed(right))
+
+
+def paste_links(settings: Settings) -> None:
+    """Collect, preview, confirm, and save pasted playlist or song links."""
+    import logging
+    import re
+    from rich.cells import cell_len
+    from rich.live import Live
+    from rich.style import Style
+
     out = ui.console()
-    out.print("[dim]Paste YouTube links (playlists or songs), one per line. Empty line = done. Ctrl+C = back.[/]")
-    urls: list[str] = []
-    seen: set = set()
-    while True:
-        try:
-            line = out.input(f"[{ui.ACCENT}]{len(urls) + 1}[/] ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return []
-        if not line:
-            return urls
-        valid, rejected = links.parse_pasted(line)
-        for url in valid:
-            key = links.link_key(url)
-            if key in seen:
-                out.print("  [dim]already added[/]")
+    existing = {links.link_key(url) for url in links.read_links()}
+    seen = set(existing)
+    rows = []
+    current_line = ""
+    finished = False
+
+    def commit_line(line: str) -> None:
+        for piece, is_valid in links.parse_pasted_entries(line):
+            if not is_valid:
+                rows.append({"url": piece, "state": "invalid", "accepted": False})
+                continue
+            identity = links.link_key(piece)
+            if identity in seen:
+                rows.append({"url": piece, "state": "duplicate", "accepted": False})
+                continue
+            seen.add(identity)
+            row = {"url": piece, "state": "checking", "accepted": True, "future": None}
+            row["future"] = _LINK_PREVIEWS.submit(_preview_link, piece, settings)
+            rows.append(row)
+
+    def apply_paste(text: str) -> None:
+        nonlocal current_line
+
+        parts = re.split(r"\r\n|\r|\n", text)
+        for index, part in enumerate(parts):
+            for char in part:
+                if char == "\b":
+                    current_line = current_line[:-1]
+                else:
+                    current_line += char
+            if index < len(parts) - 1:
+                if current_line:
+                    commit_line(current_line)
+                current_line = ""
+
+    def update_previews() -> bool:
+        changed = False
+        for row in rows:
+            future = row.get("future")
+            if future is None or not future.done():
+                continue
+            row["future"] = None
+            try:
+                details = future.result()
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Could not check pasted link %s: %s",
+                                                    row["url"], short_error(exc))
+                details = None
+            if details is None:
+                row["state"] = "unresolved"
             else:
-                seen.add(key)
-                urls.append(url)
-        for piece in rejected:
-            out.print(f"  [red]not a YouTube link:[/] [dim]{piece[:60]}[/]")
+                row["state"] = "ready"
+                row["title"], row["songs"] = details
+            changed = True
+        return changed
+
+    def status_for(row: dict) -> tuple[str, str]:
+        state = row["state"]
+        if state == "checking":
+            return "checking…", DIM
+        if state == "duplicate":
+            return "↷ already in list, skipped", DIM
+        if state == "invalid":
+            return "✗ not a valid link", RED
+        if state == "unresolved":
+            return "✗ couldn't load details", RED
+        count = row["songs"]
+        noun = "song" if count == 1 else "songs"
+        return f"✓ {row['title']} · {count} {noun}", GREEN
+
+    def link_row(number: int, row: dict, width: int) -> Text:
+        prefix = f"{number} › "
+        status, color = status_for(row)
+        prefix_width = cell_len(prefix)
+        status = truncate(status, max(0, width - prefix_width))
+        status_width = cell_len(status)
+        link_width = max(0, width - prefix_width - status_width - (1 if status_width else 0))
+        url = row["url"]
+        for scheme in ("https://", "http://"):
+            if url.startswith(scheme):
+                url = url[len(scheme):]
+                break
+        displayed_url = truncate(url, link_width)
+        spaces = max(0, width - prefix_width - cell_len(displayed_url) - status_width)
+        text = Text()
+        text.append(prefix, style=Style(color=DIM))
+        text.append(displayed_url, style=Style(color=ACCENT))
+        text.append(" " * spaces)
+        text.append(status, style=Style(color=color))
+        return text
+
+    def view() -> Group:
+        width = max(1, out.width - 6)
+        body = [
+            Text("Paste one playlist or song link per line.", style=Style(color=DIM)),
+            Text.assemble(
+                ("Press ", Style(color=DIM)),
+                ("Enter", Style(color=TEXT)),
+                (" on an empty line when you're done.", Style(color=DIM)),
+            ),
+            Text("─" * width, style=Style(color=DIM)),
+        ]
+        body.extend(link_row(index, row, width) for index, row in enumerate(rows, 1))
+        prompt = Text()
+        prefix = f"{len(rows) + 1} › "
+        prompt.append(prefix, style=Style(color=DIM))
+        available = max(0, width - cell_len(prefix) - 1)
+        prompt.append(truncate(current_line, available), style=Style(color=TEXT))
+        prompt.append("▏", style=Style(color=ACCENT))
+        body.append(prompt)
+
+        ready = sum(row["accepted"] for row in rows)
+        skipped = sum(row["state"] == "duplicate" for row in rows)
+        invalid = sum(row["state"] == "invalid" for row in rows)
+        summary = Text()
+        summary.append(f"{ready} ready", style=Style(color=GREEN))
+        if skipped:
+            summary.append(f" · {skipped} skipped", style=Style(color=DIM))
+        if invalid:
+            summary.append(f" · {invalid} invalid", style=Style(color=RED))
+        body.extend((Text("─" * width, style=Style(color=DIM)), summary))
+        panel = panel_with_title(Group(*body), "Add Music", dim="Paste links", border=BORDER)
+        return Group(panel, footer_hint("enter on empty line = done · esc cancel"))
+
+    with Live(view(), console=out, auto_refresh=False) as live:
+        while True:
+            if update_previews():
+                live.update(view(), refresh=True)
+            key = read_key(timeout=0.1)
+            pending = _clean_pending(drain_pending())
+            if key in ("esc", "ctrl-c"):
+                return
+
+            key_text = "\n" if key == "enter" else "\b" if key == "backspace" else (
+                key if key and len(key) == 1 and key.isprintable() else "")
+            if pending:
+                apply_paste(key_text + pending)
+                live.update(view(), refresh=True)
+                continue
+            if key is None:
+                continue
+            if key == "enter":
+                if current_line:
+                    commit_line(current_line)
+                    current_line = ""
+                    live.update(view(), refresh=True)
+                else:
+                    finished = True
+                    break
+            elif key == "backspace":
+                current_line = current_line[:-1]
+                live.update(view(), refresh=True)
+            elif key_text:
+                current_line += key_text
+                live.update(view(), refresh=True)
+
+    if not finished:
+        return
+    entries = [
+        (row["url"], row.get("title", "") if row["state"] == "ready" else "")
+        for row in rows if row["accepted"]
+    ]
+    if not entries:
+        return
+
+    message = Text.assemble(
+        "Add these ",
+        (str(len(entries)), "bold #3fb950"),
+        " playlist links to Playlists.txt?",
+    )
+    if not confirm_boxes(message):
+        return
+    saved = links.save_links(entries)
+    prefix = f"Saved {saved} link(s) to "
+    path_width = max(0, out.width - cell_len(prefix) - 2)
+    saved_path = _middle_truncate_path(str(config.LINKS_FILE), path_width)
+    out.print(Text.assemble((prefix, Style(color=GREEN)), (saved_path, Style(color=GREEN))))
 
 
 def run_plan(settings: Settings, urls: list[str], *, review: bool, prune_ok: bool = False,

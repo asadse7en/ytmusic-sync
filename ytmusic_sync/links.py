@@ -55,7 +55,17 @@ def link_key(url: str) -> tuple[str, str]:
     if _host(canonical) == "youtu.be":
         return "video", parsed.path.strip("/")
     video = parse_qs(parsed.query).get("v")
-    return ("video", video[0]) if video else ("url", canonical)
+    if video:
+        return "video", video[0]
+    parts = [part for part in parsed.path.split("/") if part]
+    host = _host(canonical)
+    if (
+        (host == "youtube.com" or host.endswith(".youtube.com"))
+        and len(parts) >= 2
+        and parts[-2].lower() in ("shorts", "embed", "live", "v")
+    ):
+        return "video", parts[-1]
+    return "url", canonical
 
 
 def dedupe(urls) -> list[str]:
@@ -68,13 +78,25 @@ def dedupe(urls) -> list[str]:
     return result
 
 
-def parse_pasted(text: str) -> tuple[list[str], list[str]]:
-    """Split pasted text into (valid unique links, rejected pieces)."""
-    valid, rejected, seen = [], [], set()
+def parse_pasted_entries(text: str) -> list[tuple[str, bool]]:
+    """Split pasted text into pieces paired with the existing YouTube-link validation result."""
+    entries = []
     for piece in text.replace(",", " ").split():
         if piece.startswith("#"):
             continue
-        if not is_youtube_link(piece):
+        try:
+            is_valid = is_youtube_link(piece)
+        except ValueError:
+            is_valid = False
+        entries.append((piece, is_valid))
+    return entries
+
+
+def parse_pasted(text: str) -> tuple[list[str], list[str]]:
+    """Split pasted text into (valid unique links, rejected pieces)."""
+    valid, rejected, seen = [], [], set()
+    for piece, is_valid in parse_pasted_entries(text):
+        if not is_valid:
             rejected.append(piece)
             continue
         key = link_key(piece)
