@@ -40,9 +40,6 @@ def console():
     return get_console()
 
 
-GOOD, BAD = GREEN, RED
-
-
 def print_error(message: str, hint: str | None = None) -> None:
     out = console()
     line = Text("✗ ", style=Style(color=RED))
@@ -225,7 +222,6 @@ def build_header() -> RenderableType:
         name="♪ ytmusic-sync",
         dim=f"v{__version__}",
         border=BRAND,
-        name_color=BRAND,
         padding=(0, 1),
     )
 
@@ -1285,7 +1281,6 @@ def print_stats(lib: Library, *, interactive: bool = False) -> None:
                 name="♪ Stats",
                 dim="Library overview",
                 border=BRAND,
-                name_color=BRAND,
             ),
             footer_hint("↑↓←→ move · enter or esc back"),
         )
