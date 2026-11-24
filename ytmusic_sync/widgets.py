@@ -285,7 +285,7 @@ def tile(label: str, value: str, width: int) -> Panel:
     body.append("\n")
     body.append(truncate(str(value), content_width), style=Style(color=ACCENT, bold=True))
     return Panel(body, border_style=TILE_BORDER, box=box.ROUNDED, padding=(0, 1),
-                 width=max(4, width), expand=False)
+                 width=max(4, width), expand=True)
 
 
 @dataclass

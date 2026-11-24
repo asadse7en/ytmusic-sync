@@ -1191,8 +1191,9 @@ def _stat_count(value) -> int:
 def _stat_tiles(lib: Library):
     from rich.table import Table
 
-    width = max(1, console().width - 6)
-    columns = 4 if console().width >= 80 else 2
+    screen_width = console().width
+    width = max(1, screen_width - 6)
+    columns = 4 if screen_width >= 80 else 2
     tile_width = max(4, (width - 2 * (columns - 1)) // columns)
     seconds = sum(_stat_count(song.get("dur")) for song in lib.songs.values())
     hours, minutes = divmod(seconds // 60, 60)
@@ -1205,7 +1206,7 @@ def _stat_tiles(lib: Library):
     )
     grid = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
     for _ in range(columns):
-        grid.add_column(ratio=1)
+        grid.add_column(width=tile_width)
     for start in range(0, len(metrics), columns):
         grid.add_row(*(tile(label, value, tile_width) for label, value in metrics[start:start + columns]))
     return grid
@@ -1249,26 +1250,34 @@ def _sync_line(lib: Library, width: int) -> Text:
     return line
 
 
-def _share_column(title: str, items: list[tuple[str, int]], colors: list[str], total: int, width: int):
-    from rich.table import Table
-
-    heading = Table.grid(expand=True, padding=0, pad_edge=False)
-    heading.add_column(ratio=1)
-    heading.add_column(justify="right")
-    heading.add_row(
-        Text(title, style=Style(color=ACCENT, bold=True)),
-        Text("share of library", style=Style(color=DIMMER)),
-    )
-    content = [heading]
+def _share_column(
+    title: str,
+    subtitle: str,
+    items: list[tuple[str, int]],
+    colors: list[str],
+    bar_total: int,
+    other_label: str,
+    other_count: int,
+    width: int,
+):
+    title_text = Text(title, style=Style(color=ACCENT, bold=True))
+    subtitle_width = max(0, width - cell_len(title) - 1)
+    shown_subtitle = truncate(subtitle, subtitle_width)
+    heading = Text()
+    heading.append_text(title_text)
+    heading.append(" " * max(1, width - cell_len(title) - cell_len(shown_subtitle)))
+    heading.append(shown_subtitle, style=Style(color=DIMMER))
+    heading.no_wrap = True
+    heading.overflow = "crop"
+    content = [heading, Text("")]
     if not items:
         content.append(Text("Nothing to show yet", style=Style(color=DIM)))
         return Group(*content)
 
-    if total > 0:
+    if bar_total > 0:
         parts = [(count, colors[index]) for index, (_, count) in enumerate(items)]
-        remainder = max(0, total - sum(count for _, count in items))
-        parts.append((remainder, BAR_OFF))
-        content.append(segmented_bar(width, parts, total))
+        parts.append((other_count, BAR_OFF))
+        content.extend((segmented_bar(width, parts, bar_total), Text("")))
 
     for index, (name, count) in enumerate(items):
         count_text = str(count)
@@ -1282,7 +1291,17 @@ def _share_column(title: str, items: list[tuple[str, int]], colors: list[str], t
         row.append(count_text, style=Style(color=TEXT, bold=True))
         row.no_wrap = True
         row.overflow = "crop"
-        content.append(row)
+        content.extend((row, Text("")))
+    if other_label:
+        other = Text("● ", style=Style(color=BAR_OFF))
+        other.append(f"Other · {other_label}", style=Style(color=DIM))
+        other_songs = str(other_count)
+        gap = max(1, width - cell_len(other.plain) - cell_len(other_songs))
+        other.append(" " * gap)
+        other.append(other_songs, style=Style(color=DIM))
+        other.no_wrap = True
+        other.overflow = "crop"
+        content.append(other)
     return Group(*content)
 
 
@@ -1297,8 +1316,13 @@ def print_stats(lib: Library, *, interactive: bool = False) -> None:
         count = sum(vid in lib.songs for vid in canonical_ids)
         playlist_items.append((str(name), count))
     playlist_items.sort(key=lambda item: -item[1])
-    rows = playlist_items
-    playlist_items = playlist_items[:5]
+    all_playlist_items = playlist_items
+    playlist_items = all_playlist_items[:10]
+    playlist_other_count = sum(count for _, count in all_playlist_items[10:])
+    playlist_other_label = (
+        f"{len(all_playlist_items) - 10} playlists" if len(all_playlist_items) > 10 else ""
+    )
+    playlist_total = sum(count for _, count in all_playlist_items)
 
     artist_counts = Counter()
     for song in lib.songs.values():
@@ -1308,33 +1332,86 @@ def print_stats(lib: Library, *, interactive: bool = False) -> None:
         primary = artist.split(",", 1)[0].split(" & ", 1)[0].strip()
         if primary and primary.casefold() != "unknown":
             artist_counts[primary] += 1
-    artist_items = artist_counts.most_common(5)
-    selected = 0
+    all_artist_items = artist_counts.most_common()
+    artist_items = all_artist_items[:10]
+    artist_other_count = max(0, len(lib.songs) - sum(count for _, count in artist_items))
+    artist_other_label = (
+        f"{len(all_artist_items) - 10} artists" if len(all_artist_items) > 10 else ""
+    )
+    scroll = 0
+    scroll_state = {"maximum": 0}
 
     def view():
         width = max(1, out.width)
         inner_width = max(1, width - 6)
         if width >= 90:
-            column_width = max(1, (inner_width - 2) // 2)
-            columns = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
-            columns.add_column(ratio=1)
-            columns.add_column(ratio=1)
+            column_width = max(1, (inner_width - 8) // 2)
+            columns = Table.grid(expand=True, padding=(0, 2), pad_edge=False)
+            columns.add_column(width=column_width)
+            columns.add_column(width=column_width)
             columns.add_row(
-                _share_column("Top playlists", playlist_items, PLAYLIST_COLORS, len(lib.songs), column_width),
-                _share_column("Top artists", artist_items, ARTIST_COLORS, len(lib.songs), column_width),
+                _share_column(
+                    "Top playlists", "share of all playlist songs", playlist_items,
+                    PLAYLIST_COLORS, playlist_total, playlist_other_label,
+                    playlist_other_count, column_width,
+                ),
+                _share_column(
+                    "Top artists", "share of library", artist_items, ARTIST_COLORS,
+                    len(lib.songs), artist_other_label, artist_other_count, column_width,
+                ),
             )
             shares = columns
         else:
             shares = Group(
-                _share_column("Top playlists", playlist_items, PLAYLIST_COLORS, len(lib.songs), inner_width),
-                _share_column("Top artists", artist_items, ARTIST_COLORS, len(lib.songs), inner_width),
+                _share_column(
+                    "Top playlists", "share of all playlist songs", playlist_items,
+                    PLAYLIST_COLORS, playlist_total, playlist_other_label,
+                    playlist_other_count, inner_width,
+                ),
+                Text(""),
+                _share_column(
+                    "Top artists", "share of library", artist_items, ARTIST_COLORS,
+                    len(lib.songs), artist_other_label, artist_other_count, inner_width,
+                ),
             )
 
         body = Group(
             _stat_tiles(lib),
+            Text(""),
             _sync_line(lib, inner_width),
+            Text(""),
             shares,
         )
+        if interactive:
+            body_lines = out.render_lines(
+                body, out.options.update(width=inner_width), pad=False,
+            )
+            body_height = max(1, out.height - 5)
+            if len(body_lines) > body_height:
+                visible_height = max(0, body_height - 1)
+                maximum = max(0, len(body_lines) - visible_height)
+                scroll_state["maximum"] = maximum
+                start = min(max(0, scroll), maximum)
+                end = min(len(body_lines), start + visible_height)
+                visible_lines = body_lines[start:end]
+                content = [
+                    Text.assemble(
+                        *((segment.text, segment.style)
+                          for segment in line if not segment.is_control)
+                    )
+                    for line in visible_lines
+                ]
+                markers = []
+                if start:
+                    markers.append("↑ more")
+                if end < len(body_lines):
+                    markers.append("↓ more")
+                marker = Text(" / ".join(markers), style=Style(color=DIM))
+                marker.no_wrap = True
+                marker.overflow = "crop"
+                body = Group(*content, marker)
+            else:
+                scroll_state["maximum"] = 0
         return Group(
             panel_with_title(
                 body,
@@ -1355,19 +1432,13 @@ def print_stats(lib: Library, *, interactive: bool = False) -> None:
             key = keys.read_key()
             if key in ("enter", "esc", "ctrl-c"):
                 return
-            if not rows:
+            if key not in ("up", "down", "pageup", "pagedown"):
                 continue
-            columns = 3 if out.width >= 100 else 2 if out.width >= 60 else 1
-            if key == "up":
-                selected = max(0, selected - columns)
-            elif key == "down":
-                selected = min(len(rows) - 1, selected + columns)
-            elif key == "left":
-                selected = max(0, selected - 1)
-            elif key == "right":
-                selected = min(len(rows) - 1, selected + 1)
+            step = max(1, out.height - 7) if key in ("pageup", "pagedown") else 1
+            if key in ("up", "pageup"):
+                scroll = max(0, scroll - step)
             else:
-                continue
+                scroll = min(scroll_state["maximum"], scroll + step)
             live.update(view(), refresh=True)
 
 
